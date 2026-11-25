@@ -357,6 +357,104 @@ async fn a_placed_runtime_claims_heartbeats_and_fails_a_sync_once() {
     );
 }
 
+/// Sync notes (ADR 0163) reach the Source and its health; a retried ack
+/// keeps the first ones, and a malformed note is refused.
+#[tokio::test]
+async fn a_completed_sync_reports_its_notes_on_the_source_and_its_health() {
+    let svc = service();
+    put(&svc, 60_000).await;
+    register(&svc, "connector-a", "eu").await;
+    svc.db
+        .runtime()
+        .tick_source_syncs(NS, now_millis())
+        .unwrap();
+    let work = claim(&svc, "repo").await.unwrap();
+    let skipped = |offset, reason: &str| SourceSyncNote {
+        note: Some(source_sync_note::Note::SkippedRecord(
+            source_sync_note::SkippedRecord {
+                partition: 3,
+                offset,
+                reason: reason.into(),
+            },
+        )),
+    };
+    let notes = |notes, overflow_count| SourceSyncNotes {
+        notes,
+        overflow_count,
+    };
+    let ack = |notes| {
+        svc.ack_work(as_principal(
+            AckWorkRequest {
+                options: Some(ack_work_request::Options::SourceSyncNotes(notes)),
+                ..ack_request(&work, "completed", "")
+            },
+            "root",
+        ))
+    };
+    let refused = ack(notes(vec![skipped(1, "too_long")], 0))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+
+    let reported = notes(
+        vec![
+            SourceSyncNote {
+                note: Some(source_sync_note::Note::OffsetGap(
+                    source_sync_note::OffsetGap {
+                        partition: 3,
+                        from_offset: 0,
+                        to_offset: 120,
+                    },
+                )),
+            },
+            skipped(121, "not_json"),
+        ],
+        5,
+    );
+    let Some(ack_work_response::Payload::SourceSync(acked)) =
+        ack(reported.clone()).await.unwrap().into_inner().payload
+    else {
+        panic!("a source sync ack");
+    };
+    assert_eq!(acked.sync.unwrap().last_notes.as_ref(), Some(&reported));
+    ack(notes(vec![skipped(9, "missing_id")], 0)).await.unwrap();
+
+    let read = svc
+        .get_source(as_principal(
+            GetSourceRequest {
+                namespace: NS.into(),
+                source_id: "repo".into(),
+            },
+            "reader",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .source
+        .unwrap();
+    assert_eq!(read.sync.unwrap().last_notes, Some(reported.clone()));
+    let health = |principal| {
+        svc.get_source_health(as_principal(
+            GetSourceHealthRequest {
+                namespace: NS.into(),
+                source_instance: "acme/repo".into(),
+                type_digest: source_sync_domain::GITHUB_OBJECT_SYNC_TYPE_DIGEST.into(),
+                delayed_after_ms: None,
+            },
+            principal,
+        ))
+    };
+    let disclosed = health("root").await.unwrap().into_inner().health.unwrap();
+    assert_eq!(disclosed.sync_notes, Some(reported));
+    let hidden = health("stranger")
+        .await
+        .unwrap()
+        .into_inner()
+        .health
+        .unwrap();
+    assert_eq!(hidden.sync_notes, None);
+}
+
 #[tokio::test]
 async fn a_disable_fences_the_live_sync_claim() {
     let svc = service();

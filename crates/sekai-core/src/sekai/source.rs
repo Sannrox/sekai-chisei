@@ -36,7 +36,7 @@ use crate::db::postgres::PostgresDb;
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
 use crate::sekai::audit::Decision;
-use crate::sekai::source_sync::{SyncError, SyncState};
+use crate::sekai::source_sync::{StoredSyncNotes, SyncError, SyncState};
 use crate::sekai::work_claim::ClaimRecord;
 
 pub const SOURCE_VERSION: &str = "sekai.source/v1";
@@ -401,15 +401,15 @@ macro_rules! columns {
          sync_claim_expires_at_ms, sync_lease_expiries, sync_last_success_at_ms, \
          sync_last_failure_at_ms, sync_last_failure, sync_last_runtime, \
          delivery_last_success_at_ms, delivery_last_failure_at_ms, delivery_last_failure, \
-         delivery_last_runtime"
+         delivery_last_runtime, sync_last_notes_json"
     };
 }
 
 const COLUMNS: &str = columns!();
 
 /// The sync and delivery columns, added after the table (ADR 0149 claim
-/// record, ADR 0148 delivery health).
-const ADDED_COLUMNS: [(&str, &str); 17] = [
+/// record, ADR 0148 delivery health, ADR 0163 sync notes).
+const ADDED_COLUMNS: [(&str, &str); 18] = [
     ("sync_every_ms", "INTEGER NOT NULL DEFAULT 0"),
     ("sync_due_bucket", "INTEGER NOT NULL DEFAULT 0"),
     ("sync_claimed_bucket", "INTEGER NOT NULL DEFAULT 0"),
@@ -427,6 +427,7 @@ const ADDED_COLUMNS: [(&str, &str); 17] = [
     ("delivery_last_failure_at_ms", "INTEGER NOT NULL DEFAULT 0"),
     ("delivery_last_failure", "TEXT NOT NULL DEFAULT ''"),
     ("delivery_last_runtime", "TEXT NOT NULL DEFAULT ''"),
+    ("sync_last_notes_json", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 /// Writes nothing when the id or the tokens are taken.
@@ -522,8 +523,8 @@ SET sync_due_bucket = $1, sync_claimed_bucket = $2, sync_done_bucket = $3,
     sync_claim_owner = $4, sync_claim_generation = $5, sync_fencing_token = $6,
     sync_claim_expires_at_ms = $7, sync_lease_expiries = $8,
     sync_last_success_at_ms = $9, sync_last_failure_at_ms = $10,
-    sync_last_failure = $11, sync_last_runtime = $12
-WHERE namespace = $13 AND source_id = $14";
+    sync_last_failure = $11, sync_last_runtime = $12, sync_last_notes_json = $13
+WHERE namespace = $14 AND source_id = $15";
 
 struct Row {
     namespace: String,
@@ -536,6 +537,7 @@ struct Row {
     updated_at_ms: i64,
     record_json: String,
     sync: SyncState,
+    sync_notes_json: String,
     delivery: DeliveryHealth,
 }
 
@@ -552,7 +554,10 @@ impl Row {
             revision: self.revision,
             created_at_ms: self.created_at_ms,
             updated_at_ms: self.updated_at_ms,
-            sync: self.sync,
+            sync: SyncState {
+                last_notes: StoredSyncNotes::decode(&self.sync_notes_json)?,
+                ..self.sync
+            },
             delivery: self.delivery,
         })
     }
@@ -584,7 +589,9 @@ fn sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
             last_failure_at_ms: row.get(18)?,
             last_failure: row.get(19)?,
             last_runtime: row.get(20)?,
+            last_notes: StoredSyncNotes::default(),
         },
+        sync_notes_json: row.get(25)?,
         delivery: DeliveryHealth {
             last_success_at_ms: row.get(21)?,
             last_failure_at_ms: row.get(22)?,
@@ -620,7 +627,9 @@ fn postgres_row(row: &postgres::Row) -> Row {
             last_failure_at_ms: row.get(18),
             last_failure: row.get(19),
             last_runtime: row.get(20),
+            last_notes: StoredSyncNotes::default(),
         },
+        sync_notes_json: row.get(25),
         delivery: DeliveryHealth {
             last_success_at_ms: row.get(21),
             last_failure_at_ms: row.get(22),
@@ -639,6 +648,13 @@ UPDATE sekai_sources SET
     delivery_last_failure_at_ms = CASE WHEN $1 = '' THEN delivery_last_failure_at_ms ELSE $2 END,
     delivery_last_runtime = $3
 WHERE namespace = $4 AND source_id = $5";
+
+const INSTANCE_SQL: &str = concat!(
+    "SELECT ",
+    columns!(),
+    " FROM sekai_sources WHERE namespace = $1 AND source_instance = $2 \
+     ORDER BY source_id LIMIT 2"
+);
 
 fn list_sql(placeholder_after: &str, placeholder_limit: &str) -> String {
     format!(
@@ -766,6 +782,22 @@ impl SekaiDb {
             .map_err(|error| error.to_string())
     }
 
+    pub fn sources_with_instance(
+        &self,
+        namespace: &str,
+        source_instance: &str,
+    ) -> Result<Vec<Source>, String> {
+        let conn = self.conn();
+        let mut statement = conn
+            .prepare(INSTANCE_SQL)
+            .map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map(rusqlite::params![namespace, source_instance], sqlite_row)
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| row.map_err(|error| error.to_string())?.decode())
+            .collect()
+    }
+
     pub fn get_source(&self, namespace: &str, source_id: &str) -> Result<Option<Source>, String> {
         self.sqlite_source(
             &format!("SELECT {COLUMNS} FROM sekai_sources WHERE namespace = $1 AND source_id = $2"),
@@ -885,6 +917,19 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
+    pub fn sources_with_instance(
+        &self,
+        namespace: &str,
+        source_instance: &str,
+    ) -> Result<Vec<Source>, String> {
+        self.connection()?
+            .query(INSTANCE_SQL, &[&namespace, &source_instance])
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|row| postgres_row(row).decode())
+            .collect()
+    }
+
     pub fn get_source(&self, namespace: &str, source_id: &str) -> Result<Option<Source>, String> {
         self.postgres_source(
             &format!("SELECT {COLUMNS} FROM sekai_sources WHERE namespace = $1 AND source_id = $2"),
@@ -982,6 +1027,21 @@ impl RuntimeDb {
             }
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.record_source_delivery(namespace, source_id, runtime_id, failure, now_ms)
+            }),
+        }
+    }
+
+    /// At most two Sources in `namespace` whose batches carry
+    /// `source_instance`, so a caller can tell one owner from several.
+    pub fn sources_with_instance(
+        &self,
+        namespace: &str,
+        source_instance: &str,
+    ) -> Result<Vec<Source>, String> {
+        match self {
+            Self::Sqlite(db) => db.sources_with_instance(namespace, source_instance),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.sources_with_instance(namespace, source_instance)
             }),
         }
     }
@@ -1088,6 +1148,7 @@ impl SekaiDb {
                     sync.last_failure_at_ms,
                     sync.last_failure,
                     sync.last_runtime,
+                    sync.last_notes.encode(),
                     namespace,
                     source_id,
                 ],
@@ -1166,6 +1227,7 @@ impl PostgresDb {
                     &sync.last_failure_at_ms,
                     &sync.last_failure,
                     &sync.last_runtime,
+                    &sync.last_notes.encode(),
                     &namespace,
                     &source_id,
                 ],

@@ -257,6 +257,7 @@ const OBJECT_SET_MEMBERSHIPS_SCHEMA: &str =
 const EXPORT_RECEIPTS_RECOVERABLE_INDEX_SCHEMA: &str =
     include_str!("postgres/0179_export_receipts_recoverable_index.sql");
 const GRAPH_CHANGE_REQUESTS_SCHEMA: &str = include_str!("postgres/0180_graph_change_requests.sql");
+const SOURCE_SYNC_NOTES_SCHEMA: &str = include_str!("postgres/0181_source_sync_notes.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1302,6 +1303,12 @@ const MIGRATIONS: &[Migration] = &[
         180,
         "graph_change_requests",
         GRAPH_CHANGE_REQUESTS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        181,
+        "source_sync_notes",
+        SOURCE_SYNC_NOTES_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

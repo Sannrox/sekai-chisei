@@ -517,9 +517,11 @@ impl SekaiServiceImpl {
                 ack_work_response::Payload::ExportDelivery(acknowledged)
             }
             Kind::SourceSync => {
-                if inner.options.is_some() {
-                    return Err(mismatched());
-                }
+                let notes = match inner.options {
+                    None => None,
+                    Some(ack_work_request::Options::SourceSyncNotes(notes)) => Some(notes),
+                    Some(_) => return Err(mismatched()),
+                };
                 let req = Request::from_parts(metadata, extensions, ());
                 let fence = Fence {
                     owner: &inner.runtime_id,
@@ -533,6 +535,7 @@ impl SekaiServiceImpl {
                     fence,
                     &inner.outcome,
                     &inner.reason,
+                    notes,
                 )?)
             }
             Kind::ExternalEffect => {
