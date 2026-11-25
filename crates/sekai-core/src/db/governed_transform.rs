@@ -44,11 +44,15 @@ pub struct TransformQuotaHold {
     pub claim_generation: i64,
     pub refund_request: bool,
     pub refund_tokens: i32,
+    /// Compute seconds the claim reserved (#3044, ADR 0168 part 2b), settled
+    /// to the measured seconds when the run finishes and refunded otherwise.
+    /// Zero on a hold an older plane wrote.
+    pub reserved_compute_seconds: i32,
 }
 
 /// Columns every hold read returns, in [`TransformQuotaHold`] order.
-pub(crate) const QUOTA_HOLD_COLUMNS: &str =
-    "tenant_id, quota_scope, reserved_concurrency, claim_generation, refund_request, refund_tokens";
+pub(crate) const QUOTA_HOLD_COLUMNS: &str = "tenant_id, quota_scope, reserved_concurrency, claim_generation, refund_request, refund_tokens, \
+     reserved_compute_seconds";
 
 fn quota_hold_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransformQuotaHold> {
     Ok(TransformQuotaHold {
@@ -58,6 +62,7 @@ fn quota_hold_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransformQuotaHol
         claim_generation: row.get(3)?,
         refund_request: row.get::<_, i64>(4)? != 0,
         refund_tokens: i32::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+        reserved_compute_seconds: i32::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
     })
 }
 
@@ -224,6 +229,7 @@ impl SekaiDb {
                     refund_request INTEGER NOT NULL DEFAULT 0,
                     refund_tokens INTEGER NOT NULL DEFAULT 0,
                     quota_scope TEXT NOT NULL DEFAULT '',
+                    reserved_compute_seconds INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (run_id, claim_generation)
                 );
                 CREATE TABLE IF NOT EXISTS sekai_transform_quota_owner (
@@ -334,6 +340,12 @@ impl SekaiDb {
             &self.conn(),
             "ALTER TABLE sekai_transform_quota_hold
              ADD COLUMN quota_scope TEXT NOT NULL DEFAULT ''",
+        )?;
+        // #3044 part 2b: compute seconds the hold still owns.
+        crate::db::add_sqlite_column(
+            &self.conn(),
+            "ALTER TABLE sekai_transform_quota_hold
+             ADD COLUMN reserved_compute_seconds INTEGER NOT NULL DEFAULT 0",
         )?;
         Ok(())
     }
@@ -1442,12 +1454,14 @@ impl SekaiDb {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn put_transform_quota_hold(
         &self,
         run_id: &str,
         tenant_id: &str,
         quota_scope: &str,
         reserved_concurrency: bool,
+        reserved_compute_seconds: i32,
         claim_generation: i64,
         fencing_token: &str,
     ) -> Result<bool, String> {
@@ -1484,12 +1498,14 @@ impl SekaiDb {
         let changed = tx
             .execute(
                 "INSERT INTO sekai_transform_quota_hold
-                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope,
+                     reserved_compute_seconds)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(run_id, claim_generation) DO UPDATE SET
                     tenant_id = excluded.tenant_id,
                     quota_scope = excluded.quota_scope,
                     reserved_concurrency = excluded.reserved_concurrency,
+                    reserved_compute_seconds = excluded.reserved_compute_seconds,
                     claim_generation = excluded.claim_generation
                  WHERE excluded.claim_generation >= sekai_transform_quota_hold.claim_generation",
                 params![
@@ -1497,7 +1513,8 @@ impl SekaiDb {
                     tenant_id,
                     i64::from(reserved_concurrency),
                     claim_generation,
-                    quota_scope
+                    quota_scope,
+                    reserved_compute_seconds
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -1511,30 +1528,35 @@ impl SekaiDb {
         tenant_id: &str,
         quota_scope: &str,
         reserved_concurrency: bool,
+        reserved_compute_seconds: i32,
         claim_generation: i64,
     ) -> Result<bool, String> {
         let changed = self
             .conn()
             .execute(
                 "INSERT INTO sekai_transform_quota_hold
-                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope,
+                     reserved_compute_seconds)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(run_id, claim_generation) DO UPDATE SET
                     tenant_id = excluded.tenant_id,
                     quota_scope = excluded.quota_scope,
-                    reserved_concurrency = excluded.reserved_concurrency",
+                    reserved_concurrency = excluded.reserved_concurrency,
+                    reserved_compute_seconds = excluded.reserved_compute_seconds",
                 params![
                     run_id,
                     tenant_id,
                     i64::from(reserved_concurrency),
                     claim_generation,
-                    quota_scope
+                    quota_scope,
+                    reserved_compute_seconds
                 ],
             )
             .map_err(|error| error.to_string())?;
         Ok(changed > 0)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn restore_abandoned_quota_hold(
         &self,
         run_id: &str,
@@ -1543,26 +1565,30 @@ impl SekaiDb {
         reserved_concurrency: bool,
         refund_request: bool,
         refund_tokens: i32,
+        reserved_compute_seconds: i32,
     ) -> Result<bool, String> {
         let changed = self
             .conn()
             .execute(
                 "INSERT INTO sekai_transform_quota_hold
-                    (run_id, tenant_id, reserved_concurrency, claim_generation, refund_request, refund_tokens, quota_scope)
-                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, refund_request, refund_tokens, quota_scope,
+                     reserved_compute_seconds)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7)
                  ON CONFLICT(run_id, claim_generation) DO UPDATE SET
                     tenant_id = excluded.tenant_id,
                     quota_scope = excluded.quota_scope,
                     reserved_concurrency = excluded.reserved_concurrency,
                     refund_request = excluded.refund_request,
-                    refund_tokens = excluded.refund_tokens",
+                    refund_tokens = excluded.refund_tokens,
+                    reserved_compute_seconds = excluded.reserved_compute_seconds",
                 params![
                     run_id,
                     tenant_id,
                     i64::from(reserved_concurrency),
                     i64::from(refund_request),
                     refund_tokens,
-                    quota_scope
+                    quota_scope,
+                    reserved_compute_seconds
                 ],
             )
             .map_err(|error| error.to_string())?;
@@ -8077,6 +8103,7 @@ mod tests {
             claim_generation,
             refund_request: false,
             refund_tokens: 0,
+            reserved_compute_seconds: 0,
         }
     }
 
@@ -8106,6 +8133,7 @@ mod tests {
                 "tenant-a",
                 "",
                 true,
+                0,
                 work.claim_generation,
                 &work.fencing_token,
             )
@@ -8138,6 +8166,7 @@ mod tests {
                 "tenant-a",
                 "",
                 true,
+                0,
                 work.claim_generation,
                 &work.fencing_token,
             )
@@ -8149,6 +8178,7 @@ mod tests {
                 "tenant-a",
                 "",
                 true,
+                0,
                 work.claim_generation
             )
             .unwrap()
@@ -8186,6 +8216,7 @@ mod tests {
                 "tenant-a",
                 "",
                 true,
+                0,
                 work.claim_generation,
                 &work.fencing_token,
             )
@@ -8203,6 +8234,7 @@ mod tests {
                 "tenant-a",
                 "",
                 true,
+                0,
                 work.claim_generation,
                 &work.fencing_token,
             )
@@ -8214,6 +8246,7 @@ mod tests {
                 "tenant-a",
                 "",
                 true,
+                0,
                 work.claim_generation
             )
             .unwrap()
@@ -8238,7 +8271,7 @@ mod tests {
     fn restore_quota_hold_without_work_is_retryable_in_process() {
         let db = db();
         assert!(
-            db.restore_transform_quota_hold("run-in-process", "tenant-a", "", true, 0)
+            db.restore_transform_quota_hold("run-in-process", "tenant-a", "", true, 0, 0)
                 .unwrap()
         );
         assert_eq!(
@@ -8257,11 +8290,11 @@ mod tests {
     fn restore_older_hold_keeps_the_current_claim_hold() {
         let db = db();
         assert!(
-            db.restore_transform_quota_hold("run-overlap", "tenant-a", "", true, 1)
+            db.restore_transform_quota_hold("run-overlap", "tenant-a", "", true, 0, 1)
                 .unwrap()
         );
         assert!(
-            db.restore_transform_quota_hold("run-overlap", "tenant-a", "", true, 2)
+            db.restore_transform_quota_hold("run-overlap", "tenant-a", "", true, 0, 2)
                 .unwrap()
         );
         assert_eq!(
@@ -8303,6 +8336,7 @@ mod tests {
                 "tenant-a",
                 "",
                 true,
+                0,
                 first.claim_generation,
                 &first.fencing_token,
             )
@@ -8323,13 +8357,14 @@ mod tests {
                 "tenant-a",
                 "",
                 true,
+                0,
                 second.claim_generation,
                 &second.fencing_token,
             )
             .unwrap()
         );
         assert!(
-            db.restore_transform_quota_hold(&second.run_id, "tenant-a", "", true, 1)
+            db.restore_transform_quota_hold(&second.run_id, "tenant-a", "", true, 0, 1)
                 .unwrap()
         );
         assert_eq!(
@@ -8378,11 +8413,11 @@ mod tests {
             .expect("reclaim after lease expiry");
         assert_eq!(second.claim_generation, 2);
         assert!(
-            db.restore_transform_quota_hold(&second.run_id, "tenant-a", "", true, 0)
+            db.restore_transform_quota_hold(&second.run_id, "tenant-a", "", true, 0, 0)
                 .unwrap()
         );
         assert!(
-            db.restore_transform_quota_hold(&second.run_id, "tenant-a", "", true, 1)
+            db.restore_transform_quota_hold(&second.run_id, "tenant-a", "", true, 0, 1)
                 .unwrap()
         );
         assert_eq!(
@@ -8431,6 +8466,7 @@ mod tests {
                 "tenant-a",
                 "",
                 true,
+                0,
                 first.claim_generation,
                 &first.fencing_token,
             )
@@ -8485,6 +8521,7 @@ mod tests {
                 "tenant-a",
                 scope,
                 true,
+                0,
                 first.claim_generation,
                 &first.fencing_token,
             )
@@ -8533,6 +8570,40 @@ mod tests {
             .expect("the older hold survives the upgrade");
         assert_eq!(older.quota_scope, "");
         assert!(older.refund_request);
+    }
+
+    #[test]
+    fn a_hold_table_without_compute_seconds_gains_it_and_reads_older_holds_as_none() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("before-compute-seconds.sqlite");
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        db.conn()
+            .execute_batch(
+                "ALTER TABLE sekai_transform_quota_hold DROP COLUMN reserved_compute_seconds;
+                 INSERT INTO sekai_transform_quota_hold
+                    (run_id, tenant_id, reserved_concurrency, claim_generation, quota_scope)
+                 VALUES ('held-before', 'tenant-a', 1, 1, '');",
+            )
+            .unwrap();
+        drop(db);
+
+        let db = SekaiDb::new(path.to_str().unwrap()).unwrap();
+        let older = db
+            .take_transform_quota_hold("held-before", Some(1), false)
+            .unwrap()
+            .expect("the older hold survives the upgrade");
+        assert_eq!(older.reserved_compute_seconds, 0);
+        assert!(older.reserved_concurrency);
+        assert!(
+            db.restore_transform_quota_hold("held-after", "tenant-a", "", false, 30, 1)
+                .unwrap()
+        );
+        assert_eq!(
+            db.take_transform_quota_hold("held-after", Some(1), false)
+                .unwrap()
+                .map(|hold| hold.reserved_compute_seconds),
+            Some(30)
+        );
     }
 
     #[test]

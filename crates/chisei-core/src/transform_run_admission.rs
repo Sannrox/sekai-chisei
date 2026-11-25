@@ -6,8 +6,8 @@
 use crate::chisei::budget::PeriodType;
 use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, OperationReceipt};
 use crate::chisei::tenant_quota::{
-    METRIC_CONCURRENCY, METRIC_STORAGE_BYTES, NamespaceQuotaScope, TenantQuotaAdmission,
-    TenantQuotaError, TenantQuotaGate, TenantQuotaLimits, tenant_scope_id,
+    METRIC_COMPUTE_SECONDS, METRIC_CONCURRENCY, METRIC_STORAGE_BYTES, NamespaceQuotaScope,
+    TenantQuotaAdmission, TenantQuotaError, TenantQuotaGate, TenantQuotaLimits, tenant_scope_id,
 };
 use crate::chisei::usage_ledger::UsageEvent;
 use crate::chisei_store::ChiseiStore;
@@ -141,12 +141,16 @@ impl RunQuotaLimits {
         self.tenant.is_none() && self.namespace.is_none()
     }
 
-    /// The refusal of a run larger than either whole budget.
-    pub fn refusal_larger_than_budget(&self) -> Option<IsolatedProcessRefusal> {
+    /// The refusal of a run estimated at `compute_seconds` that is larger
+    /// than either whole budget.
+    pub fn refusal_larger_than_budget(
+        &self,
+        compute_seconds: i32,
+    ) -> Option<IsolatedProcessRefusal> {
         self.tenant
             .iter()
             .chain(self.namespace.as_ref().map(|(_, limits)| limits))
-            .find_map(refusal_larger_than_budget)
+            .find_map(|limits| refusal_larger_than_budget(limits, compute_seconds))
     }
 }
 
@@ -155,6 +159,7 @@ fn limits_from_rows(rows: BudgetLimitRows) -> Option<TenantQuotaLimits> {
     let mut any = false;
     let mut request_period = None;
     let mut token_period = None;
+    let mut compute_period = None;
     for (_scope, metric, max_amount, period) in rows {
         any = true;
         match metric.as_str() {
@@ -167,6 +172,11 @@ fn limits_from_rows(rows: BudgetLimitRows) -> Option<TenantQuotaLimits> {
                 limits.max_tokens_per_period = Some(i32::try_from(max_amount).unwrap_or(i32::MAX));
                 token_period = Some(PeriodType::parse(&period));
             }
+            METRIC_COMPUTE_SECONDS => {
+                limits.max_compute_seconds_per_period =
+                    Some(i32::try_from(max_amount).unwrap_or(i32::MAX));
+                compute_period = Some(PeriodType::parse(&period));
+            }
             METRIC_CONCURRENCY => {
                 // In-flight units stay on a long tracker period; they are not
                 // the request/token accounting window.
@@ -176,7 +186,7 @@ fn limits_from_rows(rows: BudgetLimitRows) -> Option<TenantQuotaLimits> {
             _ => {}
         }
     }
-    if let Some(period) = request_period.or(token_period) {
+    if let Some(period) = request_period.or(token_period).or(compute_period) {
         limits.period = period;
     }
     any.then_some(limits)
@@ -187,11 +197,14 @@ fn limits_from_rows(rows: BudgetLimitRows) -> Option<TenantQuotaLimits> {
 pub const REFUSAL_LARGER_THAN_BUDGET: &str = "quota_larger_than_budget";
 
 /// The terminal refusal of a transform run whose own reservation exceeds a
-/// whole configured budget. Each run reserves one request and one
-/// concurrency unit, so a limit of zero for either can never admit it; a
-/// run left waiting on such a limit would wait forever. Usage, which frees
-/// with time, never refuses here.
-pub fn refusal_larger_than_budget(limits: &TenantQuotaLimits) -> Option<IsolatedProcessRefusal> {
+/// whole configured budget. Each run reserves one request, one concurrency
+/// unit and its `compute_seconds` estimate, so a limit below any of them can
+/// never admit it; a run left waiting on such a limit would wait forever.
+/// Usage, which frees with time, never refuses here.
+pub fn refusal_larger_than_budget(
+    limits: &TenantQuotaLimits,
+    compute_seconds: i32,
+) -> Option<IsolatedProcessRefusal> {
     const RUN_REQUESTS: i64 = 1;
     const RUN_CONCURRENCY: i64 = 1;
     [
@@ -199,6 +212,11 @@ pub fn refusal_larger_than_budget(limits: &TenantQuotaLimits) -> Option<Isolated
             METRIC_REQUESTS,
             limits.max_requests_per_period.map(i64::from),
             RUN_REQUESTS,
+        ),
+        (
+            METRIC_COMPUTE_SECONDS,
+            limits.max_compute_seconds_per_period.map(i64::from),
+            i64::from(compute_seconds),
         ),
         (
             METRIC_CONCURRENCY,
@@ -242,14 +260,16 @@ pub fn refusal_budget_exhausted(error: &TenantQuotaError) -> Option<IsolatedProc
     }
 }
 
-/// Admit a transform run against its tenant and namespace assignments. A
-/// reclaimed run already holds its request on both scopes, so it reserves
-/// none again.
+/// Admit a transform run against its tenant and namespace assignments,
+/// reserving `compute_seconds` of its compute budget. A reclaimed run
+/// already holds its request on both scopes, so it reserves none again; its
+/// compute is reserved anew because the lost claim's was refunded.
 pub fn admit_transform_run(
     gate: &TenantQuotaGate,
     context: &AuthenticatedContext,
     limits: &RunQuotaLimits,
     run_key: &str,
+    compute_seconds: i32,
     reclaim: bool,
 ) -> Result<TenantQuotaAdmission, TenantQuotaError> {
     let without_request = |limits: &TenantQuotaLimits| {
@@ -275,6 +295,7 @@ pub fn admit_transform_run(
         namespace.as_ref().map(|(scope, limits)| (*scope, limits)),
         1,
         0,
+        compute_seconds,
         run_key,
     )
 }
@@ -363,6 +384,7 @@ mod tests {
                 version: 1,
                 max_requests_per_period: Some(2),
                 max_tokens_per_period: None,
+                max_compute_seconds_per_period: None,
                 max_concurrency: None,
                 max_storage_bytes: None,
                 period: PeriodType::Daily,
@@ -386,6 +408,7 @@ mod tests {
                 version: 1,
                 max_requests_per_period: Some(2),
                 max_tokens_per_period: None,
+                max_compute_seconds_per_period: None,
                 max_concurrency: Some(4),
                 max_storage_bytes: None,
                 period: PeriodType::Daily,
@@ -413,6 +436,7 @@ mod tests {
             version: 1,
             max_requests_per_period: Some(requests),
             max_tokens_per_period: None,
+            max_compute_seconds_per_period: None,
             max_concurrency: Some(concurrency),
             max_storage_bytes: None,
             period: PeriodType::Daily,
@@ -447,14 +471,15 @@ mod tests {
         // and is never larger than its budget, although the namespace
         // assignment would refuse every run once enforced.
         let limits = before.expect("tenant limits");
-        assert_eq!(refusal_larger_than_budget(&limits), None);
+        assert_eq!(refusal_larger_than_budget(&limits, 0), None);
         let ctx = tenant_context("tenant-a", "alice");
         for key in ["run-1", "run-2"] {
-            let held = admit_transform_run(&gate, &ctx, &tenant_only(&limits), key, false).unwrap();
+            let held =
+                admit_transform_run(&gate, &ctx, &tenant_only(&limits), key, 0, false).unwrap();
             complete_transform_run(&gate, &held).unwrap();
         }
         assert!(matches!(
-            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-3", false),
+            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-3", 0, false),
             Err(TenantQuotaError::Exhausted { metric, .. }) if metric == METRIC_REQUESTS
         ));
     }
@@ -501,6 +526,7 @@ mod tests {
             &tenant_context("tenant-a", "alice"),
             &limits,
             key,
+            0,
             false,
         )
     }
@@ -539,6 +565,7 @@ mod tests {
             &tenant_context("tenant-a", "alice"),
             &limits,
             "run-1",
+            0,
             true,
         );
         assert!(reclaim.is_ok(), "{reclaim:?}");
@@ -567,12 +594,12 @@ mod tests {
         );
         let refusal = configured_run_limits(&db, "tenant-a", "ops")
             .unwrap()
-            .refusal_larger_than_budget()
+            .refusal_larger_than_budget(0)
             .expect("the namespace can never hold a concurrency unit");
         assert_eq!(refusal.details["metric"], METRIC_CONCURRENCY);
         assert_eq!(refusal.details["limit"], "0");
         let dev = configured_run_limits(&db, "tenant-a", "dev").unwrap();
-        assert_eq!(dev.refusal_larger_than_budget(), None);
+        assert_eq!(dev.refusal_larger_than_budget(0), None);
     }
 
     /// What a successor refunds for a crashed claim from its stored hold.
@@ -618,21 +645,21 @@ mod tests {
 
     #[test]
     fn a_zero_budget_refuses_a_run_that_could_never_fit() {
-        let refusal = refusal_larger_than_budget(&requests_and_concurrency(5, 0))
+        let refusal = refusal_larger_than_budget(&requests_and_concurrency(5, 0), 0)
             .expect("no concurrency unit can ever be held");
         assert_eq!(refusal.code, REFUSAL_LARGER_THAN_BUDGET);
         assert_eq!(refusal.details["metric"], METRIC_CONCURRENCY);
         assert_eq!(refusal.details["limit"], "0");
         assert_eq!(refusal.details["requested"], "1");
         refusal.validate().unwrap();
-        let refusal = refusal_larger_than_budget(&requests_and_concurrency(0, 1)).unwrap();
+        let refusal = refusal_larger_than_budget(&requests_and_concurrency(0, 1), 0).unwrap();
         assert_eq!(refusal.details["metric"], METRIC_REQUESTS);
         assert_eq!(
-            refusal_larger_than_budget(&requests_and_concurrency(1, 1)),
+            refusal_larger_than_budget(&requests_and_concurrency(1, 1), 0),
             None
         );
         assert_eq!(
-            refusal_larger_than_budget(&TenantQuotaLimits::unlimited(1)),
+            refusal_larger_than_budget(&TenantQuotaLimits::unlimited(1), 0),
             None
         );
     }
@@ -645,18 +672,21 @@ mod tests {
             version: 1,
             max_requests_per_period: Some(2),
             max_tokens_per_period: None,
+            max_compute_seconds_per_period: None,
             max_concurrency: None,
             max_storage_bytes: None,
             period: PeriodType::Daily,
         };
         gate.configure("tenant-a", &limits).unwrap();
         let ctx = tenant_context("tenant-a", "alice");
-        let a1 = admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-1", false).unwrap();
+        let a1 =
+            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-1", 0, false).unwrap();
         complete_transform_run(&gate, &a1).unwrap();
-        let a2 = admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-2", false).unwrap();
+        let a2 =
+            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-2", 0, false).unwrap();
         complete_transform_run(&gate, &a2).unwrap();
         let err =
-            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-3", false).unwrap_err();
+            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-3", 0, false).unwrap_err();
         assert!(matches!(
             err,
             TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_REQUESTS
@@ -671,6 +701,7 @@ mod tests {
             version: 1,
             max_requests_per_period: Some(1),
             max_tokens_per_period: None,
+            max_compute_seconds_per_period: None,
             max_concurrency: None,
             max_storage_bytes: None,
             period: PeriodType::Daily,
@@ -678,11 +709,11 @@ mod tests {
         gate.configure("tenant-a", &limits).unwrap();
         let ctx = tenant_context("tenant-a", "alice");
         let first =
-            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-1", false).unwrap();
+            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-1", 0, false).unwrap();
         complete_transform_run(&gate, &first).unwrap();
-        admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-1", true).unwrap();
+        admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-1", 0, true).unwrap();
         let err =
-            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-2", false).unwrap_err();
+            admit_transform_run(&gate, &ctx, &tenant_only(&limits), "run-2", 0, false).unwrap_err();
         assert!(matches!(
             err,
             TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_REQUESTS

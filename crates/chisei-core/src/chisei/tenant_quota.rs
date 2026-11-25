@@ -21,6 +21,11 @@ use serde::{Deserialize, Serialize};
 use crate::chisei::budget::{BudgetTracker, PeriodType};
 use crate::chisei_store::ChiseiStore;
 use sekai_core::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
+
+/// Seconds of isolated-process compute per period (#3044, ADR 0168 part 2b).
+/// A claim reserves the run's estimate; the finished run settles it to the
+/// measured seconds.
+pub const METRIC_COMPUTE_SECONDS: &str = "compute_seconds";
 use sekai_core::enterprise::AuthenticatedContext;
 
 /// In-flight concurrency units reserved while a tenant operation is active.
@@ -37,6 +42,9 @@ pub struct TenantQuotaLimits {
     pub version: u64,
     pub max_requests_per_period: Option<i32>,
     pub max_tokens_per_period: Option<i32>,
+    /// Absent in an assignment an older plane serialized.
+    #[serde(default)]
+    pub max_compute_seconds_per_period: Option<i32>,
     pub max_concurrency: Option<i32>,
     pub max_storage_bytes: Option<i64>,
     pub period: PeriodType,
@@ -48,6 +56,10 @@ impl TenantQuotaLimits {
         let negative = [
             (METRIC_REQUESTS, self.max_requests_per_period.map(i64::from)),
             (METRIC_TOKENS, self.max_tokens_per_period.map(i64::from)),
+            (
+                METRIC_COMPUTE_SECONDS,
+                self.max_compute_seconds_per_period.map(i64::from),
+            ),
             (METRIC_CONCURRENCY, self.max_concurrency.map(i64::from)),
             (METRIC_STORAGE_BYTES, self.max_storage_bytes),
         ]
@@ -64,6 +76,7 @@ impl TenantQuotaLimits {
             version,
             max_requests_per_period: None,
             max_tokens_per_period: None,
+            max_compute_seconds_per_period: None,
             max_concurrency: None,
             max_storage_bytes: None,
             period: PeriodType::Daily,
@@ -233,6 +246,11 @@ impl TenantQuotaGate {
                 .set_limit_with_metric(scope, METRIC_REQUESTS, max, limits.period)
                 .map_err(TenantQuotaError::Storage)?;
         }
+        if let Some(max) = limits.max_compute_seconds_per_period {
+            self.tracker
+                .set_limit_with_metric(scope, METRIC_COMPUTE_SECONDS, max, limits.period)
+                .map_err(TenantQuotaError::Storage)?;
+        }
         if let Some(max) = limits.max_concurrency {
             // The monthly row is only the configured cap `configured_limits`
             // reads. Live units are holder-keyed holds, not budget consume.
@@ -268,6 +286,7 @@ impl TenantQuotaGate {
             None,
             min_assignment_version,
             estimated_tokens,
+            0,
             idempotency_key,
         )
     }
@@ -277,6 +296,9 @@ impl TenantQuotaGate {
     /// namespace scope, so the budget chain reserves on both scopes or on
     /// neither. A namespace concurrency limit takes a second hold under the
     /// namespace scope, given back when the tenant's or its own is refused.
+    /// `estimated_compute_seconds` reserves like the request does, without an
+    /// idempotency key: each claim of a run is its own reservation.
+    #[allow(clippy::too_many_arguments)]
     pub fn admit_in_namespace(
         &self,
         context: &AuthenticatedContext,
@@ -284,6 +306,7 @@ impl TenantQuotaGate {
         namespace: Option<(&NamespaceQuotaScope, &TenantQuotaLimits)>,
         min_assignment_version: u64,
         estimated_tokens: i32,
+        estimated_compute_seconds: i32,
         idempotency_key: &str,
     ) -> Result<TenantQuotaAdmission, TenantQuotaError> {
         let now = wall_ms();
@@ -293,6 +316,7 @@ impl TenantQuotaGate {
             namespace,
             min_assignment_version,
             estimated_tokens,
+            estimated_compute_seconds,
             idempotency_key,
             now..=now.saturating_add(CONCURRENCY_HOLD_MS),
         )
@@ -307,6 +331,7 @@ impl TenantQuotaGate {
         namespace: Option<(&NamespaceQuotaScope, &TenantQuotaLimits)>,
         min_assignment_version: u64,
         estimated_tokens: i32,
+        estimated_compute_seconds: i32,
         idempotency_key: &str,
         hold: std::ops::RangeInclusive<i64>,
     ) -> Result<TenantQuotaAdmission, TenantQuotaError> {
@@ -334,6 +359,7 @@ impl TenantQuotaGate {
             assignment_version: limits.version,
             reserved_tokens: 0,
             reserved_request: false,
+            reserved_compute_seconds: 0,
             reserved_concurrency: false,
             idempotency_key: idempotency_key.to_string(),
             concurrency_holder: String::new(),
@@ -355,6 +381,23 @@ impl TenantQuotaGate {
                 return Err(exhausted(METRIC_TOKENS));
             }
             reserved.reserved_tokens = estimated_tokens;
+        }
+        if either(|limits| limits.max_compute_seconds_per_period.is_some())
+            && estimated_compute_seconds > 0
+        {
+            if self
+                .tracker
+                .check_and_reserve_with_metric(
+                    &scope,
+                    estimated_compute_seconds,
+                    METRIC_COMPUTE_SECONDS,
+                )
+                .is_err()
+            {
+                let _ = self.rollback_partial(&reserved);
+                return Err(exhausted(METRIC_COMPUTE_SECONDS));
+            }
+            reserved.reserved_compute_seconds = estimated_compute_seconds;
         }
         // The tenant's hold first, then the namespace's, under one holder.
         let holds = [
@@ -434,7 +477,7 @@ impl TenantQuotaGate {
 
     /// Drop a reservation when the admitted work did not run.
     ///
-    /// Refunds request, tokens, then concurrency. On a storage error the
+    /// Refunds request, tokens, compute seconds, then concurrency. On a storage error the
     /// returned admission still includes the metric that failed and any that
     /// were not attempted, so a retry does not refund a metric twice.
     pub fn abandon(&self, admission: &TenantQuotaAdmission) -> Result<(), Box<QuotaAbandonError>> {
@@ -464,6 +507,12 @@ impl TenantQuotaGate {
                 }));
             }
             remaining.reserved_tokens = 0;
+        }
+        if remaining.reserved_compute_seconds > 0 {
+            if let Err(error) = self.settle_compute(&remaining, 0) {
+                return Err(Box::new(QuotaAbandonError { error, remaining }));
+            }
+            remaining.reserved_compute_seconds = 0;
         }
         if remaining.reserved_concurrency {
             if let Err(error) = self.release_concurrency(&remaining) {
@@ -508,6 +557,28 @@ impl TenantQuotaGate {
         })
     }
 
+    /// Reconciles the compute seconds an admission reserved to `actual`, and
+    /// refunds them when `actual` is zero. The caller clears
+    /// `reserved_compute_seconds` once this returns, so a retry cannot
+    /// adjust twice.
+    pub fn settle_compute(
+        &self,
+        admission: &TenantQuotaAdmission,
+        actual: i32,
+    ) -> Result<(), TenantQuotaError> {
+        if admission.reserved_compute_seconds <= 0 {
+            return Ok(());
+        }
+        self.tracker
+            .try_adjust_with_metric(
+                &admission.scope_id,
+                admission.reserved_compute_seconds,
+                actual.max(0),
+                METRIC_COMPUTE_SECONDS,
+            )
+            .map_err(TenantQuotaError::Storage)
+    }
+
     /// Charge storage growth against the tenant storage quota.
     pub fn charge_storage(
         &self,
@@ -540,7 +611,7 @@ impl TenantQuotaGate {
                 )
                 .map_err(TenantQuotaError::Storage)?;
         }
-        Ok(())
+        self.settle_compute(admission, 0)
     }
 }
 
@@ -552,6 +623,8 @@ pub struct TenantQuotaAdmission {
     pub assignment_version: u64,
     pub reserved_tokens: i32,
     pub reserved_request: bool,
+    /// Compute seconds reserved and not yet settled.
+    pub reserved_compute_seconds: i32,
     pub reserved_concurrency: bool,
     pub idempotency_key: String,
     /// Process that took the concurrency hold. Empty on reconstructed
@@ -570,6 +643,7 @@ impl TenantQuotaAdmission {
             assignment_version: 1,
             reserved_tokens: 0,
             reserved_request: false,
+            reserved_compute_seconds: 0,
             reserved_concurrency: false,
             idempotency_key: idempotency_key.to_string(),
             concurrency_holder: String::new(),
@@ -591,6 +665,9 @@ impl TenantQuotaAdmission {
         }
         if self.reserved_tokens > 0 {
             names.push(METRIC_TOKENS.into());
+        }
+        if self.reserved_compute_seconds > 0 {
+            names.push(METRIC_COMPUTE_SECONDS.into());
         }
         if self.reserved_concurrency {
             names.push(METRIC_CONCURRENCY.into());
@@ -643,6 +720,7 @@ mod tests {
             version,
             max_requests_per_period: Some(2),
             max_tokens_per_period: Some(100),
+            max_compute_seconds_per_period: None,
             max_concurrency: Some(1),
             max_storage_bytes: Some(1_000),
             period: PeriodType::Daily,
@@ -760,6 +838,7 @@ mod tests {
         let lim = TenantQuotaLimits {
             max_requests_per_period: Some(1),
             max_tokens_per_period: None,
+            max_compute_seconds_per_period: None,
             max_concurrency: None,
             max_storage_bytes: None,
             ..limits(1)
@@ -846,6 +925,7 @@ mod tests {
         let lim = TenantQuotaLimits {
             max_requests_per_period: None,
             max_tokens_per_period: None,
+            max_compute_seconds_per_period: None,
             max_concurrency: Some(1),
             max_storage_bytes: None,
             ..limits(1)
@@ -871,6 +951,7 @@ mod tests {
         let lim = TenantQuotaLimits {
             max_requests_per_period: None,
             max_tokens_per_period: None,
+            max_compute_seconds_per_period: None,
             max_concurrency: Some(1),
             max_storage_bytes: None,
             ..limits(1)
@@ -899,6 +980,7 @@ mod tests {
         let lim = TenantQuotaLimits {
             max_requests_per_period: Some(1),
             max_tokens_per_period: None,
+            max_compute_seconds_per_period: None,
             max_concurrency: None,
             max_storage_bytes: None,
             ..limits(1)
@@ -933,11 +1015,37 @@ mod tests {
     }
 
     #[test]
+    fn compute_seconds_reserve_settle_to_actual_and_refund_on_abandon() {
+        let gate = gate();
+        let lim = TenantQuotaLimits {
+            max_compute_seconds_per_period: Some(60),
+            ..TenantQuotaLimits::unlimited(1)
+        };
+        gate.configure("tenant-a", &lim).unwrap();
+        let ctx = tenant_context("tenant-a", "alice");
+        let admit = |key: &str| gate.admit_in_namespace(&ctx, &lim, None, 1, 0, 30, key);
+        let first = admit("run-1").unwrap();
+        assert_eq!(first.reserved_compute_seconds, 30);
+        let second = admit("run-2").unwrap();
+        assert!(matches!(
+            admit("run-3").unwrap_err(),
+            TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_COMPUTE_SECONDS
+        ));
+        // Settling to 5 measured seconds frees 25, not enough for a third 30.
+        gate.settle_compute(&first, 5).unwrap();
+        assert!(admit("run-3").is_err());
+        // Abandoning the second run refunds all 30 of its seconds.
+        gate.abandon(&second).unwrap();
+        admit("run-3").unwrap();
+    }
+
+    #[test]
     fn token_exhaustion_rolls_back_request_reservation() {
         let gate = gate();
         let lim = TenantQuotaLimits {
             max_requests_per_period: Some(1),
             max_tokens_per_period: Some(5),
+            max_compute_seconds_per_period: None,
             max_concurrency: None,
             ..limits(1)
         };
@@ -960,6 +1068,7 @@ mod tests {
         TenantQuotaLimits {
             max_requests_per_period: None,
             max_tokens_per_period: None,
+            max_compute_seconds_per_period: None,
             max_concurrency: Some(1),
             max_storage_bytes: None,
             ..limits(1)
@@ -972,16 +1081,16 @@ mod tests {
         let lim = concurrency_only();
         gate.configure("tenant-a", &lim).unwrap();
         let a = tenant_context("tenant-a", "alice");
-        gate.admit_at(&a, &lim, None, 1, 0, "run-1", 0..=10)
+        gate.admit_at(&a, &lim, None, 1, 0, 0, "run-1", 0..=10)
             .unwrap();
         let blocked = gate
-            .admit_at(&a, &lim, None, 1, 0, "run-2", 5..=15)
+            .admit_at(&a, &lim, None, 1, 0, 0, "run-2", 5..=15)
             .unwrap_err();
         assert!(matches!(
             blocked,
             TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_CONCURRENCY
         ));
-        gate.admit_at(&a, &lim, None, 1, 0, "run-3", 11..=21)
+        gate.admit_at(&a, &lim, None, 1, 0, 0, "run-3", 11..=21)
             .expect("expired hold must free the slot");
     }
 
@@ -992,14 +1101,14 @@ mod tests {
         gate.configure("tenant-a", &lim).unwrap();
         let a = tenant_context("tenant-a", "alice");
         let held = gate
-            .admit_at(&a, &lim, None, 1, 0, "run-1", 0..=10)
+            .admit_at(&a, &lim, None, 1, 0, 0, "run-1", 0..=10)
             .unwrap();
         assert!(
             gate.renew_concurrency(&held, 9).unwrap(),
             "live holder must extend the hold"
         );
         let blocked = gate
-            .admit_at(&a, &lim, None, 1, 0, "run-2", 11..=21)
+            .admit_at(&a, &lim, None, 1, 0, 0, "run-2", 11..=21)
             .unwrap_err();
         assert!(matches!(
             blocked,
@@ -1018,15 +1127,15 @@ mod tests {
             let first = gate_on_file(path);
             first.configure("tenant-a", &lim).unwrap();
             first
-                .admit_at(&a, &lim, None, 1, 0, "run-crashed", 0..=10)
+                .admit_at(&a, &lim, None, 1, 0, 0, "run-crashed", 0..=10)
                 .unwrap();
         }
         let second = gate_on_file(path);
         second
-            .admit_at(&a, &lim, None, 1, 0, "run-next", 11..=21)
+            .admit_at(&a, &lim, None, 1, 0, 0, "run-next", 11..=21)
             .expect("a new process must reclaim the expired hold");
         let still_blocked = second
-            .admit_at(&a, &lim, None, 1, 0, "run-extra", 12..=22)
+            .admit_at(&a, &lim, None, 1, 0, 0, "run-extra", 12..=22)
             .unwrap_err();
         assert!(matches!(
             still_blocked,
@@ -1039,6 +1148,7 @@ mod tests {
             assignment_version: 1,
             reserved_tokens: 0,
             reserved_request: false,
+            reserved_compute_seconds: 0,
             reserved_concurrency: true,
             idempotency_key: "run-next".into(),
             concurrency_holder: String::new(),
@@ -1046,10 +1156,10 @@ mod tests {
         second.complete(&held, 0).unwrap();
         second.complete(&held, 0).unwrap();
         second
-            .admit_at(&a, &lim, None, 1, 0, "run-after-double", 13..=23)
+            .admit_at(&a, &lim, None, 1, 0, 0, "run-after-double", 13..=23)
             .expect("one complete frees one unit");
         let over = second
-            .admit_at(&a, &lim, None, 1, 0, "run-over", 14..=24)
+            .admit_at(&a, &lim, None, 1, 0, 0, "run-over", 14..=24)
             .unwrap_err();
         assert!(
             matches!(
@@ -1067,21 +1177,21 @@ mod tests {
         gate.configure("tenant-a", &lim).unwrap();
         let a = tenant_context("tenant-a", "alice");
         let stale = gate
-            .admit_at(&a, &lim, None, 1, 0, "run-1", 0..=10)
+            .admit_at(&a, &lim, None, 1, 0, 0, "run-1", 0..=10)
             .unwrap();
         let live = gate
-            .admit_at(&a, &lim, None, 1, 0, "run-1", 11..=21)
+            .admit_at(&a, &lim, None, 1, 0, 0, "run-1", 11..=21)
             .expect("expired same key is reclaimable");
         gate.complete(&stale, 0).unwrap();
         let blocked = gate
-            .admit_at(&a, &lim, None, 1, 0, "run-2", 12..=22)
+            .admit_at(&a, &lim, None, 1, 0, 0, "run-2", 12..=22)
             .unwrap_err();
         assert!(matches!(
             blocked,
             TenantQuotaError::Exhausted { metric, .. } if metric == METRIC_CONCURRENCY
         ));
         gate.complete(&live, 0).unwrap();
-        gate.admit_at(&a, &lim, None, 1, 0, "run-2", 13..=23)
+        gate.admit_at(&a, &lim, None, 1, 0, 0, "run-2", 13..=23)
             .expect("the live holder still owned the slot");
     }
 }

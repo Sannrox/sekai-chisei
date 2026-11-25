@@ -570,6 +570,7 @@ impl RuntimeDb {
         tenant_id: &str,
         quota_scope: &str,
         reserved_concurrency: bool,
+        reserved_compute_seconds: i32,
         claim_generation: i64,
         fencing_token: &str,
     ) -> Result<bool, String> {
@@ -579,6 +580,7 @@ impl RuntimeDb {
                 tenant_id,
                 quota_scope,
                 reserved_concurrency,
+                reserved_compute_seconds,
                 claim_generation,
                 fencing_token,
             ),
@@ -588,6 +590,7 @@ impl RuntimeDb {
                     tenant_id,
                     quota_scope,
                     reserved_concurrency,
+                    reserved_compute_seconds,
                     claim_generation,
                     fencing_token,
                 )
@@ -601,6 +604,7 @@ impl RuntimeDb {
         tenant_id: &str,
         quota_scope: &str,
         reserved_concurrency: bool,
+        reserved_compute_seconds: i32,
         claim_generation: i64,
     ) -> Result<bool, String> {
         match self {
@@ -609,6 +613,7 @@ impl RuntimeDb {
                 tenant_id,
                 quota_scope,
                 reserved_concurrency,
+                reserved_compute_seconds,
                 claim_generation,
             ),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
@@ -617,6 +622,7 @@ impl RuntimeDb {
                     tenant_id,
                     quota_scope,
                     reserved_concurrency,
+                    reserved_compute_seconds,
                     claim_generation,
                 )
             }),
@@ -631,6 +637,7 @@ impl RuntimeDb {
         reserved_concurrency: bool,
         refund_request: bool,
         refund_tokens: i32,
+        reserved_compute_seconds: i32,
     ) -> Result<bool, String> {
         match self {
             Self::Sqlite(db) => db.restore_abandoned_quota_hold(
@@ -640,6 +647,7 @@ impl RuntimeDb {
                 reserved_concurrency,
                 refund_request,
                 refund_tokens,
+                reserved_compute_seconds,
             ),
             Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
                 db.restore_abandoned_quota_hold(
@@ -649,6 +657,7 @@ impl RuntimeDb {
                     reserved_concurrency,
                     refund_request,
                     refund_tokens,
+                    reserved_compute_seconds,
                 )
             }),
         }

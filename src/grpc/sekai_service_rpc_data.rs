@@ -3718,22 +3718,14 @@ pub(super) async fn claim_transform_work(
                         &work.fencing_token,
                     ) {
                         Ok(Some(hold)) => {
-                            if hold.reserved_concurrency {
-                                if let Err(status) = complete_reserved_transform_quota(
-                                    quota.clone(),
-                                    &work.run_id,
-                                    &hold,
-                                ) {
-                                    let _ = service.db.runtime().restore_transform_quota_hold(
-                                        &work.run_id,
-                                        &hold.tenant_id,
-                                        &hold.quota_scope,
-                                        true,
-                                        hold.claim_generation,
-                                    );
-                                    return Err(status);
-                                }
-                            }
+                            // The lost claim's compute never ran here: refund it.
+                            release_stored_quota_hold(
+                                service.db.runtime(),
+                                quota.clone(),
+                                &work.run_id,
+                                &hold,
+                                None,
+                            )?;
                             true
                         }
                         Ok(None) => service
@@ -3851,6 +3843,7 @@ pub(super) async fn claim_transform_work(
                                 &admission.tenant_id,
                                 &admission.scope_id,
                                 admission.reserved_concurrency,
+                                admission.reserved_compute_seconds,
                                 work.claim_generation,
                                 &work.fencing_token,
                             ) {
@@ -4197,18 +4190,14 @@ pub(super) async fn write_transform_run_result(
             .runtime()
             .take_transform_quota_hold(&run.run_id, Some(claim_generation), false)
             .map_err(Status::internal)?;
-        let quota = service.quota_runtime();
-        if let Some(hold) = hold.as_ref().filter(|hold| hold.reserved_concurrency) {
-            if let Err(status) = complete_reserved_transform_quota(quota, &run.run_id, hold) {
-                let _ = service.db.runtime().restore_transform_quota_hold(
-                    &run.run_id,
-                    &hold.tenant_id,
-                    &hold.quota_scope,
-                    true,
-                    hold.claim_generation,
-                );
-                return Err(status);
-            }
+        if let Some(hold) = hold.as_ref() {
+            release_stored_quota_hold(
+                service.db.runtime(),
+                service.quota_runtime(),
+                &run.run_id,
+                hold,
+                Some(measured_compute_seconds(service, &run.run_id, hold)?),
+            )?;
         }
         return Ok(Response::new(WriteTransformRunResultResponse {
             run: Some(with_run_outcome(
@@ -4247,17 +4236,14 @@ pub(super) async fn write_transform_run_result(
         .unwrap_or_else(now_millis);
     let usage =
         record_tenant_transform_usage(quota.as_ref(), usage_tenant, &run, &actor, completed_at_ms);
-    if let Some(hold) = hold.as_ref().filter(|hold| hold.reserved_concurrency) {
-        if let Err(status) = complete_reserved_transform_quota(quota, &run.run_id, hold) {
-            let _ = service.db.runtime().restore_transform_quota_hold(
-                &run.run_id,
-                &hold.tenant_id,
-                &hold.quota_scope,
-                true,
-                hold.claim_generation,
-            );
-            return Err(status);
-        }
+    if let Some(hold) = hold.as_ref() {
+        release_stored_quota_hold(
+            service.db.runtime(),
+            quota,
+            &run.run_id,
+            hold,
+            Some(measured_compute_seconds(service, &run.run_id, hold)?),
+        )?;
     }
     if usage? {
         ack_transform_usage_pending(service.db.runtime(), &run.run_id)?;
@@ -4559,8 +4545,9 @@ fn map_quota_error(error: crate::chisei::tenant_quota::TenantQuotaError) -> Stat
 }
 
 /// Wall-clock seconds reserved when the isolated-process spec carries no
-/// time limit. Matches the runner's default wall clock.
-const DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS: i64 = 30;
+/// time limit. Matches the runner's default wall clock. A claim reserves this
+/// much of the compute budget (#3044, ADR 0168 part 2b).
+const DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS: i32 = 30;
 
 /// What admitting a claimed isolated-process run decided.
 enum ClaimAdmission {
@@ -4570,9 +4557,10 @@ enum ClaimAdmission {
     Refused(crate::enterprise::IsolatedProcessRefusal),
 }
 
-/// Admits a claimed run. A full concurrency limit is `RESOURCE_EXHAUSTED`, so
-/// the run waits; a spent budget refuses it. A reclaim reserves no request,
-/// so it is never refused here.
+/// Admits a claimed run, reserving its estimated compute seconds. A full
+/// concurrency limit is `RESOURCE_EXHAUSTED`, so the run waits; a spent
+/// budget refuses it. A reclaim reserves no request, only compute, so only a
+/// spent compute budget refuses it.
 fn admit_claimed_isolated_process(
     service: &SekaiServiceImpl,
     quota: &crate::db::runtime_db::RuntimeDb,
@@ -4587,13 +4575,14 @@ fn admit_claimed_isolated_process(
         owner,
         &work.namespace,
         &format!("transform-claim:{}", work.run_id),
+        DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS,
         reclaim,
     )? {
         Ok(held) => Ok(ClaimAdmission::Admitted(held)),
         Err(error) => {
             match crate::composition::transform_run_admission::refusal_budget_exhausted(&error) {
-                Some(refusal) if !reclaim => Ok(ClaimAdmission::Refused(refusal)),
-                _ => Err(map_quota_error(error)),
+                Some(refusal) => Ok(ClaimAdmission::Refused(refusal)),
+                None => Err(map_quota_error(error)),
             }
         }
     }
@@ -4612,7 +4601,7 @@ fn extension_refusal(
         &crate::enterprise::IsolatedProcessJob {
             run_id: work.run_id.clone(),
             namespace: work.namespace.clone(),
-            estimated_seconds: DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS,
+            estimated_seconds: i64::from(DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS),
         },
     )?;
     // Each detail is checked as the `name=value` pair it reads as, and a
@@ -4662,7 +4651,7 @@ fn admit_extension_isolated_process(
         &crate::enterprise::IsolatedProcessJob {
             run_id: work.run_id.clone(),
             namespace: work.namespace.clone(),
-            estimated_seconds: DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS,
+            estimated_seconds: i64::from(DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS),
         },
     ) {
         Ok(()) => Ok(()),
@@ -4694,7 +4683,7 @@ fn tenant_budget_refusal(
         namespace,
     )
     .map_err(Status::internal)?;
-    Ok(limits.refusal_larger_than_budget())
+    Ok(limits.refusal_larger_than_budget(DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS))
 }
 
 /// Admits a transform run in `namespace` against its tenant's and its
@@ -4707,19 +4696,20 @@ fn admit_tenant_transform(
     run_key: &str,
     reclaim: bool,
 ) -> Result<Option<crate::chisei::tenant_quota::TenantQuotaAdmission>, Status> {
-    tenant_transform_admission(db, gate, tenant_context, namespace, run_key, reclaim)?
+    tenant_transform_admission(db, gate, tenant_context, namespace, run_key, 0, reclaim)?
         .map_err(map_quota_error)
 }
 
 /// [`admit_tenant_transform`] with the gate's own error, so a caller can tell
-/// a spent budget from a full concurrency limit. The outer error is a store
-/// read that refuses the admission.
+/// a spent budget from a full concurrency limit, reserving `compute_seconds`.
+/// The outer error is a store read that refuses the admission.
 fn tenant_transform_admission(
     db: &crate::db::runtime_db::RuntimeDb,
     gate: &crate::chisei::tenant_quota::TenantQuotaGate,
     tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
     namespace: &str,
     run_key: &str,
+    compute_seconds: i32,
     reclaim: bool,
 ) -> Result<
     Result<
@@ -4747,7 +4737,12 @@ fn tenant_transform_admission(
     }
     Ok(
         crate::composition::transform_run_admission::admit_transform_run(
-            gate, context, &limits, run_key, reclaim,
+            gate,
+            context,
+            &limits,
+            run_key,
+            compute_seconds,
+            reclaim,
         )
         .map(Some),
     )
@@ -4786,7 +4781,8 @@ fn abandon_or_persist_quota_hold(
         Err(failed)
             if failed.remaining.reserved_concurrency
                 || failed.remaining.reserved_request
-                || failed.remaining.reserved_tokens > 0 =>
+                || failed.remaining.reserved_tokens > 0
+                || failed.remaining.reserved_compute_seconds > 0 =>
         {
             db.restore_abandoned_quota_hold(
                 &failed.remaining.idempotency_key,
@@ -4795,6 +4791,7 @@ fn abandon_or_persist_quota_hold(
                 failed.remaining.reserved_concurrency,
                 failed.remaining.reserved_request,
                 failed.remaining.reserved_tokens,
+                failed.remaining.reserved_compute_seconds,
             )
             .map_err(Status::internal)?;
             Ok(())
@@ -4841,18 +4838,7 @@ fn release_claimed_transform_quota(
             return Ok(released);
         };
         released = true;
-        if hold.reserved_concurrency {
-            if let Err(status) = complete_reserved_transform_quota(runtime.clone(), run_id, &hold) {
-                let _ = db.restore_transform_quota_hold(
-                    run_id,
-                    &hold.tenant_id,
-                    &hold.quota_scope,
-                    true,
-                    hold.claim_generation,
-                );
-                return Err(status);
-            }
-        }
+        release_stored_quota_hold(db, runtime.clone(), run_id, &hold, None)?;
     }
 }
 
@@ -4873,6 +4859,7 @@ fn release_retryable_transform_quota(
         let admission = crate::chisei::tenant_quota::TenantQuotaAdmission {
             reserved_tokens: hold.refund_tokens,
             reserved_request: hold.refund_request,
+            reserved_compute_seconds: hold.reserved_compute_seconds,
             reserved_concurrency: hold.reserved_concurrency,
             ..crate::chisei::tenant_quota::TenantQuotaAdmission::from_hold(
                 &hold.tenant_id,
@@ -4890,23 +4877,13 @@ fn release_retryable_transform_quota(
                     failed.remaining.reserved_concurrency,
                     failed.remaining.reserved_request,
                     failed.remaining.reserved_tokens,
+                    failed.remaining.reserved_compute_seconds,
                 );
                 return Err(map_quota_error(failed.error));
             }
         }
     }
-    if hold.reserved_concurrency {
-        if let Err(status) = complete_reserved_transform_quota(runtime, run_id, &hold) {
-            let _ = db.restore_transform_quota_hold(
-                run_id,
-                &hold.tenant_id,
-                &hold.quota_scope,
-                true,
-                hold.claim_generation,
-            );
-            return Err(status);
-        }
-    }
+    release_stored_quota_hold(db, runtime, run_id, &hold, None)?;
     Ok(true)
 }
 
@@ -4930,6 +4907,7 @@ fn restore_request_admission_hold(
         tenant_id,
         "",
         false,
+        0,
         work.claim_generation,
         &work.fencing_token,
     )
@@ -4937,26 +4915,70 @@ fn restore_request_admission_hold(
     .map_err(Status::internal)
 }
 
-/// Drops the concurrency holds a stored hold stands for: the tenant's and,
-/// when it recorded a namespace scope, the namespace's.
-fn complete_reserved_transform_quota(
+/// Gives back what a stored hold still owns: its compute seconds settled to
+/// `settle_to` (refunded when `None`), then the concurrency holds of the
+/// tenant and, when it recorded a namespace scope, the namespace's. On an
+/// error the hold is put back with what it still owns, so a retry finishes
+/// the release without adjusting compute twice.
+fn release_stored_quota_hold(
+    db: &crate::db::runtime_db::RuntimeDb,
     runtime: std::sync::Arc<crate::db::runtime_db::RuntimeDb>,
     run_id: &str,
     hold: &crate::db::governed_transform::TransformQuotaHold,
+    settle_to: Option<i32>,
 ) -> Result<(), Status> {
+    if !hold.reserved_concurrency && hold.reserved_compute_seconds <= 0 {
+        return Ok(());
+    }
+    let restore = |compute_seconds: i32| {
+        let _ = db.restore_transform_quota_hold(
+            run_id,
+            &hold.tenant_id,
+            &hold.quota_scope,
+            hold.reserved_concurrency,
+            compute_seconds,
+            hold.claim_generation,
+        );
+    };
     let admission = crate::chisei::tenant_quota::TenantQuotaAdmission {
-        reserved_concurrency: true,
+        reserved_compute_seconds: hold.reserved_compute_seconds,
+        reserved_concurrency: hold.reserved_concurrency,
         ..crate::chisei::tenant_quota::TenantQuotaAdmission::from_hold(
             &hold.tenant_id,
             &hold.quota_scope,
             &format!("transform-claim:{run_id}"),
         )
     };
-    crate::composition::transform_run_admission::complete_transform_run(
-        &transform_quota_gate(runtime)?,
-        &admission,
-    )
-    .map_err(map_quota_error)
+    let gate = transform_quota_gate(runtime)?;
+    if let Err(error) = gate.settle_compute(&admission, settle_to.unwrap_or(0)) {
+        restore(hold.reserved_compute_seconds);
+        return Err(map_quota_error(error));
+    }
+    if hold.reserved_concurrency
+        && let Err(error) =
+            crate::composition::transform_run_admission::complete_transform_run(&gate, &admission)
+    {
+        restore(0);
+        return Err(map_quota_error(error));
+    }
+    Ok(())
+}
+
+/// Whole seconds the finished run measured, rounded up, or the hold's
+/// reservation when the run recorded no measurement.
+fn measured_compute_seconds(
+    service: &SekaiServiceImpl,
+    run_id: &str,
+    hold: &crate::db::governed_transform::TransformQuotaHold,
+) -> Result<i32, Status> {
+    let measured = service
+        .db
+        .runtime()
+        .transform_run_finish(run_id)
+        .map_err(Status::internal)?
+        .and_then(|(_, compute_ms)| compute_ms)
+        .map(|ms| i32::try_from(ms.max(0).saturating_add(999) / 1000).unwrap_or(i32::MAX));
+    Ok(measured.unwrap_or(hold.reserved_compute_seconds))
 }
 
 fn record_tenant_transform_usage(

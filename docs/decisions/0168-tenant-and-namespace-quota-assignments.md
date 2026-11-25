@@ -65,7 +65,10 @@ The maintainer accepted the shape on 2026-11-24:
      the run reserves nothing. A full concurrency limit still defers.
    - **2b:** `compute_seconds` reserved at claim from the run's estimate,
      settled to the measured seconds (#3043), and released on lease expiry.
-     The stored quota hold gains the reserved seconds.
+     The stored quota hold gains the reserved seconds. The reservation
+     takes no idempotency key: budget usage keys are global, and each claim
+     of a run is its own reservation, refunded when that claim is lost. A
+     reclaim reserves compute again, so a spent compute budget refuses it.
    - **Part 3:** the concurrency queue, its held state, FIFO release and
      `queued(concurrency)` with a position in `proto/`.
 4. How `mode` is stored is pending a maintainer decision: a dedicated
@@ -88,9 +91,14 @@ The maintainer accepted the shape on 2026-11-24:
   admission. Two exceptions: a limit of zero requests or zero concurrency
   used to defer every run forever and now refuses each run for good; and
   from 2a an isolated run whose request or token budget is spent is
-  refused for good instead of waiting for the next period.
+  refused for good instead of waiting for the next period. From 2b the same
+  holds for a compute budget, which only a new assignment sets.
 - A namespace assignment has no effect on admission until 1b.
-- No schema, migration or `proto/` change. An older plane ignores namespace
+- No `proto/` change. 2b adds the hold's `reserved_compute_seconds` column,
+  default zero; a hold an older plane wrote has no compute to settle. An
+  older plane ignores `compute_seconds` rows and admits without them, and a
+  hold it releases leaves the newer claim's reservation charged until the
+  period resets. An older plane ignores namespace
   rows, because it reads only `tenant:{id}` and its parents. During a
   rolling deploy an older instance defers a zero-budget run that a newer one
   refuses. Either way the run never executes. Likewise an older instance
@@ -112,3 +120,10 @@ The maintainer accepted the shape on 2026-11-24:
 - Over gRPC, an isolated run whose namespace request budget is spent is
   refused with `quota_budget_exhausted` and leaves the tenant's remaining
   request unreserved.
+- A claim reserves its compute estimate. A written result settles it to the
+  measured seconds, so later claims fit, and a spent compute budget refuses
+  with `quota_budget_exhausted` and the metric `compute_seconds`.
+- A claim lost on lease expiry refunds its compute, and the cancel of the
+  reclaimed run refunds the reclaim's.
+- A hold table without the compute column gains it on SQLite and
+  PostgreSQL, and older holds read as zero.
