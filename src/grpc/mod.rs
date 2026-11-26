@@ -1994,7 +1994,11 @@ pub fn build_services_for_plane(
     if plane == ProcessPlane::Combined {
         sekai_svc = sekai_svc.with_embedding_route(hosted_embedding_route(chisei_svc.clone()));
     }
-    Ok((Arc::new(sekai_svc), chisei_svc))
+    let sekai_svc = Arc::new(sekai_svc);
+    if plane == ProcessPlane::Combined {
+        chisei_svc.attach_sekai_service(&sekai_svc);
+    }
+    Ok((sekai_svc, chisei_svc))
 }
 
 /// The hosted catalog route of a stored embedding spec, admitted as hosted

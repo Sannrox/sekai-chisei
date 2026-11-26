@@ -41053,3 +41053,6 @@ mod source_rpc_tests;
 
 #[path = "agent_turn_transcript_rpc_tests.rs"]
 mod agent_turn_transcript_rpc_tests;
+
+#[path = "recorded_eval_dataset_tests.rs"]
+mod recorded_eval_dataset_tests;

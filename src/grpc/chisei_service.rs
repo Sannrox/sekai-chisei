@@ -112,6 +112,11 @@ use policy_resolution::{
 use budget_identity::{budget_metric, budget_subject};
 
 pub struct ChiseiServiceImpl {
+    /// Combined mode: the in-process Sekai service, for calls that judge
+    /// Sekai facts as their caller (recorded eval datasets, ADR 0153). Weak,
+    /// because the Sekai service holds this one; empty on a Chisei plane.
+    pub(super) sekai_service:
+        std::sync::OnceLock<std::sync::Weak<super::sekai_service::SekaiServiceImpl>>,
     pub(super) budget: Arc<BudgetTracker>,
     pub(super) policy: Arc<PolicyResolver>,
     pub(super) pipeline: pipe::Pipeline,
@@ -355,6 +360,7 @@ impl ChiseiServiceImpl {
                 crate::db::store::SekaiStore::memory(),
             ),
             privacy_scan: Arc::new(crate::chisei::privacy::PrivacyScanCache::default()),
+            sekai_service: std::sync::OnceLock::new(),
         }
     }
 
@@ -443,7 +449,27 @@ impl ChiseiServiceImpl {
                 crate::db::store::SekaiStore::memory(),
             ),
             privacy_scan: Arc::new(crate::chisei::privacy::PrivacyScanCache::default()),
+            sekai_service: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attach the in-process Sekai service (combined mode). Set once.
+    pub(crate) fn attach_sekai_service(&self, sekai: &Arc<super::sekai_service::SekaiServiceImpl>) {
+        let _ = self.sekai_service.set(Arc::downgrade(sekai));
+    }
+
+    /// The in-process Sekai service, or a refusal on a plane without one.
+    pub(super) fn in_process_sekai_service(
+        &self,
+    ) -> Result<Arc<super::sekai_service::SekaiServiceImpl>, Status> {
+        self.sekai_service
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    crate::composition::recorded_eval_cases::RECORDED_NEEDS_COMBINED,
+                )
+            })
     }
 
     pub fn with_sekai_commit_lookup(
@@ -1007,4 +1033,4 @@ impl ChiseiService for ChiseiServiceImpl {
 mod evaluation_rationale_rpc_tests;
 #[cfg(test)]
 #[path = "chisei_service_tests.rs"]
-mod tests;
+pub(crate) mod tests;

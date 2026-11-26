@@ -990,7 +990,7 @@ async fn resolve_policy_skips_cheap_routing_for_native_runtime() {
     assert_eq!(resolution.route_bias, "");
 }
 
-pub(super) fn config(db_path: &str) -> Config {
+pub(crate) fn config(db_path: &str) -> Config {
     Config {
         grpc_port: 0,
         sekai_bind: None,

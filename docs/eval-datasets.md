@@ -46,14 +46,13 @@ template may not use its expected property as input.
   and digest, for the evaluation executor (docs/evaluation-execution.md).
   Its step receipts pin each case; there is no separate eval store.
 
-Model-graded rubrics are out of scope. Datasets recorded from decided Action
-instances are decided in
-[ADR 0153](decisions/0153-eval-cases-recorded-from-reviewed-actions.md)
-and not implemented yet (#3513).
+Model-graded rubrics are out of scope. Datasets can also be recorded from
+decided Action instances, see [Recorded definitions](#recorded-definitions).
 
 ## Definitions
 
-A namespace sees two sources of definitions:
+A namespace sees three sources of definitions: the two below and
+[recorded definitions](#recorded-definitions).
 
 - **The directory.** The files in `CHISEI_EVAL_DATASETS_DIR`, one
   `<name>.json` per dataset. Every namespace sees them, and they are
@@ -78,15 +77,70 @@ namespace and the directory:
 
 - `GetEvalDatasetDefinition` reads one version, or the current one. Where
   the directory and the store both hold a name, the directory's is current.
+  A name belongs to one source; a put under a name another source holds is
+  refused.
 - `ListEvalDatasetDefinitions` lists the current version of every name, by
   name, in pages (50 by default, at most 200). Entries say whether they are
-  `stored` or from the `directory`. A directory file that does not parse or
-  generate is left out.
+  `stored`, `recorded` or from the `directory`. A directory file that does
+  not parse or generate is left out.
 - `ListEvalDatasetCases` pages through the cases of one `name@version` in
   dataset order (100 by default, at most 1,000). A version never changes, so
   pages stay stable.
 
 All four calls are experimental.
+
+## Recorded definitions
+
+[ADR 0153](decisions/0153-eval-cases-recorded-from-reviewed-actions.md)
+(#3513) turns Actions people decided into cases. `PutEvalDatasetDefinition`
+with a `chisei.eval-recorded-dataset-definition/v1` selection freezes the
+matching instances of the request's namespace into a version
+(`chisei_eval_recorded_datasets`):
+
+```json
+{
+  "contract_version": "chisei.eval-recorded-dataset-definition/v1",
+  "name": "refund-decisions",
+  "action_type": "Refund.issue",
+  "decided_from_ms": 1767225600000,
+  "decided_to_ms": 1769904000000,
+  "decision": "deny"
+}
+```
+
+- **Only a person's decision labels a case.** An instance is selected when
+  it parked for approval and an approver granted or denied it, inside the
+  half-open window `[decided_from_ms, decided_to_ms)`, and, when `decision`
+  is set, with that decision. Policy outcomes, system denies after a grant,
+  plan steps and offline submissions are not cases. At most 1,000 cases.
+- **A case is a reference.** It holds the instance id, request digest,
+  decision and decision time, never a parameter or property value. The
+  version's digest covers those references.
+- **Selection happens once, as the caller.** The put needs namespace admin
+  and the Sekai plane in the same process (combined mode); a split
+  Chisei plane refuses with `FAILED_PRECONDITION`. Instances the caller
+  cannot read are skipped as if they did not match. A selection that
+  matches nothing is refused. One audit decision records the dataset,
+  version and case count.
+- **Reads show what the caller can read.** Get and list return the
+  selection, not the instance ids. `ListEvalDatasetCases` pages over the
+  cases whose instance the caller can read, so an unreadable case looks like
+  one the version never had.
+- **Erasure retires the version.** When any source instance is gone, no
+  longer matches its digest (an erased or redacted parameter), or changed
+  decision, the version answers "not found" for case listing and runs.
+
+A run of a recorded version names the agent as `<member_id>@<revision_digest>`
+and still names an evaluator definition, which the run ledger pins; the
+verdict comes from the decision, not from the evaluator. Each case replays
+the instance's Action type, parameters and target object as it stood at the
+proposal through `DryRunAgent` as the caller: a grant passes when the turn
+would submit that Action (same type and request digest), a deny passes when
+it would not. Nothing is submitted, so a run creates no Action instance,
+receipt or effect. The run is refused "not found" unless the caller can read
+every case and every source still stands, so it never scores fewer cases. A
+recorded run cannot be bound to a release artifact. Without a configured
+dry-run model the run is refused like `DryRunAgent`.
 
 ## Runs
 

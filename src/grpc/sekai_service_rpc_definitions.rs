@@ -1607,76 +1607,15 @@ pub(super) async fn dry_run_agent(
     require_authenticated(&principals)?;
     let tenant_context = request_tenant_context(service.db.runtime(), &req)?;
     let input = req.into_inner();
-    authorize_source_sync_namespace(
+    let trace = authorized_dry_run_turn(
         service,
         &principals,
         tenant_context.as_ref(),
         &input.namespace,
-        false,
-    )?;
-    definition_branch_domain::validate_digest("revision_digest", &input.revision_digest)
-        .map_err(Status::invalid_argument)?;
-    definition_branch_domain::DefinitionMemberRef {
-        member_kind: crate::sekai::agent_promotion::MEMBER_KIND_AGENT.into(),
-        member_id: input.member_id.clone(),
-    }
-    .validate()
-    .map_err(Status::invalid_argument)?;
-    authorize_definition_revision(
-        service,
-        &principals,
-        &input.namespace,
         &input.revision_digest,
-        false,
-    )
-    .map_err(|status| match status.code() {
-        tonic::Code::NotFound => Status::not_found("definition member unavailable"),
-        tonic::Code::Internal => Status::internal("definition member unavailable"),
-        _ => status,
-    })?;
-    let member = service
-        .db
-        .runtime()
-        .get_definition_member(
-            &input.namespace,
-            &input.revision_digest,
-            crate::sekai::agent_promotion::MEMBER_KIND_AGENT,
-            &input.member_id,
-        )
-        .map_err(|_| Status::internal("definition member unavailable"))?
-        .ok_or_else(|| Status::not_found("definition member unavailable"))?;
-    let definition: crate::sekai::agent_definition::AgentDefinition =
-        serde_json::from_str(&member.definition_json)
-            .map_err(|_| Status::not_found("definition member unavailable"))?;
-    definition
-        .validate()
-        .map_err(|_| Status::not_found("definition member unavailable"))?;
-    let request = crate::sekai::agent_dry_run::DryRunModelRequest {
-        namespace: input.namespace.clone(),
-        revision_digest: input.revision_digest.clone(),
-        member_id: input.member_id.clone(),
-        input: input.input,
-        instructions: definition.instructions.clone(),
-    };
-    let reply = match service.dry_run_host.as_ref() {
-        Some(host) => host.admit_and_complete(&request),
-        None => default_dry_run(service.db.runtime(), &request),
-    }
-    .map_err(map_dry_run_failure)?;
-    let namespace = input.namespace.clone();
-    let runtime = service.db.runtime();
-    let trace = crate::sekai::agent_dry_run::classify_actions(
-        &definition,
-        reply,
-        |action_type, parameters_json| {
-            crate::sekai::agent_dry_run::validate_dry_run_proposed_action(
-                runtime,
-                &namespace,
-                action_type,
-                parameters_json,
-            )
-        },
-    );
+        &input.member_id,
+        input.input,
+    )?;
     let record_id = format!("dry-run-{}", uuid::Uuid::new_v4().simple());
     let record = dry_run_eval_record(
         &input.namespace,
@@ -2151,6 +2090,80 @@ fn to_proto_shadow_report(report: &crate::sekai::agent_shadow::ShadowReport) -> 
             })
             .collect(),
     }
+}
+
+/// One dry-run turn of agent `member_id` at `revision_digest` over `input`,
+/// authorized exactly as `DryRunAgent`: namespace read, the revision's member
+/// grants, and the plane's model host (fail closed without one). Proposed
+/// Actions are classified `would_submit` or `refused`; nothing is admitted.
+/// Shared by `DryRunAgent` and recorded eval cases (ADR 0153).
+pub(super) fn authorized_dry_run_turn(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+    revision_digest: &str,
+    member_id: &str,
+    input: String,
+) -> Result<crate::sekai::agent_dry_run::DryRunTrace, Status> {
+    authorize_source_sync_namespace(service, principals, tenant_context, namespace, false)?;
+    definition_branch_domain::validate_digest("revision_digest", revision_digest)
+        .map_err(Status::invalid_argument)?;
+    definition_branch_domain::DefinitionMemberRef {
+        member_kind: crate::sekai::agent_promotion::MEMBER_KIND_AGENT.into(),
+        member_id: member_id.to_string(),
+    }
+    .validate()
+    .map_err(Status::invalid_argument)?;
+    authorize_definition_revision(service, principals, namespace, revision_digest, false).map_err(
+        |status| match status.code() {
+            tonic::Code::NotFound => Status::not_found("definition member unavailable"),
+            tonic::Code::Internal => Status::internal("definition member unavailable"),
+            _ => status,
+        },
+    )?;
+    let member = service
+        .db
+        .runtime()
+        .get_definition_member(
+            namespace,
+            revision_digest,
+            crate::sekai::agent_promotion::MEMBER_KIND_AGENT,
+            member_id,
+        )
+        .map_err(|_| Status::internal("definition member unavailable"))?
+        .ok_or_else(|| Status::not_found("definition member unavailable"))?;
+    let definition: crate::sekai::agent_definition::AgentDefinition =
+        serde_json::from_str(&member.definition_json)
+            .map_err(|_| Status::not_found("definition member unavailable"))?;
+    definition
+        .validate()
+        .map_err(|_| Status::not_found("definition member unavailable"))?;
+    let request = crate::sekai::agent_dry_run::DryRunModelRequest {
+        namespace: namespace.to_string(),
+        revision_digest: revision_digest.to_string(),
+        member_id: member_id.to_string(),
+        input,
+        instructions: definition.instructions.clone(),
+    };
+    let reply = match service.dry_run_host.as_ref() {
+        Some(host) => host.admit_and_complete(&request),
+        None => default_dry_run(service.db.runtime(), &request),
+    }
+    .map_err(map_dry_run_failure)?;
+    let runtime = service.db.runtime();
+    Ok(crate::sekai::agent_dry_run::classify_actions(
+        &definition,
+        reply,
+        |action_type, parameters_json| {
+            crate::sekai::agent_dry_run::validate_dry_run_proposed_action(
+                runtime,
+                namespace,
+                action_type,
+                parameters_json,
+            )
+        },
+    ))
 }
 
 fn map_dry_run_failure(error: crate::sekai::agent_dry_run::DryRunFailure) -> Status {

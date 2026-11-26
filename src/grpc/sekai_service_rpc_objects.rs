@@ -792,7 +792,7 @@ pub(super) async fn query_counterfactual_view(
 /// pages of history. The newest and oldest retained change bracket the read;
 /// a recorded write or purge in between retries, and a namespace that keeps
 /// changing fails closed.
-fn read_live_objects_and_history(
+pub(super) fn read_live_objects_and_history(
     db: &crate::db::runtime_db::RuntimeDb,
     namespace: &str,
 ) -> Result<
