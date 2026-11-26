@@ -178,7 +178,7 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0150: Keep operator console sessions process-local across failover](0150-process-local-console-sessions.md)
 - [ADR 0151: Chisei admits every model call](0151-chisei-admits-every-model-call.md) (superseded by ADR 0152)
 - [ADR 0152: The gateway is the model egress layer, not an entry point to Chisei](0152-gateway-is-the-model-egress-layer.md)
-- [ADR 0153: Eval cases recorded from reviewed Actions are references, replayed through the agent dry run](0153-eval-cases-recorded-from-reviewed-actions.md) (proposed)
+- [ADR 0153: Eval cases recorded from reviewed Actions are references, replayed through the agent dry run](0153-eval-cases-recorded-from-reviewed-actions.md)
 - [ADR 0154: Evaluators report several metrics; plans own each objective and threshold](0154-evaluators-report-metrics-plans-own-objectives.md)
 - [ADR 0155: Custom-rubric judges pin their criteria in the evaluator definition](0155-custom-rubric-judges-pin-their-criteria.md)
 - [ADR 0156: Improvement reads execution telemetry from the plane](0156-improvement-reads-execution-telemetry-from-the-plane.md)

@@ -1,7 +1,7 @@
 # ADR 0153: Eval cases recorded from reviewed Actions are references, replayed through the agent dry run
 
-- Status: proposed
-- Date: 2026-11-18
+- Status: accepted
+- Date: 2026-11-18 (accepted 2026-11-26)
 - Owners: @Sannrox
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/2305 (#2305)
 - Supersedes: none
@@ -153,7 +153,7 @@ recorded definitions as the second source.
   synthetic cases.
 - The deny expectation is weak ("not this Action"). It catches regressions to
   a known-bad proposal, not progress towards a better one.
-- Follow-up work, one feature Issue once this is accepted:
+- Follow-up work, one feature Issue (#3513):
   - the recorded definition contract and put/resolve;
   - the dry-run case runner;
   - case reads gated by markings;

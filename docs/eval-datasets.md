@@ -47,9 +47,9 @@ template may not use its expected property as input.
   Its step receipts pin each case; there is no separate eval store.
 
 Model-graded rubrics are out of scope. Datasets recorded from decided Action
-instances are proposed in
+instances are decided in
 [ADR 0153](decisions/0153-eval-cases-recorded-from-reviewed-actions.md)
-and not implemented.
+and not implemented yet (#3513).
 
 ## Definitions
 
