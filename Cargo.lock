@@ -3228,18 +3228,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sekai-keys"
-version = "1.0.0"
-dependencies = [
- "aes-gcm",
- "libc",
- "rand 0.8.8",
- "serde",
- "serde_json",
- "zeroize",
-]
-
-[[package]]
 name = "sekai-object-parser"
 version = "0.1.0"
 dependencies = [
