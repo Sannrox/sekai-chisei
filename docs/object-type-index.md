@@ -8,6 +8,17 @@ See [ADR 0073](decisions/0073-source-and-action-objects.md), the published
 [10⁷ envelope](research/876-object-index-envelope.md), and the
 [hop-projection envelope](research/889-hop-projection-envelope.md).
 
+## Default engine and removal schedule
+
+The relational projection is the default engine for `EvaluateObjectSet`
+today. [ADR 0174](decisions/0174-object-log-serves-object-set-reads.md)
+makes the object log the default in the minor release after every gate it
+lists holds in a tagged release. The relational engine then stays
+selectable through `SEKAI_OBJECT_INDEX_ENGINE` for two further minor
+releases and is removed in the third. Every engine counts and sums distinct
+objects, the log answers only kinds whose security rules its restriction can
+evaluate, and each response states whether it is exact.
+
 ## Operator path
 
 Operator RPCs (stable; served on the default build):
