@@ -15,6 +15,7 @@ use crate::sekai::definition_branch::{
     DefinitionMember, DefinitionRevision, validate_digest, validate_namespace,
     validate_revision_members,
 };
+use crate::sekai::definition_text;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DefinitionMemberChange {
@@ -428,9 +429,9 @@ fn classify_member_change(
         ));
         classified = true;
     }
-    let unknown_fields = unknown_definition_fields(&from_value)?
+    let unknown_fields = unknown_definition_fields(&from_value, &change.member_kind)?
         .into_iter()
-        .chain(unknown_definition_fields(&to_value)?)
+        .chain(unknown_definition_fields(&to_value, &change.member_kind)?)
         .collect::<BTreeSet<_>>();
     for field in &unknown_fields {
         reasons.push(reason(
@@ -445,6 +446,15 @@ fn classify_member_change(
         match field.as_str() {
             "required" | "access_marking" => {}
             "owner" | "lint_suppressions" => {
+                reasons.push(reason(
+                    DefinitionCompatibilityClass::Compatible,
+                    change,
+                    &format!("changed_{field}"),
+                    field,
+                ));
+                classified = true;
+            }
+            field if text_field(&change.member_kind, field) => {
                 reasons.push(reason(
                     DefinitionCompatibilityClass::Compatible,
                     change,
@@ -525,7 +535,9 @@ fn governed_transform_member(member: &DefinitionMember) -> bool {
 /// `key`, `property_types`, `property_markings` and `source` are the
 /// object-type fields a source draft writes (#2296). `from`, `to`,
 /// `columns`, `target_key` and `cardinality` are the matching link-type
-/// fields. Changing any of them is conditional.
+/// fields. Changing any of them is conditional. Object and link types also
+/// know the text fields of [`definition_text`] (#2298); changing those is
+/// compatible.
 const KNOWN_DEFINITION_FIELDS: &[&str] = &[
     "access_marking",
     "cardinality",
@@ -552,7 +564,7 @@ fn push_unknown_fields(
     reasons: &mut Vec<DefinitionCompatibilityReason>,
 ) -> Result<(), String> {
     let value = parse_definition(&member.definition_json)?;
-    for field in unknown_definition_fields(&value)? {
+    for field in unknown_definition_fields(&value, &member.member_kind)? {
         reasons.push(reason(
             DefinitionCompatibilityClass::Unknown,
             change,
@@ -563,15 +575,21 @@ fn push_unknown_fields(
     Ok(())
 }
 
-fn unknown_definition_fields(value: &Value) -> Result<Vec<String>, String> {
+fn unknown_definition_fields(value: &Value, member_kind: &str) -> Result<Vec<String>, String> {
     let object = value.as_object().ok_or_else(|| {
         "unknown_definition_construct: definition_json must be an object".to_string()
     })?;
     Ok(object
         .keys()
-        .filter(|key| !KNOWN_DEFINITION_FIELDS.contains(&key.as_str()))
+        .filter(|key| {
+            !KNOWN_DEFINITION_FIELDS.contains(&key.as_str()) && !text_field(member_kind, key)
+        })
         .cloned()
         .collect())
+}
+
+fn text_field(member_kind: &str, field: &str) -> bool {
+    definition_text::carries_text(member_kind) && definition_text::FIELDS.contains(&field)
 }
 
 fn inspect_value_constructs(value: &Value, member_kind: &str) -> Result<(), String> {
@@ -1370,6 +1388,49 @@ mod tests {
                 .iter()
                 .any(|reason| reason.code == "changed_field" && reason.property == "cardinality")
         );
+    }
+
+    #[test]
+    fn reviewing_or_editing_type_text_is_compatible_only_on_object_and_link_types() {
+        let classify = |kind: &str, from_json: &str, to_json: &str| {
+            let from_member = prepared(kind, "Shipment", from_json);
+            let to_member = prepared(kind, "Shipment", to_json);
+            let from = revision(std::slice::from_ref(&from_member), "");
+            let to = revision(std::slice::from_ref(&to_member), "");
+            classify_definition_revision_compatibility(
+                &from,
+                std::slice::from_ref(&from_member),
+                &to,
+                std::slice::from_ref(&to_member),
+            )
+            .unwrap()
+        };
+        let drafted = r#"{"name":"Shipment","properties":["shp_stat_cd"],"description":"A parcel.","alternative_names":["parcel"],"property_descriptions":{"shp_stat_cd":"Status."},"property_alternative_names":{"shp_stat_cd":["status"]},"unreviewed":["description","property_descriptions/shp_stat_cd"]}"#;
+        let reviewed = r#"{"name":"Shipment","properties":["shp_stat_cd"],"description":"A parcel on its way.","alternative_names":["parcel","consignment"],"property_descriptions":{"shp_stat_cd":"Status."},"property_alternative_names":{"shp_stat_cd":["status"]}}"#;
+        let report = classify("object_type", drafted, reviewed);
+        assert_eq!(report.class, "compatible", "{:?}", report.reasons);
+        let codes: Vec<&str> = report.reasons.iter().map(|r| r.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            [
+                "changed_alternative_names",
+                "changed_description",
+                "changed_unreviewed"
+            ]
+        );
+        let link = classify(
+            "link_type",
+            r#"{"name":"Shipment","description":"Goes to.","unreviewed":["description"]}"#,
+            r#"{"name":"Shipment","description":"Goes to."}"#,
+        );
+        assert_eq!(link.class, "compatible", "{:?}", link.reasons);
+        // On a kind without text the key stays an unknown field.
+        let class = classify(
+            "ontology_class",
+            r#"{"name":"Shipment","description":"a"}"#,
+            r#"{"name":"Shipment","description":"b"}"#,
+        );
+        assert_eq!(class.class, "unknown");
     }
 
     #[test]

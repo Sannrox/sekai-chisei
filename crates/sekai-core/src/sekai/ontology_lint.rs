@@ -9,7 +9,8 @@
 //! - markings applied to almost every visible object, or that almost every
 //!   visible principal profile is cleared for;
 //! - enabled Action types with no instance the caller may see;
-//! - object type properties no visible consumer binding references (#1684).
+//! - object type properties no visible consumer binding references (#1684);
+//! - object and link type texts still marked `unreviewed` (#2298).
 //!
 //! A definition member can suppress findings about itself (or its
 //! properties) with a reason, in its `lint_suppressions`; a suppressed
@@ -35,6 +36,7 @@ pub const RULE_BROAD_MARKING_APPLIED: &str = "broad_marking_applied";
 pub const RULE_BROAD_MARKING_GRANTED: &str = "broad_marking_granted";
 pub const RULE_ACTION_TYPE_NEVER_RUN: &str = "action_type_never_run";
 pub const RULE_UNREFERENCED_PROPERTY: &str = "unreferenced_property";
+pub const RULE_UNREVIEWED_TEXT: &str = "unreviewed_text";
 
 /// Definition field holding a member's suppressions.
 pub const SUPPRESSIONS_FIELD: &str = "lint_suppressions";
@@ -45,8 +47,13 @@ const SUPPRESSIBLE: &[(&str, &str)] = &[
     ("object_type", RULE_ORPHAN_OBJECT_TYPE),
     ("object_type", RULE_UNOWNED_OBJECT_TYPE),
     ("object_type", RULE_UNREFERENCED_PROPERTY),
+    ("object_type", RULE_UNREVIEWED_TEXT),
     ("link_type", RULE_UNOWNED_LINK_TYPE),
+    ("link_type", RULE_UNREVIEWED_TEXT),
 ];
+/// Rules whose findings, and so whose suppressions, name a `property`: the
+/// property itself, or for `unreviewed_text` the unreviewed path.
+const PROPERTY_RULES: &[&str] = &[RULE_UNREFERENCED_PROPERTY, RULE_UNREVIEWED_TEXT];
 
 /// Error findings a definition proposal introduces block its merge (#1687).
 pub const SEVERITY_ERROR: &str = "error";
@@ -67,7 +74,8 @@ pub struct LintFinding {
     pub subject_kind: &'static str,
     pub subject_id: String,
     /// For `property` findings, the property of the object type
-    /// `subject_id`; empty otherwise.
+    /// `subject_id`; for `unreviewed_text`, the unreviewed path; empty
+    /// otherwise.
     pub property: String,
     pub severity: &'static str,
     pub detail: String,
@@ -111,9 +119,9 @@ pub fn suppressions(
                 entry.rule
             ));
         }
-        if (entry.rule == RULE_UNREFERENCED_PROPERTY) == entry.property.trim().is_empty() {
+        if PROPERTY_RULES.contains(&entry.rule.as_str()) == entry.property.trim().is_empty() {
             return Err(format!(
-                "{SUPPRESSIONS_FIELD}: name a property exactly for {RULE_UNREFERENCED_PROPERTY}"
+                "{SUPPRESSIONS_FIELD}: name a property exactly for {RULE_UNREFERENCED_PROPERTY} and {RULE_UNREVIEWED_TEXT}"
             ));
         }
         let reason = entry.reason.trim();
@@ -195,6 +203,26 @@ fn declares_owner(member: &DefinitionMember) -> bool {
         .unwrap_or(false)
 }
 
+/// One warning per path in the member's `unreviewed` list.
+fn unreviewed_text(kind: &'static str, member: &DefinitionMember) -> Vec<LintFinding> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&member.definition_json) else {
+        return Vec::new();
+    };
+    crate::sekai::definition_text::unreviewed_paths(&value)
+        .into_iter()
+        .map(|path| LintFinding {
+            property: path,
+            ..finding(
+                RULE_UNREVIEWED_TEXT,
+                kind,
+                &member.member_id,
+                SEVERITY_WARNING,
+                "this text awaits review; remove its path from unreviewed to accept it".into(),
+            )
+        })
+        .collect()
+}
+
 fn broad(count: usize, population: usize) -> bool {
     population >= BROAD_MIN_POPULATION && count * 100 >= population * BROAD_SHARE_PERCENT
 }
@@ -265,6 +293,11 @@ pub fn lint_all(input: &LintInput) -> Vec<LintFinding> {
                 SEVERITY_WARNING,
                 "neither the definition nor its catalog entry names an owner".into(),
             ));
+        }
+    }
+    for kind in ["object_type", "link_type"] {
+        for member in of_kind(kind) {
+            findings.extend(unreviewed_text(kind, member));
         }
     }
     for link_type in of_kind("link_type") {
@@ -657,6 +690,62 @@ mod tests {
                 ("Ticket", Some("read by the nightly export")),
             ]
         );
+    }
+
+    #[test]
+    fn each_unreviewed_text_is_one_warning_a_suppression_can_waive() {
+        let mut input = clean();
+        input.members[0] = member(
+            "object_type",
+            "Ticket",
+            r#"{"owner":"support","properties":["title"],"description":"A support request.","property_descriptions":{"title":"What went wrong."},"unreviewed":["description","property_descriptions/title"],"lint_suppressions":[{"rule":"unreviewed_text","property":"description","reason":"wording agreed in review"}]}"#,
+        );
+        input.members[2] = member(
+            "link_type",
+            "AssignedTo",
+            r#"{"owner":"support","alternative_names":["handled by"],"unreviewed":["alternative_names"]}"#,
+        );
+        input.consumed_properties = [("Ticket".into(), "title".into())].into();
+        let findings: Vec<_> = lint(&input)
+            .findings
+            .into_iter()
+            .map(|finding| {
+                assert_eq!(finding.rule, RULE_UNREVIEWED_TEXT);
+                assert_eq!(finding.severity, SEVERITY_WARNING);
+                (
+                    finding.subject_kind,
+                    finding.subject_id,
+                    finding.property,
+                    finding.suppressed,
+                )
+            })
+            .collect();
+        assert_eq!(
+            findings,
+            [
+                (
+                    "link_type",
+                    "AssignedTo".into(),
+                    "alternative_names".into(),
+                    None
+                ),
+                (
+                    "object_type",
+                    "Ticket".into(),
+                    "description".into(),
+                    Some("wording agreed in review".into())
+                ),
+                (
+                    "object_type",
+                    "Ticket".into(),
+                    "property_descriptions/title".into(),
+                    None
+                ),
+            ]
+        );
+        let unnamed =
+            serde_json::json!({"lint_suppressions":[{"rule":"unreviewed_text","reason":"r"}]});
+        assert!(suppressions("link_type", &unnamed).is_err());
     }
 
     #[test]

@@ -762,13 +762,14 @@ fn exercise_revision_compatibility(db: &dyn DefinitionBranchBackend, namespace: 
             member(
                 namespace,
                 "Ticket",
-                r#"{"name":"Ticket","properties":["title"]}"#,
+                // Drafted text (#2298) stores and reads back on both backends.
+                r#"{"name":"Ticket","properties":["title"],"description":"A support request.","property_alternative_names":{"title":["subject"]},"unreviewed":["description"]}"#,
             ),
             typed_member(
                 namespace,
                 "link_type",
                 "AssignedTo",
-                r#"{"name":"AssignedTo"}"#,
+                r#"{"name":"AssignedTo","alternative_names":["handled by"]}"#,
             ),
         ],
         removals: Vec::new(),

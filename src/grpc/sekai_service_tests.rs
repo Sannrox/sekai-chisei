@@ -35694,6 +35694,86 @@ async fn ontology_lint_reports_one_finding_per_problem_and_only_what_the_caller_
     assert_eq!(missing.code(), tonic::Code::NotFound);
 }
 
+/// #2298: drafted text merges as a compatible change, reads back through the
+/// definition read, and lints as one warning per unreviewed path.
+#[tokio::test]
+async fn unreviewed_text_merges_reads_back_and_lints_as_warnings() {
+    let svc = service();
+    let parent = seed_definition_parent(&svc, "text-a");
+    let shipment = |definition_json: &str| DefinitionMemberInput {
+        member_kind: "object_type".into(),
+        member_id: "Shipment".into(),
+        definition_json: definition_json.into(),
+        member_digest: String::new(),
+    };
+    let (seeded, _) = publish_definition_history_entry(
+        &svc,
+        "text-a",
+        &parent.revision_digest,
+        "text-a-1",
+        "text-a-cs-1",
+        vec![shipment(
+            r#"{"name":"Shipment","owner":"logistics","properties":["shp_stat_cd"],"lint_suppressions":[{"rule":"orphan_object_type","reason":"seed type"},{"rule":"unreferenced_property","property":"shp_stat_cd","reason":"seed type"}]}"#,
+        )],
+    )
+    .await;
+    let (drafted, _) = publish_definition_history_entry(
+        &svc,
+        "text-a",
+        &seeded,
+        "text-a-2",
+        "text-a-cs-2",
+        vec![shipment(
+            r#"{"name":"Shipment","owner":"logistics","properties":["shp_stat_cd"],"lint_suppressions":[{"rule":"orphan_object_type","reason":"seed type"},{"rule":"unreferenced_property","property":"shp_stat_cd","reason":"seed type"}],"description":"A parcel on its way to a customer.","property_alternative_names":{"shp_stat_cd":["shipment status"]},"unreviewed":["description","property_alternative_names/shp_stat_cd"]}"#,
+        )],
+    )
+    .await;
+    let member = svc
+        .get_definition_member(with_named_principal(
+            GetDefinitionMemberRequest {
+                namespace: "text-a".into(),
+                revision_digest: drafted,
+                member_kind: "object_type".into(),
+                member_id: "Shipment".into(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .member
+        .unwrap();
+    let definition: serde_json::Value = serde_json::from_str(&member.definition_json).unwrap();
+    assert_eq!(
+        definition["property_alternative_names"]["shp_stat_cd"],
+        serde_json::json!(["shipment status"])
+    );
+    let findings = svc
+        .get_ontology_lint_report(with_named_principal(
+            GetOntologyLintReportRequest {
+                namespace: "text-a".into(),
+                branch_id: String::new(),
+            },
+            "root",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .findings;
+    let unreviewed: Vec<(&str, &str)> = findings
+        .iter()
+        .filter(|finding| finding.rule == "unreviewed_text")
+        .map(|finding| (finding.property.as_str(), finding.severity.as_str()))
+        .collect();
+    assert_eq!(
+        unreviewed,
+        [
+            ("description", "warning"),
+            ("property_alternative_names/shp_stat_cd", "warning"),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn unreferenced_properties_follow_visible_consumers_and_suppressions() {
     let svc = service();
