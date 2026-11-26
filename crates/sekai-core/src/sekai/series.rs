@@ -47,6 +47,7 @@ pub struct Bucket {
 
 /// What a store scan of one series found.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum SeriesScan {
     /// The samples in the range, oldest first.
     Samples(Vec<Sample>),
@@ -58,6 +59,7 @@ pub enum SeriesScan {
 
 /// A series read's answer: the samples as stored, or buckets, never both.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum SeriesPoints {
     Raw(Vec<Sample>),
     Buckets { width_ms: i64, buckets: Vec<Bucket> },

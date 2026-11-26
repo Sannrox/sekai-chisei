@@ -112,6 +112,7 @@ impl SekaiServiceImpl {
                     "{REFUSAL_QUARANTINED}: the samples dataset is quarantined"
                 )));
             }
+            _ => return Err(Status::internal("unsupported series scan result")),
         };
         let response =
             match series::downsample(samples, input.start_ms, input.end_ms, input.target_points) {
@@ -139,6 +140,7 @@ impl SekaiServiceImpl {
                     bucket_width_ms: width_ms,
                     ..Default::default()
                 },
+                _ => return Err(Status::internal("unsupported series points")),
             };
         Ok(Response::new(response))
     }
