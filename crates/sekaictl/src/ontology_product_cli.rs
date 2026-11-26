@@ -16,12 +16,13 @@ use serde::{Deserialize, Serialize};
 use tonic::Request;
 
 use chisei_core::lookup_first;
-use sekai_admin_client::client::connect_sekai;
+use sekai_admin_client::client::{GatewayClient, connect_sekai};
 use sekai_core::sekai::schema::is_builtin_schema_kind;
 use sekai_core::sekai::semantic;
 use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_proto::chisei::{
-    ExecutePlanRequest, ExecutionInput, GetOperationReceiptRequest, PlanExecutionRequest,
+    ExecutePlanRequest, ExecutionInput, ExecutionPlan, GetOperationReceiptRequest,
+    PlanExecutionRequest, PlannedChatResponse,
 };
 use sekai_proto::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_proto::sekai::{
@@ -38,10 +39,11 @@ pub const DOMAIN_DOC_VERSION: &str = "sekai.ontology-product/v1";
 pub const SEED_DOC_VERSION: &str = "sekai.seed/v1";
 
 pub fn usage() -> &'static str {
-    "sekaictl ontology <inspect|apply|export|import|draft|seed|run|first-run|context|expand|explain|lint> ...\n  \
+    "sekaictl ontology <inspect|apply|export|import|draft|find|seed|run|first-run|context|expand|explain|lint> ...\n  \
      sekaictl ontology export --namespace <ns> --out <dir> [--target <url-or-socket>]\n  \
      sekaictl ontology import --namespace <ns> --dir <dir> --source-commit <sha> [--target <url-or-socket>]\n  \
-     sekaictl ontology draft --discovery <file> --out <dir> [--namespace <ns>] [--update] [--target <url-or-socket>]\n  \
+     sekaictl ontology draft --discovery <file> --out <dir> [--namespace <ns>] [--update] [--describe] [--target <url-or-socket>]\n  \
+     sekaictl ontology find --namespace <ns> --name <name> [--target <url-or-socket>]\n  \
      sekaictl ontology apply --file <domain.json> [--target <url-or-socket>]\n  \
      sekaictl ontology seed --file <seed.json> [--target <url-or-socket>]\n  \
      sekaictl ontology run --namespace <ns> --task-type <capability> --spec <json-or-@file> [--target ...]\n  \
@@ -749,16 +751,7 @@ pub async fn plan_and_execute(
         action_claim: None,
     };
 
-    let plan = client
-        .plan_execution(Request::new(PlanExecutionRequest {
-            routing_profile_id: String::new(),
-            input: Some(input),
-            gunshi_allocation: None,
-        }))
-        .await?
-        .into_inner()
-        .plan
-        .ok_or("plan_execution returned empty plan")?;
+    let plan = plan_execution(&mut client, input).await?;
 
     let plan_id = plan.plan_id.clone();
     let executable = plan.executable;
@@ -776,17 +769,7 @@ pub async fn plan_and_execute(
         });
     }
 
-    let mut stream = client
-        .execute_plan_stream(Request::new(ExecutePlanRequest { plan: Some(plan) }))
-        .await?
-        .into_inner();
-    let mut response = None;
-    while let Some(event) = stream.message().await? {
-        if event.response.is_some() {
-            response = event.response;
-        }
-    }
-    let response = response.ok_or("execution stream returned no response")?;
+    let response = execute_plan(&mut client, plan).await?;
 
     let (content, provider, stop_reason) =
         (response.content, response.provider, response.stop_reason);
@@ -801,6 +784,42 @@ pub async fn plan_and_execute(
         provider,
         stop_reason,
     })
+}
+
+/// Plans one governed execution. Chisei admits or refuses it: namespace
+/// policy, route, budget and egress are decided here, never in the client.
+pub(crate) async fn plan_execution(
+    client: &mut ChiseiServiceClient<GatewayClient>,
+    input: ExecutionInput,
+) -> Result<ExecutionPlan, tonic::Status> {
+    client
+        .plan_execution(Request::new(PlanExecutionRequest {
+            routing_profile_id: String::new(),
+            input: Some(input),
+            gunshi_allocation: None,
+        }))
+        .await?
+        .into_inner()
+        .plan
+        .ok_or_else(|| tonic::Status::internal("plan_execution returned empty plan"))
+}
+
+/// Executes an admitted plan and returns the final response of its stream.
+pub(crate) async fn execute_plan(
+    client: &mut ChiseiServiceClient<GatewayClient>,
+    plan: ExecutionPlan,
+) -> Result<PlannedChatResponse, BoxErr> {
+    let mut stream = client
+        .execute_plan_stream(Request::new(ExecutePlanRequest { plan: Some(plan) }))
+        .await?
+        .into_inner();
+    let mut response = None;
+    while let Some(event) = stream.message().await? {
+        if event.response.is_some() {
+            response = event.response;
+        }
+    }
+    Ok(response.ok_or("execution stream returned no response")?)
 }
 
 pub async fn fetch_receipt_json(target: &str, request_id: &str) -> Result<String, BoxErr> {
@@ -1145,17 +1164,28 @@ pub async fn run_ontology_product_command(args: Vec<String>) -> Result<(), BoxEr
             let rest = &args[1..];
             let discovery = require_flag(rest, "--discovery").map_err(std::io::Error::other)?;
             let out = require_flag(rest, "--out").map_err(std::io::Error::other)?;
-            let update = rest.iter().any(|flag| flag == "--update");
             let namespace = flag_value(rest, "--namespace");
             let outcome = crate::ontology_draft::run(
                 &target_from_args(rest),
                 Path::new(&discovery),
                 Path::new(&out),
-                namespace.as_deref(),
-                update,
+                crate::ontology_draft::DraftOptions {
+                    namespace: namespace.as_deref(),
+                    update: rest.iter().any(|flag| flag == "--update"),
+                    describe: rest.iter().any(|flag| flag == "--describe"),
+                },
             )
             .await?;
             println!("drafted {} files to {out}", outcome.files);
+            if let Some(described) = &outcome.described {
+                println!(
+                    "described with model {} (request {}, plan {}, prompt {}); every proposed text is unreviewed",
+                    described.model,
+                    described.request_id,
+                    described.plan_id,
+                    described.prompt_digest
+                );
+            }
             for path in &outcome.removed {
                 println!("removed {path}");
             }
@@ -1164,6 +1194,30 @@ pub async fn run_ontology_product_command(args: Vec<String>) -> Result<(), BoxEr
             }
             for decision in &outcome.stale {
                 println!("stale decision, the source no longer has its subject: {decision}");
+            }
+            Ok(())
+        }
+        "find" => {
+            let rest = &args[1..];
+            let namespace = require_flag(rest, "--namespace").map_err(std::io::Error::other)?;
+            let name = require_flag(rest, "--name").map_err(std::io::Error::other)?;
+            let found =
+                crate::ontology_find::find(&target_from_args(rest), &namespace, &name).await?;
+            if found.is_empty() {
+                println!("no published type or property goes by {name:?}");
+            }
+            for hit in &found {
+                println!(
+                    "{}/{}{} by {}{}",
+                    hit.member_kind,
+                    hit.member_id,
+                    hit.property
+                        .as_deref()
+                        .map(|property| format!(" property {property}"))
+                        .unwrap_or_default(),
+                    hit.field,
+                    if hit.unreviewed { " (unreviewed)" } else { "" }
+                );
             }
             Ok(())
         }

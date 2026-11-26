@@ -60,7 +60,7 @@ pub fn build_tree(
                 "{path} and {other} differ only in case and cannot share a tree"
             ));
         }
-        tree.insert(path, render(&omit_credentials(without_envelope(value)))?);
+        tree.insert(path, render_member(&member.kind, value)?);
     }
     if let Some(lattice) = lattice.filter(|lattice| !lattice.tokens.is_empty()) {
         tree.insert(
@@ -177,9 +177,6 @@ fn snake_words(key: &str) -> String {
     out
 }
 
-/// Redacts credential values: everything beneath a credential-shaped key. Governed
-/// definitions name their properties in a `properties` array of strings, so a
-/// property called `password` is a string in an array and keeps its name.
 /// Top-level keys of governed documents that name where a body was stored
 /// rather than what it defines; they would tie the tree to one namespace.
 const ENVELOPE_KEYS: &[&str] = &["namespace", "definition_digest"];
@@ -196,18 +193,84 @@ fn without_envelope(value: Value) -> Value {
     }
 }
 
+/// A member body as the tree holds it: without its envelope, credentials
+/// redacted, rendered canonically.
+pub(crate) fn render_member(kind: &str, value: Value) -> Result<String, String> {
+    render(&omit_member_credentials(kind, without_envelope(value)))
+}
+
+/// Object type maps keyed by declared property. A key there is a property
+/// name, not a credential position, so a property called `password` keeps
+/// its type, marking and text.
+const PROPERTY_MAPS: &[&str] = &[
+    "property_types",
+    "property_markings",
+    "property_descriptions",
+    "property_alternative_names",
+];
+
+/// Redacts credential values: everything beneath a credential-shaped key.
+/// Governed definitions name their properties in a `properties` array of
+/// strings, so a property called `password` is a string in an array and
+/// keeps its name. In an object type's [`PROPERTY_MAPS`] a string or a list
+/// of strings under a property key is kept; any other value there falls back
+/// to the credential-key rule, so an unexpected shape is still redacted.
+fn omit_member_credentials(kind: &str, value: Value) -> Value {
+    let Value::Object(map) = value else {
+        return omit_credentials(value);
+    };
+    if kind != "object_type" {
+        return omit_credentials(Value::Object(map));
+    }
+    Value::Object(
+        map.into_iter()
+            .map(|(key, value)| {
+                let value = match value {
+                    Value::Object(properties) if PROPERTY_MAPS.contains(&key.as_str()) => {
+                        Value::Object(
+                            properties
+                                .into_iter()
+                                .map(|(property, value)| {
+                                    if is_text(&value) {
+                                        (property, value)
+                                    } else {
+                                        omit_entry(property, value)
+                                    }
+                                })
+                                .collect(),
+                        )
+                    }
+                    value => omit_entry(key.clone(), value).1,
+                };
+                (key, value)
+            })
+            .collect(),
+    )
+}
+
+/// A string, or a list holding only strings.
+fn is_text(value: &Value) -> bool {
+    match value {
+        Value::String(_) => true,
+        Value::Array(items) => items.iter().all(Value::is_string),
+        _ => false,
+    }
+}
+
+fn omit_entry(key: String, value: Value) -> (String, Value) {
+    let value = if credential_key(&key) {
+        redact_strings(value)
+    } else {
+        omit_credentials(value)
+    };
+    (key, value)
+}
+
 fn omit_credentials(value: Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(
             map.into_iter()
-                .map(|(key, value)| {
-                    let value = if credential_key(&key) {
-                        redact_strings(value)
-                    } else {
-                        omit_credentials(value)
-                    };
-                    (key, value)
-                })
+                .map(|(key, value)| omit_entry(key, value))
                 .collect(),
         ),
         Value::Array(items) => Value::Array(items.into_iter().map(omit_credentials).collect()),
@@ -548,6 +611,51 @@ mod tests {
         }
         assert!(body.contains("\"max_tokens\": 5"), "{body}");
         assert!(!body.contains("k2") && !body.contains("k3"), "{body}");
+    }
+
+    #[test]
+    fn property_maps_keep_credential_named_properties_and_still_redact_secrets() {
+        let tree = build_tree(
+            &[member(
+                "object_type",
+                "account",
+                r#"{"properties":["password","api_key"],"property_types":{"password":"string","api_key":"string"},"property_descriptions":{"password":"Login password hash."},"property_alternative_names":{"api_key":["access key"]},"property_markings":{"password":{"token":"s1"}},"password":"s2","source":{"property_types":{"password":"s3"}}}"#,
+            )],
+            None,
+        )
+        .unwrap();
+        let body: Value = serde_json::from_str(&tree["object_type/account.json"]).unwrap();
+        assert_eq!(body["property_types"]["password"], "string");
+        assert_eq!(body["property_types"]["api_key"], "string");
+        assert_eq!(
+            body["property_descriptions"]["password"],
+            "Login password hash."
+        );
+        assert_eq!(
+            body["property_alternative_names"]["api_key"],
+            serde_json::json!(["access key"])
+        );
+        // Outside the text shape, or outside an object type's own maps, the
+        // credential rule still applies.
+        assert_eq!(
+            body["property_markings"]["password"]["token"],
+            CREDENTIAL_PLACEHOLDER
+        );
+        assert_eq!(body["password"], CREDENTIAL_PLACEHOLDER);
+        assert_eq!(
+            body["source"]["property_types"]["password"],
+            CREDENTIAL_PLACEHOLDER
+        );
+        let function = build_tree(
+            &[member(
+                "function",
+                "f",
+                r#"{"property_types":{"password":"s4"}}"#,
+            )],
+            None,
+        )
+        .unwrap();
+        assert!(!function["function/f.json"].contains("s4"));
     }
 
     #[test]

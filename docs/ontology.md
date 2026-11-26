@@ -331,7 +331,10 @@ string beneath a credential-shaped key (a word `secret`, `password`,
 `credential`, `token` or `apikey`, or `api_key` / `private_key`), at any depth, is
 written as `[credential reference omitted]`. Property names in a definition's
 `properties` list are strings in an array, so a property called `password`
-keeps its name. An id whose encoded name passes 200 bytes is
+keeps its name. In an object type's property maps (`property_types`,
+`property_markings`, `property_descriptions`, `property_alternative_names`) a
+key is a property name, so a string or list of strings under it is kept; any
+other value there still follows the credential rule. An id whose encoded name passes 200 bytes is
 written under a shortened name with a SHA-256 suffix, and `layout.json` maps that
 path to the full id under `long_ids`. Two ids that differ only in case are
 refused, because their files would collide on a case-insensitive file system.
@@ -341,7 +344,7 @@ leaves nothing behind.
 ## Draft a definition tree from a source discovery
 
 ```sh
-sekaictl ontology draft --discovery <file> --out <dir> [--update] [--namespace <ns>] [--target <url-or-socket>]
+sekaictl ontology draft --discovery <file> --out <dir> [--update] [--namespace <ns>] [--describe] [--target <url-or-socket>]
 ```
 
 Writes a definition tree in the export layout from one
@@ -361,6 +364,36 @@ the files, then import them as a proposal.
 Record kind and column names are the discovery's own tokens. Import skips
 `draft-report.json` and `draft-decisions.json`. Each drafted object type
 carries an `orphan_object_type` suppression until something consumes it.
+
+### Propose descriptions and alternative names
+
+`--describe` (it needs `--namespace`) adds one governed model call before
+anything is written. It proposes a one-sentence description and alternative
+names for each drafted object type, property and link type. The call is
+planned and executed through Chisei (`PlanExecution`, then
+`ExecutePlanStream`) in that namespace, so its policy, route, budget and
+egress rules decide whether it runs. Some deployments forbid it; the step is
+optional.
+
+- The model sees only member ids, property names, declared types and
+  value-shape finding codes. Sample counts, ratios, markings and source
+  revisions are never sent.
+- Every proposed text lands with its path in `unreviewed`, and import lints
+  one `unreviewed_text` warning per path. A reviewer accepts a text by
+  removing its path, after editing it if needed.
+- `draft-report.json` gains a `describe` block: the resolved `model`, the
+  `prompt_digest` (SHA-256 over the instructions and the input sent), the
+  `request_id` and the `plan_id`.
+- The tree is written only after every proposal parsed and passed the
+  definition text checks. A call Chisei refuses or plans as not executable
+  fails with `describe_no_model_route`; a failed execution with
+  `describe_call_failed`; an answer that does not parse, names a member or
+  property the draft lacks, or holds refused text with
+  `describe_invalid_proposal`. Each leaves the tree untouched.
+
+A redraft rewrites the members it owns, so text in them is proposed again
+with `--describe` or dropped without it. Record a `keep` decision for a member
+whose reviewed text should stay.
 
 ### Redraft without losing review decisions
 
@@ -397,6 +430,19 @@ A draft rewrites the file with one decision per line in sorted order, so two
 reviewers who add different decisions usually merge without a conflict. A
 decision whose subject the source no longer has is printed as stale and stays
 in the file.
+
+## Find a type or property by name
+
+```sh
+sekaictl ontology find --namespace <ns> --name <name> [--target <url-or-socket>]
+```
+
+Lists the published object types, link types and properties that go by a
+name: a member's id, `name` or `alternative_names`, a declared property, or a
+property's `property_alternative_names`. Case is ignored, and `_`, `-` and
+spaces count as one separator. The match runs in the client over the same
+reads as export; a match on text still awaiting review is marked
+`(unreviewed)`.
 
 ## Import a file tree as a proposal
 
