@@ -1348,6 +1348,30 @@ fn erase_expired_llm_call_versions(
         })
         .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
         .collect::<Vec<_>>();
+    // A shared span is one stored row for every version that covers it.
+    let span_rows = tx
+        .query(
+            "SELECT from_seq,row_id,data FROM sekai_dataset_row_spans
+             WHERE dataset_id=$1 FOR UPDATE",
+            &[&LLM_CALLS_DATASET],
+        )
+        .map_err(err)?
+        .into_iter()
+        .filter(|row| {
+            let data: &str = row.get(2);
+            serde_json::from_str::<std::collections::HashMap<String, String>>(data).is_err()
+                || expired(data)
+        })
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, i64>(1)))
+        .collect::<Vec<_>>();
+    for (from_seq, row_id) in &span_rows {
+        tx.execute(
+            "DELETE FROM sekai_dataset_row_spans
+             WHERE dataset_id=$1 AND from_seq=$2 AND row_id=$3",
+            &[&LLM_CALLS_DATASET, from_seq, row_id],
+        )
+        .map_err(err)?;
+    }
     for (name, row_id) in &branch_rows {
         tx.execute(
             "DELETE FROM sekai_dataset_branch_rows
@@ -1364,10 +1388,10 @@ fn erase_expired_llm_call_versions(
         )
         .map_err(err)?;
     }
-    if !version_rows.is_empty() {
+    if !version_rows.is_empty() || !span_rows.is_empty() {
         tx.execute(
             "UPDATE sekai_dataset_versions SET row_count = (
-                SELECT COUNT(*) FROM sekai_dataset_version_rows
+                SELECT COUNT(*) FROM sekai_dataset_version_content
                 WHERE dataset_id = sekai_dataset_versions.dataset_id
                   AND version_id = sekai_dataset_versions.version_id
              ) WHERE dataset_id=$1",
@@ -1572,6 +1596,25 @@ fn erase_supported_subject_data(
                 .map_err(err)?;
         }
     }
+    for row in client
+        .query(
+            "SELECT from_seq, row_id, data FROM sekai_dataset_row_spans
+             WHERE dataset_id = 'llm_calls'",
+            &[],
+        )
+        .map_err(err)?
+    {
+        let (from_seq, row_id): (i64, i64) = (row.get(0), row.get(1));
+        if value_mentions_subject(row.get(2), &request.subject_kind, subject) {
+            client
+                .execute(
+                    "DELETE FROM sekai_dataset_row_spans
+                     WHERE dataset_id = 'llm_calls' AND from_seq = $1 AND row_id = $2",
+                    &[&from_seq, &row_id],
+                )
+                .map_err(err)?;
+        }
+    }
     crate::db::postgres_dataset_branch::edit_branch_rows_pg(client, "llm_calls", &|row| {
         let mentions = row
             .and_then(|values| serde_json::to_string(&values).ok())
@@ -1585,7 +1628,7 @@ fn erase_supported_subject_data(
     client
         .execute(
             "UPDATE sekai_dataset_versions SET row_count = (
-                SELECT COUNT(*) FROM sekai_dataset_version_rows
+                SELECT COUNT(*) FROM sekai_dataset_version_content
                 WHERE dataset_id = sekai_dataset_versions.dataset_id
                   AND version_id = sekai_dataset_versions.version_id
              ) WHERE dataset_id = 'llm_calls'",

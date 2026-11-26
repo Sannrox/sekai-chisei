@@ -12,12 +12,26 @@ pub(crate) const LATEST_SOURCE_ROW_SQL: &str = "SELECT data FROM sekai_dataset_r
      WHERE dataset_id LIKE 'srcds:%' AND dataset_id=$1
        AND (data::jsonb)->>'source_id' = $2
      ORDER BY id DESC LIMIT 1";
-/// Newest row of one source key in one retained version, over
-/// `idx_dataset_version_rows_source_key`.
-pub(crate) const LATEST_SOURCE_VERSION_ROW_SQL: &str = "SELECT data FROM sekai_dataset_version_rows
-     WHERE dataset_id LIKE 'srcds:%' AND dataset_id=$1 AND version_id=$2
-       AND (data::jsonb)->>'source_id' = $3
-     ORDER BY row_id DESC LIMIT 1";
+/// Newest row of one source key in one retained version. A version has one
+/// layout, so at most one branch answers: a `copy` version seeks
+/// `idx_dataset_version_rows_source_key`, a `span` version seeks
+/// `idx_dataset_row_spans_source_key` and keeps the spans live at its seq.
+pub(crate) const LATEST_SOURCE_VERSION_ROW_SQL: &str =
+    "(SELECT data FROM sekai_dataset_version_rows
+       WHERE dataset_id LIKE 'srcds:%' AND dataset_id=$1 AND version_id=$2
+         AND (data::jsonb)->>'source_id' = $3
+       ORDER BY row_id DESC LIMIT 1)
+     UNION ALL
+     (SELECT s.data FROM sekai_dataset_versions v
+       JOIN sekai_dataset_row_spans s
+         ON s.dataset_id = v.dataset_id
+        AND s.from_seq <= v.seq AND (s.to_seq IS NULL OR s.to_seq > v.seq)
+       WHERE v.dataset_id=$1 AND v.version_id=$2
+         AND v.layout = 'span' AND v.purged = 0
+         AND s.dataset_id LIKE 'srcds:%' AND s.dataset_id=$1
+         AND (s.data::jsonb)->>'source_id' = $3
+       ORDER BY s.row_id DESC LIMIT 1)
+     LIMIT 1";
 
 impl PostgresDb {
     pub fn create_dataset(&self, dataset: &Dataset) -> Result<(), String> {
@@ -210,7 +224,7 @@ impl PostgresDb {
         let state = crate::db::postgres_dataset_health::load_state_pg(&mut tx, dataset_id)?;
         let rows = if state.quarantined && !state.last_healthy_version_id.is_empty() {
             tx.query(
-                "SELECT data FROM sekai_dataset_version_rows
+                "SELECT data FROM sekai_dataset_version_content
                  WHERE dataset_id=$1 AND version_id=$2 ORDER BY row_id",
                 &[&dataset_id, &state.last_healthy_version_id],
             )
@@ -562,7 +576,7 @@ impl PostgresDb {
         }
         let rows = tx
             .query(
-                "SELECT data FROM sekai_dataset_version_rows
+                "SELECT data FROM sekai_dataset_version_content
                  WHERE dataset_id = $1 AND version_id = $2 ORDER BY row_id",
                 &[&dataset_id, &version.version_id],
             )
@@ -599,7 +613,7 @@ impl PostgresDb {
         }
         let rows = tx
             .query(
-                "SELECT row_id, data FROM sekai_dataset_version_rows
+                "SELECT row_id, data FROM sekai_dataset_version_content
                  WHERE dataset_id = $1 AND version_id = $2 AND row_id > $3
                  ORDER BY row_id LIMIT $4",
                 &[
@@ -674,7 +688,7 @@ pub(crate) fn rollback_dataset_pg(
     .map_err(|error| error.to_string())?;
     tx.execute(
         "INSERT INTO sekai_dataset_rows (dataset_id, data)
-         SELECT dataset_id, data FROM sekai_dataset_version_rows
+         SELECT dataset_id, data FROM sekai_dataset_version_content
          WHERE dataset_id = $1 AND version_id = $2
          ORDER BY row_id",
         &[&request.dataset_id, &restored.version_id],
@@ -1078,9 +1092,21 @@ fn prune_dataset_versions_pg(
            )",
         &[&dataset_id, &cutoff],
     )
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    tx.execute(PURGE_UNCOVERED_SPANS_PG, &[&dataset_id])
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
+
+/// Deletes the closed spans of a dataset that no retained `span` version
+/// covers (ADR 0172). Open spans are the live content and always stay.
+const PURGE_UNCOVERED_SPANS_PG: &str = "DELETE FROM sekai_dataset_row_spans s
+     WHERE s.dataset_id = $1 AND s.to_seq IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM sekai_dataset_versions v
+         WHERE v.dataset_id = $1 AND v.layout = 'span' AND v.purged = 0
+           AND v.seq >= s.from_seq AND v.seq < s.to_seq
+       )";
 
 pub fn mark_consuming_transform_outputs_stale_pg(
     tx: &mut postgres::Transaction<'_>,
@@ -1125,6 +1151,8 @@ pub fn mark_consuming_transform_outputs_stale_pg(
     Ok(())
 }
 
+/// Redacts matching rows of every version, in both layouts. A shared span is
+/// rewritten once and every version that covers it sees the result.
 fn redact_dataset_version_rows_pg(
     tx: &mut postgres::Transaction<'_>,
     dataset_id: &str,
@@ -1132,20 +1160,11 @@ fn redact_dataset_version_rows_pg(
     fields: &[&str],
     keys: &[String],
 ) -> Result<(), String> {
-    let rows = tx
-        .query(
-            "SELECT version_id, row_id, data FROM sekai_dataset_version_rows WHERE dataset_id = $1",
-            &[&dataset_id],
-        )
-        .map_err(|error| error.to_string())?;
-    for row in rows {
-        let version_id: String = row.get(0);
-        let row_id: i64 = row.get(1);
-        let data: String = row.get(2);
+    let redact = |data: &str| -> Result<Option<(String, String)>, String> {
         let mut values: HashMap<String, String> =
-            serde_json::from_str(&data).map_err(|error| error.to_string())?;
+            serde_json::from_str(data).map_err(|error| error.to_string())?;
         if !matches_filters(&values, filters) {
-            continue;
+            return Ok(None);
         }
         let mut changed = false;
         for field in fields {
@@ -1157,16 +1176,45 @@ fn redact_dataset_version_rows_pg(
             }
         }
         if !changed {
-            continue;
+            return Ok(None);
         }
         let data = serde_json::to_string(&values).map_err(|error| error.to_string())?;
         let partition_key = crate::sekai::governed_transform::partition_value(keys, &values);
-        tx.execute(
-            "UPDATE sekai_dataset_version_rows SET data = $1, partition_key = $2
-             WHERE dataset_id = $3 AND version_id = $4 AND row_id = $5",
-            &[&data, &partition_key, &dataset_id, &version_id, &row_id],
+        Ok(Some((data, partition_key)))
+    };
+    let copies = tx
+        .query(
+            "SELECT version_id, row_id, data FROM sekai_dataset_version_rows WHERE dataset_id = $1",
+            &[&dataset_id],
         )
         .map_err(|error| error.to_string())?;
+    for row in copies {
+        let (version_id, row_id): (String, i64) = (row.get(0), row.get(1));
+        if let Some((data, partition_key)) = redact(row.get(2))? {
+            tx.execute(
+                "UPDATE sekai_dataset_version_rows SET data = $1, partition_key = $2
+                 WHERE dataset_id = $3 AND version_id = $4 AND row_id = $5",
+                &[&data, &partition_key, &dataset_id, &version_id, &row_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    let spans = tx
+        .query(
+            "SELECT from_seq, row_id, data FROM sekai_dataset_row_spans WHERE dataset_id = $1",
+            &[&dataset_id],
+        )
+        .map_err(|error| error.to_string())?;
+    for row in spans {
+        let (from_seq, row_id): (i64, i64) = (row.get(0), row.get(1));
+        if let Some((data, partition_key)) = redact(row.get(2))? {
+            tx.execute(
+                "UPDATE sekai_dataset_row_spans SET data = $1, partition_key = $2
+                 WHERE dataset_id = $3 AND row_id = $4 AND from_seq = $5",
+                &[&data, &partition_key, &dataset_id, &row_id, &from_seq],
+            )
+            .map_err(|error| error.to_string())?;
+        }
     }
     Ok(())
 }

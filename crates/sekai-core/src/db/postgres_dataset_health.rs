@@ -507,7 +507,7 @@ fn load_version_rows_pg(
     version_id: &str,
 ) -> Result<Vec<HashMap<String, String>>, String> {
     tx.query(
-        "SELECT data FROM sekai_dataset_version_rows
+        "SELECT data FROM sekai_dataset_version_content
          WHERE dataset_id = $1 AND version_id = $2 ORDER BY row_id",
         &[&dataset_id, &version_id],
     )

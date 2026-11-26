@@ -269,6 +269,7 @@ const TRANSFORM_WORK_QUEUE_SCOPE_SCHEMA: &str =
 const NAMESPACE_PACKAGE_INSTALLATIONS_SCHEMA: &str =
     include_str!("postgres/0186_namespace_package_installations.sql");
 const DATASET_SERIES_INDEX_SCHEMA: &str = include_str!("postgres/0187_dataset_series_index.sql");
+const DATASET_ROW_SPANS_SCHEMA: &str = include_str!("postgres/0188_dataset_row_spans.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1356,6 +1357,12 @@ const MIGRATIONS: &[Migration] = &[
         187,
         "dataset_series_index",
         DATASET_SERIES_INDEX_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        188,
+        "dataset_row_spans",
+        DATASET_ROW_SPANS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

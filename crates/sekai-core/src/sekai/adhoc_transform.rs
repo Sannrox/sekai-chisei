@@ -219,6 +219,7 @@ pub(crate) const SWEEP_STATEMENTS: &[&str] = &[
     "DELETE FROM sekai_embedding_chunks WHERE object_id = {object}",
     "DELETE FROM sekai_dataset_rows WHERE dataset_id = {dataset}",
     "DELETE FROM sekai_dataset_version_rows WHERE dataset_id = {dataset}",
+    "DELETE FROM sekai_dataset_row_spans WHERE dataset_id = {dataset}",
     "DELETE FROM sekai_dataset_versions WHERE dataset_id = {dataset}",
     "DELETE FROM sekai_dataset_version_policy WHERE dataset_id = {dataset}",
     "DELETE FROM sekai_datasets WHERE id = {dataset}",
