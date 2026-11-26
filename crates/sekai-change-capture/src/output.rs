@@ -8,6 +8,9 @@
 //! {"kind":"truncate","commit_lsn":40,"index":1,"relations":["public.items"]}
 //! {"kind":"commit","commit_lsn":40,"end_lsn":48}
 //! {"kind":"caught_up","wal_end":56}
+//! {"kind":"snapshot_at","lsn":32}
+//! {"kind":"row","key":{"id":"1"},"row":{"id":"1","name":"a"}}
+//! {"kind":"snapshot_end","complete":false}
 //! {"kind":"refused","reason":"unknown_relation"}
 //! ```
 
@@ -56,6 +59,27 @@ pub enum Line {
     /// with the server at `wal_end`.
     CaughtUp {
         wal_end: u64,
+    },
+    /// `snapshot` reads the table after the slot's position `lsn`: the feed
+    /// replays every change committed after it.
+    SnapshotAt {
+        lsn: u64,
+    },
+    /// `snapshot`: one row of the table, in key order; `key` maps the
+    /// replica-identity columns to their values, `row` every published
+    /// column, `null` for a null.
+    Row {
+        key: BTreeMap<String, Option<String>>,
+        row: BTreeMap<String, Option<String>>,
+    },
+    /// `snapshot`: no row after the page's starting key, and the row at
+    /// that key is gone too.
+    Gone {
+        key: BTreeMap<String, Option<String>>,
+    },
+    /// `snapshot` ends its page; `complete` when no row follows it.
+    SnapshotEnd {
+        complete: bool,
     },
     /// `check` found the database ready to capture.
     Checked,

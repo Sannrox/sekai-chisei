@@ -33,7 +33,7 @@ fn run() -> i32 {
     drop(bytes);
     let capture = match (mode.as_str(), &start.postgres) {
         ("self-test", _) => None,
-        ("check" | "changes", Some(settings)) => Some(settings.clone()),
+        ("check" | "changes" | "snapshot", Some(settings)) => Some(settings.clone()),
         _ => return EXIT_USAGE,
     };
     if let Err(reason) = sandbox::enter(socket_fd, &start.read_paths) {
@@ -58,6 +58,7 @@ fn run() -> i32 {
     let outcome = pg::connect(socket, &settings, &start.credential).and_then(|mut session| {
         match mode.as_str() {
             "check" => pg::check(&mut session, &settings).map(|()| Some(Line::Checked)),
+            "snapshot" => pg::snapshot(&mut session, &settings, &mut stdout).map(|()| None),
             _ => pg::changes(&mut session, &settings, &mut stdout).map(|()| None),
         }
     });

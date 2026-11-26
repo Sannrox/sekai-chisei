@@ -392,8 +392,17 @@ change page that does not start at the committed offset, skips a sequence, or
 is empty without being caught up fails the sync as `invalid` and commits
 nothing. A generation in recovery starts the next generation's snapshot.
 
-Each change page runs one sandboxed capture child over a connection the
-runtime dialed after the egress check. A record's `external_id` is its
+The snapshot reads the table after the slot's position `P` (ADR 0170): the
+first page creates the slot when it is missing and takes its confirmed
+position, each page reads the next 500 rows in key order after the last
+committed key, and the last page hands off to the feed at `P`, which replays
+every change committed after it. The plane therefore ends in the source's
+state, though a row can briefly show an older value during the hand-off. An
+empty table fails the sync as `unavailable` (`table_empty`) until a row
+exists.
+
+Each snapshot or change page runs one sandboxed capture child over a
+connection the runtime dialed after the egress check. A record's `external_id` is its
 replica-identity key values in column-name order, percent-encoded and joined
 by `~`; its properties are the row's non-null text values. A delete is a
 tombstone, and an update that changes the key is a tombstone of the old key
@@ -406,8 +415,11 @@ sandbox cannot apply fails `unavailable` at once. A refused password is
 every other refusal `invalid`: an unverified certificate, a publication
 without exactly one table, a truncate, an update that leaves a large value out
 of the stream, and a slot that is missing or confirmed past the cursor once
-the feed runs. No runtime offers the type yet: its snapshot, the capture child
-and its sandbox self-test gate it, Linux only.
+the feed runs, a publication with a row filter, and a table whose replica
+identity is not a key. A runtime offers the type only on Linux, once the
+capture child installed beside it passes its sandbox self-test at startup;
+otherwise it names the reason on stderr and does not list the type's Sources.
+The child trusts the runtime's `relational_ca_file` beside the system roots.
 
 The GitHub object-sync profile admits exactly one code-owned type revision:
 

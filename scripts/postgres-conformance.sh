@@ -151,7 +151,12 @@ fi
 
 # Self-contained conformance files compile in the grouped `it` target (#1308).
 # Filters match the former binary names so ignored postgres cases still run.
+# The change-capture cases run the built child through the connector runtime.
 status=0
+cargo build --locked -p sekai-change-capture --bin sekai-change-capture
+target_dir="$(cargo metadata --locked --format-version 1 --no-deps |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+export SEKAI_TEST_CAPTURE_CHILD="$target_dir/debug/sekai-change-capture"
 SEKAI_TEST_POSTGRES_URL="$base/sekai_conformance" \
   cargo test --locked --no-fail-fast --test it -- --ignored --test-threads=1 \
     backend_conformance postgres || status=$?

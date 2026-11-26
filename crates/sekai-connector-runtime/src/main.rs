@@ -3,8 +3,11 @@
 //!
 //! The configuration names the plane, this runtime's id, principal,
 //! namespaces and placement labels, and the operator's credential
-//! bindings, and optionally a CA file relational Sources trust and a
-//! `gateway_url` model steps call (#3025). The plane bearer comes from
+//! bindings, and optionally a CA file relational and change-capture
+//! Sources trust and a `gateway_url` model steps call (#3025). Change
+//! capture (`postgres_capture`) is offered only on Linux, once its child's
+//! sandbox self-test passes at startup; otherwise the runtime says why on
+//! stderr and serves the other types. The plane bearer comes from
 //! `SEKAI_CREDENTIAL` and the gateway key from `CHISEI_GATEWAY_KEY`, never
 //! from the file.
 
@@ -41,8 +44,8 @@ struct Config {
     poll_ms: u64,
     #[serde(default)]
     credentials: CredentialBindings,
-    /// A PEM CA certificate relational Sources trust next to the system
-    /// roots, for a database behind a private CA.
+    /// A PEM CA certificate relational and `postgres_capture` Sources
+    /// trust next to the system roots, for a database behind a private CA.
     #[serde(default)]
     relational_ca_file: Option<PathBuf>,
     /// The model egress gateway's compatible surface, such as
@@ -130,6 +133,7 @@ async fn serve() -> Result<(), String> {
             event_stream::open(prepared, &broker_tls)
         })
         .with(&OBJECT_STORAGE_CONNECTOR, object_storage::open);
+    let connectors = with_capture(connectors, ca.as_deref())?;
     let runtime = Runtime::connect(
         plane,
         &config.namespaces,
@@ -155,6 +159,34 @@ async fn serve() -> Result<(), String> {
         .serve(Duration::from_millis(config.poll_ms), shutdown_signal()?)
         .await;
     Ok(())
+}
+
+/// Adds `postgres_capture` when this host can run its sandboxed child.
+#[cfg(unix)]
+fn with_capture(connectors: Connectors, ca: Option<&[u8]>) -> Result<Connectors, String> {
+    use sekai_connector_runtime::postgres_capture::{self, Capture};
+    use sekai_source_sdk::POSTGRES_CAPTURE_CONNECTOR;
+    let ca_pem = ca
+        .map(|pem| String::from_utf8(pem.to_vec()))
+        .transpose()
+        .map_err(|_| "relational CA file is not PEM text".to_string())?;
+    Ok(match Capture::offered(ca_pem) {
+        Ok(capture) => connectors.with(&POSTGRES_CAPTURE_CONNECTOR, move |prepared| {
+            postgres_capture::open(prepared, &capture)
+        }),
+        Err(unavailable) => {
+            eprintln!(
+                "sekai-connector-runtime: change capture not offered: {}",
+                unavailable.0
+            );
+            connectors
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn with_capture(connectors: Connectors, _ca: Option<&[u8]>) -> Result<Connectors, String> {
+    Ok(connectors)
 }
 
 /// Resolves on SIGINT or SIGTERM (unix) or Ctrl-C (elsewhere) so
