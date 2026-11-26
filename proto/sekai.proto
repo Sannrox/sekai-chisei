@@ -5921,9 +5921,15 @@ message ExportNamespacePackageRequest {
   // At least 1. Installations order upgrades by this number.
   uint32 package_version = 3;
   // Datasets packaged as definitions (name, typed and classified columns,
-  // partition keys); content is not carried in this version. Each
-  // must be bound to an object in the namespace and readable in every column.
+  // partition keys). Each must be bound to an object in the namespace and
+  // readable in every column.
   repeated string dataset_ids = 4;
+  // Of `dataset_ids`, those whose rows the package carries: the latest
+  // version, without the columns the caller's egress may not release (counted
+  // as `dataset_column` in the withheld list). Each needs an export grant on
+  // the namespace. All rows together are at most 2 MiB of canonical JSON, or
+  // export is refused with namespace_package_content_too_large.
+  repeated string content_dataset_ids = 5;
 }
 
 message ExportNamespacePackageResponse {

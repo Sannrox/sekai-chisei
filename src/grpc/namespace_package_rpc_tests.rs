@@ -24,6 +24,17 @@ fn signer() -> PackageSigner {
 
 /// Binds a dataset to a new object in `namespace`; `reader` alone may read it.
 fn bound_dataset(svc: &SekaiServiceImpl, id: &str, namespace: &str, reader: &str) {
+    bound_dataset_with(svc, id, namespace, reader, &[("title", "public")]);
+}
+
+/// As [`bound_dataset`], with string columns of these classifications.
+fn bound_dataset_with(
+    svc: &SekaiServiceImpl,
+    id: &str,
+    namespace: &str,
+    reader: &str,
+    columns: &[(&str, &str)],
+) {
     let object_id = format!("{id}-binding");
     svc.db
         .runtime()
@@ -44,11 +55,14 @@ fn bound_dataset(svc: &SekaiServiceImpl, id: &str, namespace: &str, reader: &str
         .create_dataset(&crate::sekai::dataset::Dataset {
             id: id.into(),
             name: id.into(),
-            columns: vec![crate::sekai::dataset::ColumnDef {
-                name: "title".into(),
-                col_type: "string".into(),
-                classification: "public".into(),
-            }],
+            columns: columns
+                .iter()
+                .map(|(name, classification)| crate::sekai::dataset::ColumnDef {
+                    name: name.to_string(),
+                    col_type: "string".into(),
+                    classification: classification.to_string(),
+                })
+                .collect(),
             object_id,
             created: 1,
             partition_keys: Vec::new(),
@@ -107,10 +121,43 @@ fn export(
             package_name: name.into(),
             package_version: 1,
             dataset_ids: dataset_ids.iter().map(|id| id.to_string()).collect(),
+            content_dataset_ids: Vec::new(),
         }),
         &signer(),
     )
     .map(Response::into_inner)
+}
+
+/// Export with rows for `content` of `dataset_ids`.
+fn export_with_content(
+    svc: &SekaiServiceImpl,
+    dataset_ids: &[&str],
+    content: &[&str],
+) -> Result<ExportNamespacePackageResponse, Status> {
+    export_namespace_package_as(
+        svc,
+        with_principal(ExportNamespacePackageRequest {
+            namespace: NAMESPACE.into(),
+            package_name: "support-desk".into(),
+            package_version: 1,
+            dataset_ids: dataset_ids.iter().map(|id| id.to_string()).collect(),
+            content_dataset_ids: content.iter().map(|id| id.to_string()).collect(),
+        }),
+        &signer(),
+    )
+    .map(Response::into_inner)
+}
+
+fn grant_export_to_tester(svc: &SekaiServiceImpl) {
+    crate::sekai::data_export::grant_export(
+        svc.db.runtime(),
+        NAMESPACE,
+        "tester",
+        "package content test",
+        "root",
+        1,
+    )
+    .unwrap();
 }
 
 #[tokio::test]
@@ -460,4 +507,162 @@ async fn an_input_installs_only_when_mapped_to_a_dataset_of_its_schema() {
     assert_eq!(installed.resources.len(), 1);
     assert_eq!(installed.resources[0].role, "input");
     assert_eq!(installed.resources[0].resource_id, "local-tickets");
+}
+
+#[tokio::test]
+async fn opted_in_rows_install_as_one_new_version_and_only_once() {
+    let svc = service();
+    fixture(&svc).await;
+    grant_export_to_tester(&svc);
+    let exported = export_with_content(&svc, &["tickets"], &["tickets"]).unwrap();
+    assert!(exported.envelope_json.contains("row-data-marker"));
+    target_object(&svc, "desk-binding");
+    let mapped = [("tickets", "desk-tickets", "desk-binding")];
+
+    install(&svc, &exported.envelope_json, &mapped).unwrap();
+    let versions = || {
+        svc.db
+            .runtime()
+            .list_dataset_versions("desk-tickets")
+            .unwrap()
+            .len()
+    };
+    let titles = || {
+        svc.db
+            .runtime()
+            .query_rows("desk-tickets", &Default::default())
+            .unwrap()
+            .into_iter()
+            .map(|row| row["title"].clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(versions(), 1);
+    assert_eq!(titles(), ["row-data-marker"]);
+
+    // Reinstalling the same package appends nothing.
+    install(&svc, &exported.envelope_json, &mapped).unwrap();
+    assert_eq!(versions(), 1);
+    assert_eq!(titles(), ["row-data-marker"]);
+}
+
+#[tokio::test]
+async fn a_retry_finding_other_rows_in_its_dataset_is_refused_by_name() {
+    let svc = service();
+    fixture(&svc).await;
+    grant_export_to_tester(&svc);
+    let exported = export_with_content(&svc, &["tickets"], &["tickets"]).unwrap();
+    target_object(&svc, "desk-binding");
+    // A crash left the dataset created; someone then wrote other rows to it.
+    let source = svc.db.runtime().get_dataset("tickets").unwrap().unwrap();
+    svc.db
+        .runtime()
+        .create_dataset(&crate::sekai::dataset::Dataset {
+            id: "desk-tickets".into(),
+            object_id: "desk-binding".into(),
+            ..source
+        })
+        .unwrap();
+    svc.db
+        .runtime()
+        .append_rows(
+            "desk-tickets",
+            &[[("title".to_string(), "written-elsewhere".to_string())].into()],
+        )
+        .unwrap();
+
+    let refused = install(
+        &svc,
+        &exported.envelope_json,
+        &[("tickets", "desk-tickets", "desk-binding")],
+    )
+    .unwrap_err();
+    assert_eq!(
+        refused.message(),
+        "entry dataset_version/tickets: dataset desk-tickets changed outside the installation"
+    );
+    assert_eq!(
+        svc.db
+            .runtime()
+            .query_rows("desk-tickets", &Default::default())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn content_needs_an_export_grant_and_leaves_out_unreleased_columns() {
+    let mut svc = service();
+    fixture(&svc).await;
+    // Read alone packages the definition, not the rows.
+    let refused = export_with_content(&svc, &["tickets"], &["tickets"]).unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        refused.message(),
+        "dataset tickets content needs an export grant on namespace pkg-ns"
+    );
+    assert!(export_with_content(&svc, &["tickets"], &[]).is_ok());
+    let refused = export_with_content(&svc, &[], &["tickets"]).unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+
+    grant_export_to_tester(&svc);
+    bound_dataset_with(
+        &svc,
+        "contacts",
+        NAMESPACE,
+        "tester",
+        &[("name", "public"), ("email", "sensitive")],
+    );
+    svc.db
+        .runtime()
+        .append_rows(
+            "contacts",
+            &[[
+                ("name".to_string(), "Ada".to_string()),
+                ("email".to_string(), "ada@example.test".to_string()),
+            ]
+            .into()],
+        )
+        .unwrap();
+    let egress = crate::composition::gateway_egress_policy::EgressPolicies::new(["edge".into()]);
+    egress
+        .load(
+            "edge",
+            serde_json::json!({
+                "format": "chisei.gateway-policy/v1",
+                "generation": 1,
+                "principals": [
+                    {"name": "tester", "routes": [{"provider": "hosted", "models": ["*"]}]},
+                ],
+                "egress": [{"provider": "hosted", "data_classes": ["public"]}],
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    svc.set_egress_policies(egress);
+
+    let exported = export_with_content(&svc, &["contacts"], &["contacts"]).unwrap();
+    assert!(exported.envelope_json.contains("Ada"));
+    assert!(!exported.envelope_json.contains("ada@example.test"));
+    let package = package_domain::verify_namespace_envelope(&exported.envelope_json, &keyring())
+        .unwrap()
+        .package;
+    assert!(package.withheld.contains(&WithheldCount {
+        kind: package_domain::WITHHELD_DATASET_COLUMN.into(),
+        count: 1,
+    }));
+    // The withheld column stays in the schema, so the digest is unchanged.
+    let carried = package
+        .entries
+        .iter()
+        .find(|entry| entry.id == "contacts")
+        .unwrap();
+    let source = svc.db.runtime().get_dataset("contacts").unwrap().unwrap();
+    assert_eq!(
+        carried.digest,
+        package_domain::DatasetDocument::of(&source)
+            .schema_digest()
+            .unwrap()
+    );
 }

@@ -16,13 +16,18 @@
 //!   not the name, so a mapped dataset can match under another name. v1
 //!   export emits no inputs: with transforms out, no carried resource depends
 //!   on an uncarried dataset.
+//! - A `dataset_version` output the exporter opted into content for sets
+//!   `content_included` and carries a [`DatasetContentDocument`]: the same
+//!   definition plus the rows of the source's latest version and their
+//!   `content_digest`. The entry digest stays the schema digest.
 //! - The withheld list counts definition members the caller may not read, by
-//!   member kind, never naming them.
+//!   member kind, and the columns of content datasets the caller's egress may
+//!   not release (`dataset_column`), never naming them.
 //!
-//! The package digest covers the whole canonical manifest, and the envelope
-//! signature is the definition package signature under this contract. A
-//! package never carries credentials, run history, receipts or audit.
-//! Content (`content_included`) is always false until datasets can carry it.
+//! The package digest covers the whole canonical manifest, rows included, and
+//! the envelope signature is the definition package signature under this
+//! contract. A package never carries credentials, run history, receipts or
+//! audit.
 
 use std::collections::BTreeMap;
 
@@ -51,6 +56,18 @@ pub const REFUSAL_INCOMPATIBLE: &str = "namespace_package_incompatible";
 pub const MAX_PACKAGE_NAME_BYTES: usize = 128;
 /// Datasets one package may select.
 pub const MAX_PACKAGE_DATASETS: usize = 256;
+/// Canonical JSON bytes of all rows one package carries, together. A package
+/// travels in one gRPC message, whose default limit is 4 MiB.
+pub const MAX_PACKAGE_CONTENT_BYTES: usize = 2 * 1024 * 1024;
+/// The opted-in rows exceed [`MAX_PACKAGE_CONTENT_BYTES`].
+pub const REFUSAL_CONTENT_TOO_LARGE: &str = "namespace_package_content_too_large";
+/// Withheld-list kind for a column of a content dataset whose values the
+/// exporter's egress may not release.
+pub const WITHHELD_DATASET_COLUMN: &str = "dataset_column";
+
+/// One carried row: column name to value. Columns the exporter's egress may
+/// not release are absent.
+pub type ContentRow = BTreeMap<String, String>;
 
 /// Whether the package creates the resource or depends on one the installer
 /// maps in the target namespace.
@@ -157,6 +174,84 @@ impl DatasetDocument {
             },
         )
     }
+}
+
+/// What a `dataset_version` output with `content_included` creates: its
+/// definition, and the rows of the source dataset's latest version
+/// (ADR 0169 decision 13). The fields repeat [`DatasetDocument`] rather than
+/// flatten it, so unknown fields are still refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatasetContentDocument {
+    pub name: String,
+    pub columns: Vec<DatasetColumn>,
+    pub partition_keys: Vec<String>,
+    /// [`content_digest`] of `rows`.
+    pub content_digest: String,
+    /// In the source version's row order.
+    pub rows: Vec<ContentRow>,
+}
+
+impl DatasetContentDocument {
+    pub fn new(definition: DatasetDocument, rows: Vec<ContentRow>) -> Result<Self, String> {
+        Ok(Self {
+            content_digest: content_digest(&rows)?,
+            name: definition.name,
+            columns: definition.columns,
+            partition_keys: definition.partition_keys,
+            rows,
+        })
+    }
+
+    pub fn definition(&self) -> DatasetDocument {
+        DatasetDocument {
+            name: self.name.clone(),
+            columns: self.columns.clone(),
+            partition_keys: self.partition_keys.clone(),
+        }
+    }
+}
+
+/// SHA-256 over the canonical rows, in order.
+pub fn content_digest(rows: &[ContentRow]) -> Result<String, String> {
+    definition_package::contract_digest(NAMESPACE_PACKAGE_CONTRACT, "dataset_content", &rows)
+}
+
+/// The canonical JSON size of one row, as counted against
+/// [`MAX_PACKAGE_CONTENT_BYTES`].
+pub fn row_bytes(row: &ContentRow) -> Result<usize, String> {
+    Ok(crate::shomei::canonical_json_with_finite_numbers(row)?.len())
+}
+
+/// Refuses a row naming a column `columns` lacks, or a value its column's type
+/// does not parse as. Values are strings; an empty value is a null. `int`,
+/// `float` and `bool` columns are checked, other types hold any string.
+/// Errors name the row and column.
+pub fn check_rows(columns: &[DatasetColumn], rows: &[ContentRow]) -> Result<(), String> {
+    for (index, row) in rows.iter().enumerate() {
+        for (name, value) in row {
+            let column = columns
+                .iter()
+                .find(|column| &column.name == name)
+                .ok_or_else(|| {
+                    format!("row {index} names column {name}, which the schema lacks")
+                })?;
+            let fits = value.is_empty()
+                || match column.col_type.as_str() {
+                    "int" => value.parse::<i64>().is_ok(),
+                    "float" => value.parse::<f64>().is_ok_and(f64::is_finite),
+                    "bool" => matches!(value.as_str(), "true" | "false"),
+                    _ => true,
+                };
+            if !fits {
+                return Err(format!(
+                    "row {index} column {name} is not a {} value",
+                    column.col_type
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Installation status (ADR 0169 decision 10): the definitions proposal has
@@ -292,7 +387,8 @@ fn manifest_digest(package: &NamespacePackage) -> Result<String, String> {
 
 /// Builds a manifest from the readable definitions, the selected datasets
 /// (outputs), the datasets they depend on without carrying (inputs), and
-/// withheld counts by kind. Duplicate datasets are refused.
+/// withheld counts by kind. Duplicate datasets are refused. Carries no rows;
+/// see [`build_namespace_package_with_content`].
 pub fn build_namespace_package(
     name: &str,
     version: u32,
@@ -301,7 +397,39 @@ pub fn build_namespace_package(
     inputs: &[Dataset],
     withheld: BTreeMap<String, u64>,
 ) -> Result<NamespacePackage, String> {
+    build_namespace_package_with_content(
+        name,
+        version,
+        definitions,
+        outputs,
+        inputs,
+        BTreeMap::new(),
+        withheld,
+    )
+}
+
+/// As [`build_namespace_package`], with `content` holding the rows of the
+/// outputs opted into content, by dataset id. Content for a dataset that is
+/// not an output, or over [`MAX_PACKAGE_CONTENT_BYTES`] in all, is refused.
+pub fn build_namespace_package_with_content(
+    name: &str,
+    version: u32,
+    definitions: &DefinitionPackage,
+    outputs: &[Dataset],
+    inputs: &[Dataset],
+    mut content: BTreeMap<String, Vec<ContentRow>>,
+    withheld: BTreeMap<String, u64>,
+) -> Result<NamespacePackage, String> {
     validate_name_and_version(name, version)?;
+    if let Some(id) = content
+        .keys()
+        .find(|id| !outputs.iter().any(|dataset| &dataset.id == *id))
+    {
+        return Err(format!(
+            "{REFUSAL_INCOMPATIBLE}: content for {id}, which the package does not create"
+        ));
+    }
+    let mut content_bytes = 0usize;
     let mut entries = vec![PackageEntry {
         kind: KIND_DEFINITION_PACKAGE.into(),
         id: DEFINITIONS_ENTRY_ID.into(),
@@ -313,16 +441,40 @@ pub fn build_namespace_package(
     for (role, datasets) in [(EntryRole::Output, outputs), (EntryRole::Input, inputs)] {
         for dataset in datasets {
             let document = DatasetDocument::of(dataset);
+            let digest = document.schema_digest()?;
+            let rows = match role {
+                EntryRole::Output => content.remove(&dataset.id),
+                _ => None,
+            };
+            let (content_included, document_json) = match (role, rows) {
+                (EntryRole::Output, Some(rows)) => {
+                    check_rows(&document.columns, &rows).map_err(|error| {
+                        format!("{REFUSAL_INCOMPATIBLE}: dataset {}: {error}", dataset.id)
+                    })?;
+                    for row in &rows {
+                        content_bytes += row_bytes(row)?;
+                    }
+                    if content_bytes > MAX_PACKAGE_CONTENT_BYTES {
+                        return Err(format!(
+                            "{REFUSAL_CONTENT_TOO_LARGE}: dataset {} brings the package over {MAX_PACKAGE_CONTENT_BYTES} bytes of rows",
+                            dataset.id
+                        ));
+                    }
+                    (
+                        true,
+                        canonical_string(&DatasetContentDocument::new(document, rows)?)?,
+                    )
+                }
+                (EntryRole::Output, None) => (false, canonical_string(&document)?),
+                _ => (false, String::new()),
+            };
             entries.push(PackageEntry {
                 kind: KIND_DATASET_VERSION.into(),
                 id: dataset.id.clone(),
                 role,
-                digest: document.schema_digest()?,
-                content_included: false,
-                document_json: match role {
-                    EntryRole::Output => canonical_string(&document)?,
-                    EntryRole::Input => String::new(),
-                },
+                digest,
+                content_included,
+                document_json,
             });
         }
     }
@@ -374,13 +526,35 @@ pub fn sign_namespace_package(
     })
 }
 
-/// Recomputes one entry's digest from its document; inputs carry none.
-fn check_entry(entry: &PackageEntry, ontology_digest: &str) -> Result<(), String> {
+/// Recomputes one entry's digests from its document; inputs carry none.
+/// Returns the bytes of rows the entry carries.
+fn check_entry(entry: &PackageEntry, ontology_digest: &str) -> Result<usize, String> {
     let name = format!("{}/{}", entry.kind, entry.id);
     if entry.content_included {
-        return Err(format!(
-            "{REFUSAL_INCOMPATIBLE}: entry {name} carries content, which this plane cannot install"
-        ));
+        if (entry.kind.as_str(), entry.role) != (KIND_DATASET_VERSION, EntryRole::Output) {
+            return Err(format!(
+                "{REFUSAL_INCOMPATIBLE}: entry {name} carries content, which only a dataset output may"
+            ));
+        }
+        let document: DatasetContentDocument = serde_json::from_str(&entry.document_json)
+            .map_err(|error| format!("{REFUSAL_INCOMPATIBLE}: entry {name}: {error}"))?;
+        if document.definition().schema_digest()? != entry.digest {
+            return Err(format!(
+                "{REFUSAL_TAMPERED}: entry {name} does not match its schema"
+            ));
+        }
+        if content_digest(&document.rows)? != document.content_digest {
+            return Err(format!(
+                "{REFUSAL_TAMPERED}: entry {name} does not match its content digest"
+            ));
+        }
+        check_rows(&document.columns, &document.rows)
+            .map_err(|error| format!("{REFUSAL_INCOMPATIBLE}: entry {name}: {error}"))?;
+        let mut bytes = 0;
+        for row in &document.rows {
+            bytes += row_bytes(row)?;
+        }
+        return Ok(bytes);
     }
     match (entry.kind.as_str(), entry.role) {
         (KIND_DEFINITION_PACKAGE, EntryRole::Output) if entry.id == DEFINITIONS_ENTRY_ID => {
@@ -404,7 +578,7 @@ fn check_entry(entry: &PackageEntry, ontology_digest: &str) -> Result<(), String
                     "{REFUSAL_TAMPERED}: ontology digest does not match entry {name}"
                 ));
             }
-            Ok(())
+            Ok(0)
         }
         (KIND_DATASET_VERSION, EntryRole::Output) => {
             let document: DatasetDocument = serde_json::from_str(&entry.document_json)
@@ -414,10 +588,11 @@ fn check_entry(entry: &PackageEntry, ontology_digest: &str) -> Result<(), String
                     "{REFUSAL_TAMPERED}: entry {name} does not match its schema"
                 ));
             }
-            Ok(())
+            Ok(0)
         }
         (KIND_DATASET_VERSION, EntryRole::Input) if entry.document_json.is_empty() => {
             crate::sekai::definition_branch::validate_digest("digest", &entry.digest)
+                .map(|()| 0)
                 .map_err(|error| format!("{REFUSAL_INCOMPATIBLE}: entry {name}: {error}"))
         }
         _ => Err(format!("{REFUSAL_INCOMPATIBLE}: unsupported entry {name}")),
@@ -449,8 +624,14 @@ pub fn verify_namespace_envelope(
         ));
     }
     // Entries first, so an unknown kind is refused by name.
+    let mut content_bytes = 0usize;
     for entry in &package.entries {
-        check_entry(entry, &package.ontology_digest)?;
+        content_bytes += check_entry(entry, &package.ontology_digest)?;
+    }
+    if content_bytes > MAX_PACKAGE_CONTENT_BYTES {
+        return Err(format!(
+            "{REFUSAL_CONTENT_TOO_LARGE}: package carries over {MAX_PACKAGE_CONTENT_BYTES} bytes of rows"
+        ));
     }
     let sorted_unique = package
         .entries
