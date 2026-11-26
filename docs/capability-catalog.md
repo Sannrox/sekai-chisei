@@ -435,7 +435,11 @@ by an independent MCP policy path.
 
 `sekai-mcp` is the executable projection host for that contract. It speaks MCP
 stdio with newline-delimited JSON-RPC 2.0. The same JSON-RPC allowlist is also
-served as `POST /mcp` on `SEKAI_HTTP_PORT` with the HTTP/JSON bearer.
+served as `POST /mcp` on `SEKAI_HTTP_PORT` with the HTTP/JSON bearer. Beyond
+loopback, `/mcp` is served only over TLS. Under token or enterprise auth the
+bearer is authenticated at the door as `DiscoverCapabilities` and again for
+each tool as that tool's native RPC, so an enterprise-scoped credential reaches
+only the tools whose RPCs the enterprise allowlist serves.
 Credentials for the stdio host stay in the process environment
 (`SEKAI_MCP_PRINCIPAL`, `SEKAI_MCP_NAMESPACE`, `SEKAI_MCP_TARGET` or
 `SEKAI_SOCKET`, and optional `SEKAI_CREDENTIAL`). HTTP MCP uses the request

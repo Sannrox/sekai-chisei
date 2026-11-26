@@ -109,7 +109,8 @@ Wait until the StatefulSet is available and ops health is green:
 ```bash
 kubectl -n local rollout status statefulset/sekai-chisei --timeout=120s
 kubectl -n local get pods,svc,pvc
-# From inside the cluster network, ops is HTTP on 9464; gRPC is TLS on 50051.
+# From inside the cluster network, ops is HTTP on 9464; gRPC is TLS on 50051;
+# the HTTP projection and POST /mcp are TLS on 50080 once TCP binds.
 ```
 
 The image keeps `SEKAI_SOCKET=/data/sekai.sock` on the PVC. First boot is

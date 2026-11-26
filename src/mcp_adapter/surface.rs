@@ -72,6 +72,18 @@ pub enum NativeRpc {
 }
 
 impl NativeRpc {
+    /// The gRPC service that serves [`Self::rpc_name`], so a tool call can be
+    /// authorized against its full RPC path.
+    pub fn service_name(self) -> &'static str {
+        match self {
+            Self::PutEvaluationPlan
+            | Self::ResolveEvaluationPlan
+            | Self::ExecuteEvaluationManifest
+            | Self::GetOperationReceipt => "chisei.ChiseiService",
+            _ => "sekai.SekaiService",
+        }
+    }
+
     /// The public RPC this tool calls, as the maturity table names it.
     pub fn rpc_name(self) -> &'static str {
         match self {
@@ -160,21 +172,88 @@ pub async fn dispatch_native(
     invocation: SdkInvocation,
     experimental_rpcs: bool,
 ) -> Result<Value, AdapterError> {
+    dispatch_native_as(
+        sekai,
+        chisei,
+        rpc,
+        invocation,
+        experimental_rpcs,
+        &CallerIdentity::default(),
+    )
+    .await
+}
+
+/// The identity a tool call runs as when a server listener authenticated it:
+/// the interceptor's identity metadata and extensions (the enterprise
+/// authenticated context included) for that tool's RPC. The default is empty,
+/// so a request carries only the invocation's own principal, as an in-process
+/// host binds it.
+#[derive(Clone, Default)]
+pub struct CallerIdentity {
+    metadata: tonic::metadata::MetadataMap,
+    extensions: http::Extensions,
+}
+
+impl CallerIdentity {
+    /// Keep what the interceptor returned for this call's RPC path. Only the
+    /// metadata the interceptor writes itself is carried onto a request.
+    pub fn authenticated(request: tonic::Request<()>) -> Self {
+        let (metadata, extensions, ()) = request.into_parts();
+        Self {
+            metadata,
+            extensions,
+        }
+    }
+
+    /// Carry this identity onto `request`, replacing its extensions.
+    pub fn apply<T>(&self, request: &mut tonic::Request<T>) {
+        for key in crate::grpc::AUTHENTICATED_METADATA {
+            if let Some(value) = self.metadata.get(key) {
+                request.metadata_mut().insert(key, value.clone());
+            }
+        }
+        *request.extensions_mut() = self.extensions.clone();
+    }
+
+    fn bind<T>(
+        &self,
+        invocation: &SdkInvocation,
+        message: T,
+    ) -> Result<tonic::Request<T>, crate::capability_projection::ProjectionError> {
+        let mut request = invocation.bind(message)?;
+        self.apply(&mut request);
+        Ok(request)
+    }
+}
+
+/// [`dispatch_native`] as an authenticated caller: every request the tool
+/// sends, including a lookup it makes first, carries `caller`'s identity.
+pub async fn dispatch_native_as(
+    sekai: &SekaiServiceImpl,
+    chisei: &ChiseiServiceImpl,
+    rpc: NativeRpc,
+    invocation: SdkInvocation,
+    experimental_rpcs: bool,
+    caller: &CallerIdentity,
+) -> Result<Value, AdapterError> {
     // In-process dispatch skips the gRPC maturity layer, so it applies the
     // same gate: an experimental RPC stays off unless `experimental_rpcs`.
     crate::rpc_maturity::require_invokable(rpc.rpc_name(), experimental_rpcs)
         .map_err(status_error)?;
     match rpc {
         NativeRpc::GetObject => {
-            let request = invocation
-                .bind(GetObjectRequest {
-                    id: invocation
-                        .input
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                })
+            let request = caller
+                .bind(
+                    &invocation,
+                    GetObjectRequest {
+                        id: invocation
+                            .input
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    },
+                )
                 .map_err(|error| AdapterError::Protocol(error.to_string()))?;
             let response = sekai
                 .get_object(request)
@@ -196,8 +275,8 @@ pub async fn dispatch_native(
             }))
         }
         NativeRpc::GetLinks => {
-            let request = invocation
-                .bind(get_links_request(&invocation)?)
+            let request = caller
+                .bind(&invocation, get_links_request(&invocation)?)
                 .map_err(|error| AdapterError::Protocol(error.to_string()))?;
             let response = sekai
                 .get_links(request)
@@ -207,8 +286,8 @@ pub async fn dispatch_native(
             Ok(json!({"links": response.links.iter().map(link_json).collect::<Vec<_>>()}))
         }
         NativeRpc::CreateLink => {
-            let request = invocation
-                .bind(create_link_request(&invocation)?)
+            let request = caller
+                .bind(&invocation, create_link_request(&invocation)?)
                 .map_err(|error| AdapterError::Protocol(error.to_string()))?;
             let response = sekai
                 .create_link(request)
@@ -224,8 +303,8 @@ pub async fn dispatch_native(
             let payload =
                 serde_json::from_value::<PutEvaluationPlanRequest>(invocation.input.clone())
                     .map_err(|error| AdapterError::Protocol(error.to_string()))?;
-            let request = invocation
-                .bind(payload)
+            let request = caller
+                .bind(&invocation, payload)
                 .map_err(|error| AdapterError::Protocol(error.to_string()))?;
             let response = chisei
                 .put_evaluation_plan(request)
@@ -239,8 +318,8 @@ pub async fn dispatch_native(
             let payload =
                 serde_json::from_value::<ResolveEvaluationPlanRequest>(invocation.input.clone())
                     .map_err(|error| AdapterError::Protocol(error.to_string()))?;
-            let request = invocation
-                .bind(payload)
+            let request = caller
+                .bind(&invocation, payload)
                 .map_err(|error| AdapterError::Protocol(error.to_string()))?;
             let response = chisei
                 .resolve_evaluation_plan(request)
@@ -255,8 +334,8 @@ pub async fn dispatch_native(
                 invocation.input.clone(),
             )
             .map_err(|error| AdapterError::Protocol(error.to_string()))?;
-            let request = invocation
-                .bind(payload)
+            let request = caller
+                .bind(&invocation, payload)
                 .map_err(|error| AdapterError::Protocol(error.to_string()))?;
             let response = chisei
                 .execute_evaluation_manifest(request)
@@ -270,8 +349,8 @@ pub async fn dispatch_native(
             let payload =
                 serde_json::from_value::<EvaluateObjectSetRequest>(invocation.input.clone())
                     .map_err(|error| AdapterError::Protocol(error.to_string()))?;
-            let request = invocation
-                .bind(payload)
+            let request = caller
+                .bind(&invocation, payload)
                 .map_err(|error| AdapterError::Protocol(error.to_string()))?;
             let response = sekai
                 .evaluate_object_set(request)
@@ -285,8 +364,8 @@ pub async fn dispatch_native(
             let payload =
                 serde_json::from_value::<DescribeObjectActionRequest>(invocation.input.clone())
                     .map_err(|error| AdapterError::Protocol(error.to_string()))?;
-            let request = invocation
-                .bind(payload)
+            let request = caller
+                .bind(&invocation, payload)
                 .map_err(|error| AdapterError::Protocol(error.to_string()))?;
             let response = sekai
                 .describe_object_action(request)
@@ -300,8 +379,8 @@ pub async fn dispatch_native(
             let payload =
                 serde_json::from_value::<PreviewObjectActionRequest>(invocation.input.clone())
                     .map_err(|error| AdapterError::Protocol(error.to_string()))?;
-            let request = invocation
-                .bind(payload)
+            let request = caller
+                .bind(&invocation, payload)
                 .map_err(|error| AdapterError::Protocol(error.to_string()))?;
             let response = timeout(
                 preview_fill_deadline(),
@@ -315,8 +394,8 @@ pub async fn dispatch_native(
                 .map_err(|error| AdapterError::Protocol(error.to_string()))
         }
         NativeRpc::SubmitActionInstance => {
-            let request = invocation
-                .bind(submit_request(&invocation)?)
+            let request = caller
+                .bind(&invocation, submit_request(&invocation)?)
                 .map_err(|error| AdapterError::Protocol(error.to_string()))?;
             let response = timeout(
                 Duration::from_secs(5),
@@ -329,8 +408,8 @@ pub async fn dispatch_native(
             Ok(submit_output(response))
         }
         NativeRpc::GetOperationReceipt => {
-            let request = invocation
-                .bind(receipt_request(&invocation))
+            let request = caller
+                .bind(&invocation, receipt_request(&invocation))
                 .map_err(|error| AdapterError::Protocol(error.to_string()))?;
             let response = chisei
                 .get_operation_receipt(request)
@@ -341,98 +420,112 @@ pub async fn dispatch_native(
         }
         NativeRpc::CreateDefinitionBranch => dispatch_sekai_json(
             sekai
-                .create_definition_branch(bind_json(&invocation)?)
+                .create_definition_branch(bind_json(caller, &invocation)?)
                 .await,
         ),
         NativeRpc::ApplyDefinitionBranchEdit => dispatch_sekai_json(
             sekai
-                .apply_definition_branch_edit(bind_json(&invocation)?)
+                .apply_definition_branch_edit(bind_json(caller, &invocation)?)
                 .await,
         ),
         NativeRpc::CompareDefinitionRevisions => dispatch_sekai_json(
             sekai
-                .compare_definition_revisions(bind_json(&invocation)?)
+                .compare_definition_revisions(bind_json(caller, &invocation)?)
                 .await,
         ),
         NativeRpc::ReportDefinitionConsumerImpact => dispatch_sekai_json(
             sekai
-                .report_definition_consumer_impact(bind_json(&invocation)?)
+                .report_definition_consumer_impact(bind_json(caller, &invocation)?)
                 .await,
         ),
         NativeRpc::CreateDefinitionProposal => {
-            require_stored_plans(&invocation, |request| async {
+            require_stored_plans(caller, &invocation, |request| async {
                 crate::rpc_maturity::require_invokable("GetEvaluationPlan", experimental_rpcs)?;
                 chisei.get_evaluation_plan(request).await.map(drop)
             })
             .await?;
             dispatch_sekai_json(
                 sekai
-                    .create_definition_proposal(bind_json(&invocation)?)
+                    .create_definition_proposal(bind_json(caller, &invocation)?)
                     .await,
             )
         }
         NativeRpc::Search => Ok(search_references(
             sekai
-                .search(bind_json::<SearchRequest>(&invocation)?)
+                .search(bind_json::<SearchRequest>(caller, &invocation)?)
                 .await
                 .map_err(status_error)?
                 .into_inner(),
         )),
-        NativeRpc::ListOntologyClasses => {
-            dispatch_sekai_json(sekai.list_ontology_classes(bind_json(&invocation)?).await)
-        }
-        NativeRpc::GetOntologyClass => {
-            dispatch_sekai_json(sekai.get_ontology_class(bind_json(&invocation)?).await)
-        }
-        NativeRpc::ExpandNeighborhood => {
-            dispatch_sekai_json(sekai.expand_neighborhood(bind_json(&invocation)?).await)
-        }
+        NativeRpc::ListOntologyClasses => dispatch_sekai_json(
+            sekai
+                .list_ontology_classes(bind_json(caller, &invocation)?)
+                .await,
+        ),
+        NativeRpc::GetOntologyClass => dispatch_sekai_json(
+            sekai
+                .get_ontology_class(bind_json(caller, &invocation)?)
+                .await,
+        ),
+        NativeRpc::ExpandNeighborhood => dispatch_sekai_json(
+            sekai
+                .expand_neighborhood(bind_json(caller, &invocation)?)
+                .await,
+        ),
         NativeRpc::GetLineage => {
-            dispatch_sekai_json(sekai.get_lineage(bind_json(&invocation)?).await)
+            dispatch_sekai_json(sekai.get_lineage(bind_json(caller, &invocation)?).await)
         }
         NativeRpc::DryRunAgent => {
-            dispatch_sekai_json(sekai.dry_run_agent(bind_json(&invocation)?).await)
+            dispatch_sekai_json(sekai.dry_run_agent(bind_json(caller, &invocation)?).await)
         }
         NativeRpc::ListSiteAgentWorkingMemory => dispatch_sekai_json(
             sekai
-                .list_site_agent_working_memory(bind_json(&invocation)?)
+                .list_site_agent_working_memory(bind_json(caller, &invocation)?)
                 .await,
         ),
-        NativeRpc::CreateDatasetBranch => {
-            dispatch_sekai_json(sekai.create_dataset_branch(bind_json(&invocation)?).await)
-        }
+        NativeRpc::CreateDatasetBranch => dispatch_sekai_json(
+            sekai
+                .create_dataset_branch(bind_json(caller, &invocation)?)
+                .await,
+        ),
         NativeRpc::RunGovernedTransformOnBranch => dispatch_sekai_json(
             sekai
-                .run_governed_transform_on_branch(bind_json(&invocation)?)
+                .run_governed_transform_on_branch(bind_json(caller, &invocation)?)
                 .await,
         ),
-        NativeRpc::CompareDatasetBranch => {
-            dispatch_sekai_json(sekai.compare_dataset_branch(bind_json(&invocation)?).await)
-        }
+        NativeRpc::CompareDatasetBranch => dispatch_sekai_json(
+            sekai
+                .compare_dataset_branch(bind_json(caller, &invocation)?)
+                .await,
+        ),
         NativeRpc::ProposeDatasetBranchMerge => dispatch_sekai_json(
             sekai
-                .propose_dataset_branch_merge(bind_json(&invocation)?)
+                .propose_dataset_branch_merge(bind_json(caller, &invocation)?)
                 .await,
         ),
         NativeRpc::SimulatePlan => {
-            dispatch_sekai_json(sekai.simulate_plan(bind_json(&invocation)?).await)
+            dispatch_sekai_json(sekai.simulate_plan(bind_json(caller, &invocation)?).await)
         }
         NativeRpc::PreviewGovernedTransform => dispatch_sekai_json(
             sekai
-                .preview_governed_transform(bind_json(&invocation)?)
+                .preview_governed_transform(bind_json(caller, &invocation)?)
                 .await,
         ),
         NativeRpc::DryRunDefinitionChangeBundle => dispatch_sekai_json(
             sekai
-                .dry_run_definition_change_bundle(bind_json(&invocation)?)
+                .dry_run_definition_change_bundle(bind_json(caller, &invocation)?)
                 .await,
         ),
-        NativeRpc::RunTransformChain => {
-            dispatch_sekai_json(sekai.run_transform_chain(bind_json(&invocation)?).await)
-        }
-        NativeRpc::GetTransformChainRun => {
-            dispatch_sekai_json(sekai.get_transform_chain_run(bind_json(&invocation)?).await)
-        }
+        NativeRpc::RunTransformChain => dispatch_sekai_json(
+            sekai
+                .run_transform_chain(bind_json(caller, &invocation)?)
+                .await,
+        ),
+        NativeRpc::GetTransformChainRun => dispatch_sekai_json(
+            sekai
+                .get_transform_chain_run(bind_json(caller, &invocation)?)
+                .await,
+        ),
     }
 }
 
@@ -469,12 +562,13 @@ pub fn search_references(response: SearchResponse) -> Value {
 }
 
 fn bind_json<T: serde::de::DeserializeOwned + prost::Message + Default>(
+    caller: &CallerIdentity,
     invocation: &SdkInvocation,
 ) -> Result<tonic::Request<T>, AdapterError> {
     let payload = serde_json::from_value::<T>(invocation.input.clone())
         .map_err(|error| AdapterError::Protocol(error.to_string()))?;
-    invocation
-        .bind(payload)
+    caller
+        .bind(invocation, payload)
         .map_err(|error| AdapterError::Protocol(error.to_string()))
 }
 
@@ -485,6 +579,7 @@ fn bind_json<T: serde::de::DeserializeOwned + prost::Message + Default>(
 /// while experimental RPCs are disabled, fails closed. A list longer than the
 /// server accepts is left for the server to refuse.
 async fn require_stored_plans<F, Fut>(
+    caller: &CallerIdentity,
     invocation: &SdkInvocation,
     lookup: F,
 ) -> Result<(), AdapterError>
@@ -501,11 +596,14 @@ where
         return Ok(());
     }
     for digest in &proposal.eval_plan_digests {
-        let request = invocation
-            .bind(GetEvaluationPlanRequest {
-                namespace: proposal.namespace.clone(),
-                content_digest: digest.clone(),
-            })
+        let request = caller
+            .bind(
+                invocation,
+                GetEvaluationPlanRequest {
+                    namespace: proposal.namespace.clone(),
+                    content_digest: digest.clone(),
+                },
+            )
             .map_err(|error| AdapterError::Protocol(error.to_string()))?;
         match lookup(request).await {
             Ok(()) => {}
@@ -1086,7 +1184,10 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.create_definition_branch(bind_json(&invocation)?),
+                    client.create_definition_branch(bind_json(
+                        &CallerIdentity::default(),
+                        &invocation,
+                    )?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1097,7 +1198,10 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.apply_definition_branch_edit(bind_json(&invocation)?),
+                    client.apply_definition_branch_edit(bind_json(
+                        &CallerIdentity::default(),
+                        &invocation,
+                    )?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1108,7 +1212,10 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.compare_definition_revisions(bind_json(&invocation)?),
+                    client.compare_definition_revisions(bind_json(
+                        &CallerIdentity::default(),
+                        &invocation,
+                    )?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1119,7 +1226,10 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.report_definition_consumer_impact(bind_json(&invocation)?),
+                    client.report_definition_consumer_impact(bind_json(
+                        &CallerIdentity::default(),
+                        &invocation,
+                    )?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1128,7 +1238,7 @@ impl NativeSurface for SdkSurface {
             NativeRpc::CreateDefinitionProposal => {
                 let channel = self.channel().await?;
                 let timeout = self.config.timeout;
-                require_stored_plans(&invocation, |request| {
+                require_stored_plans(&CallerIdentity::default(), &invocation, |request| {
                     let mut chisei = ChiseiServiceClient::new(channel.clone());
                     async move {
                         tokio::time::timeout(timeout, chisei.get_evaluation_plan(request))
@@ -1141,7 +1251,10 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.create_definition_proposal(bind_json(&invocation)?),
+                    client.create_definition_proposal(bind_json(
+                        &CallerIdentity::default(),
+                        &invocation,
+                    )?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1152,7 +1265,10 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.search(bind_json::<SearchRequest>(&invocation)?),
+                    client.search(bind_json::<SearchRequest>(
+                        &CallerIdentity::default(),
+                        &invocation,
+                    )?),
                 )
                 .await?;
                 Ok(search_references(response))
@@ -1162,7 +1278,8 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.list_ontology_classes(bind_json(&invocation)?),
+                    client
+                        .list_ontology_classes(bind_json(&CallerIdentity::default(), &invocation)?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1173,7 +1290,7 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.get_ontology_class(bind_json(&invocation)?),
+                    client.get_ontology_class(bind_json(&CallerIdentity::default(), &invocation)?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1184,7 +1301,7 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.expand_neighborhood(bind_json(&invocation)?),
+                    client.expand_neighborhood(bind_json(&CallerIdentity::default(), &invocation)?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1195,7 +1312,7 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.get_lineage(bind_json(&invocation)?),
+                    client.get_lineage(bind_json(&CallerIdentity::default(), &invocation)?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1206,7 +1323,7 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.dry_run_agent(bind_json(&invocation)?),
+                    client.dry_run_agent(bind_json(&CallerIdentity::default(), &invocation)?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1217,7 +1334,10 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.list_site_agent_working_memory(bind_json(&invocation)?),
+                    client.list_site_agent_working_memory(bind_json(
+                        &CallerIdentity::default(),
+                        &invocation,
+                    )?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1228,7 +1348,8 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.create_dataset_branch(bind_json(&invocation)?),
+                    client
+                        .create_dataset_branch(bind_json(&CallerIdentity::default(), &invocation)?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1239,7 +1360,10 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.run_governed_transform_on_branch(bind_json(&invocation)?),
+                    client.run_governed_transform_on_branch(bind_json(
+                        &CallerIdentity::default(),
+                        &invocation,
+                    )?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1250,7 +1374,10 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.compare_dataset_branch(bind_json(&invocation)?),
+                    client.compare_dataset_branch(bind_json(
+                        &CallerIdentity::default(),
+                        &invocation,
+                    )?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1261,7 +1388,10 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.propose_dataset_branch_merge(bind_json(&invocation)?),
+                    client.propose_dataset_branch_merge(bind_json(
+                        &CallerIdentity::default(),
+                        &invocation,
+                    )?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1272,7 +1402,7 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.simulate_plan(bind_json(&invocation)?),
+                    client.simulate_plan(bind_json(&CallerIdentity::default(), &invocation)?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1283,7 +1413,10 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.preview_governed_transform(bind_json(&invocation)?),
+                    client.preview_governed_transform(bind_json(
+                        &CallerIdentity::default(),
+                        &invocation,
+                    )?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1294,7 +1427,10 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.dry_run_definition_change_bundle(bind_json(&invocation)?),
+                    client.dry_run_definition_change_bundle(bind_json(
+                        &CallerIdentity::default(),
+                        &invocation,
+                    )?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1305,7 +1441,7 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.run_transform_chain(bind_json(&invocation)?),
+                    client.run_transform_chain(bind_json(&CallerIdentity::default(), &invocation)?),
                 )
                 .await?;
                 serde_json::to_value(response)
@@ -1316,7 +1452,10 @@ impl NativeSurface for SdkSurface {
                 let mut client = SekaiServiceClient::new(channel);
                 let response = with_timeout(
                     self.config.timeout,
-                    client.get_transform_chain_run(bind_json(&invocation)?),
+                    client.get_transform_chain_run(bind_json(
+                        &CallerIdentity::default(),
+                        &invocation,
+                    )?),
                 )
                 .await?;
                 serde_json::to_value(response)

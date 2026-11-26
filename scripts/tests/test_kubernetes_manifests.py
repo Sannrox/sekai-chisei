@@ -28,6 +28,14 @@ class StatefulSet(unittest.TestCase):
                 env = {entry["name"]: entry.get("value") for entry in container.get("env", [])}
                 self.assertEqual(env.get("OPS_BIND"), "0.0.0.0")
 
+    def test_the_http_projection_listens_on_every_address_on_its_named_port(self):
+        for container in self.containers:
+            with self.subTest(container=container["name"]):
+                env = {entry["name"]: entry.get("value") for entry in container.get("env", [])}
+                self.assertEqual(env.get("SEKAI_HTTP_BIND"), "0.0.0.0")
+                ports = {port["name"]: port["containerPort"] for port in container["ports"]}
+                self.assertEqual(ports.get("http"), 50080)
+
     def test_probes_hit_the_ops_port(self):
         for container in self.containers:
             ports = {port["name"]: port["containerPort"] for port in container["ports"]}
@@ -79,14 +87,17 @@ class StatefulSet(unittest.TestCase):
 
 
 class Service(unittest.TestCase):
-    def test_exposes_grpc_and_ops_by_name_and_number(self):
+    def test_exposes_grpc_ops_and_http_by_name_and_number(self):
         service = load("20-service.yaml")
         self.assertEqual(service["kind"], "Service")
         self.assertEqual(service["spec"]["selector"], {"app": "sekai-chisei"})
         ports = {
             port["name"]: (port["port"], port["targetPort"]) for port in service["spec"]["ports"]
         }
-        self.assertEqual(ports, {"grpc": (50051, "grpc"), "ops": (9464, "ops")})
+        self.assertEqual(
+            ports,
+            {"grpc": (50051, "grpc"), "ops": (9464, "ops"), "http": (50080, "http")},
+        )
 
 
 if __name__ == "__main__":

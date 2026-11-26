@@ -37,8 +37,14 @@ spec:
               containerPort: 50051
             - name: ops
               containerPort: 9464
+            - name: http
+              containerPort: 50080
           env:
             - name: OPS_BIND
+              value: "0.0.0.0"
+            # HTTP projection and `POST /mcp` (#3172). It binds once token or
+            # enterprise auth is on, and serves TLS with the gRPC certificate.
+            - name: SEKAI_HTTP_BIND
               value: "0.0.0.0"
             - name: SEKAI_TLS_CERT
               value: /tls/tls.crt

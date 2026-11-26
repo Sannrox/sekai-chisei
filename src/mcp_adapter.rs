@@ -14,8 +14,8 @@ pub use framing::{MAX_FRAME_BYTES, read_frame, write_frame};
 pub use in_process::{InProcessSurface, SyntheticHostReport, run_synthetic_host};
 pub use protocol::{PROTOCOL_VERSION, handle_message, well_known_tools};
 pub use surface::{
-    AdapterError, CatalogSnapshot, FixtureObject, FixtureSurface, NativeRpc, NativeSurface,
-    SdkSurface, dispatch_native, status_error,
+    AdapterError, CallerIdentity, CatalogSnapshot, FixtureObject, FixtureSurface, NativeRpc,
+    NativeSurface, SdkSurface, dispatch_native, dispatch_native_as, status_error,
 };
 
 use std::sync::Arc;

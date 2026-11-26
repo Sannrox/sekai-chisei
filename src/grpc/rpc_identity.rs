@@ -46,6 +46,16 @@ where
     }
 }
 
+/// Stamp the server route on a request that reached the server through a
+/// listener other than tonic's, such as the HTTP projection's `/mcp`, so the
+/// interceptor authorizes that RPC exactly as on gRPC. The path is chosen by
+/// the server, never read from the caller.
+pub(crate) fn set_server_rpc_path<T>(request: &mut tonic::Request<T>, path: &str) {
+    request
+        .extensions_mut()
+        .insert(ServerRpcPath(path.to_owned()));
+}
+
 pub(super) fn request_rpc_method<T>(request: &tonic::Request<T>) -> Option<(&str, &str)> {
     if let Some(path) = request.extensions().get::<ServerRpcPath>() {
         let (service, method) = path.0.strip_prefix('/')?.split_once('/')?;
