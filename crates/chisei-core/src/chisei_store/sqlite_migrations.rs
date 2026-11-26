@@ -1239,6 +1239,7 @@ CREATE TABLE IF NOT EXISTS chisei_receipt_chain_keys (
                 period_type TEXT NOT NULL,
                 home_site_id TEXT NOT NULL DEFAULT '',
                 pool_id TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT 'enforce',
                 PRIMARY KEY (scope_id, metric)
             );
             CREATE TABLE IF NOT EXISTS chisei_budget_usage (
@@ -1295,6 +1296,8 @@ CREATE TABLE IF NOT EXISTS chisei_receipt_chain_keys (
         for ddl in [
             "ALTER TABLE chisei_budget_limits ADD COLUMN home_site_id TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE chisei_budget_limits ADD COLUMN pool_id TEXT NOT NULL DEFAULT ''",
+            // #3044 part 1c: an older plane never reads it and enforces.
+            "ALTER TABLE chisei_budget_limits ADD COLUMN mode TEXT NOT NULL DEFAULT 'enforce'",
         ] {
             let _ = conn.execute(ddl, []);
         }

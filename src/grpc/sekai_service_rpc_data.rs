@@ -3738,7 +3738,7 @@ pub(super) async fn claim_transform_work(
                 // the extension's, else a budget the run could never fit (#3044).
                 let refusal = match extension_refusal(service, owner.as_ref(), &work) {
                     Some(refusal) => Some(refusal),
-                    None => tenant_budget_refusal(quota.as_ref(), owner.as_ref(), &work.namespace)?,
+                    None => tenant_budget_refusal(&quota, owner.as_ref(), &work)?,
                 };
                 if let Some(refusal) = refusal {
                     refuse_claimed_run(service, quota.clone(), &work, &refusal, targeted)?;
@@ -4648,7 +4648,7 @@ fn admit_claimed_isolated_process(
         &transform_quota_gate(service.quota_runtime())?,
         owner,
         &work.namespace,
-        &format!("transform-claim:{}", work.run_id),
+        &claim_run_key(work),
         DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS,
         reclaim,
     )? {
@@ -4669,7 +4669,8 @@ fn admit_claimed_isolated_process(
 
 /// The queue scope in which an older held run waits ahead of `work`, so it
 /// queues behind that run instead of overtaking it. Only scopes that still
-/// have a concurrency limit queue.
+/// have a concurrency limit queue. A report-only tenant records the queue
+/// and does not wait.
 fn queued_ahead(
     service: &SekaiServiceImpl,
     quota: &crate::db::runtime_db::RuntimeDb,
@@ -4694,9 +4695,21 @@ fn queued_ahead(
             .runtime()
             .transform_queue_ahead(&scope_id, work.created_at_ms, &work.run_id)
             .map_err(Status::internal)?;
-        if ahead > 0 {
+        if ahead == 0 {
+            continue;
+        }
+        if limits.mode == crate::chisei::tenant_quota::QuotaMode::Enforce {
             return Ok(Some(scope_id));
         }
+        transform_quota_gate(service.quota_runtime())?
+            .report_breaches(
+                tenant_id,
+                &claim_run_key(work),
+                &[crate::composition::transform_run_admission::queue_breach(
+                    &scope_id,
+                )],
+            )
+            .map_err(map_quota_error)?;
     }
     Ok(None)
 }
@@ -4781,22 +4794,38 @@ fn admit_extension_isolated_process(
 }
 
 /// The refusal of a run larger than its tenant's or its namespace's whole
-/// budget. Store errors refuse the claim, as admission does.
+/// budget. A report-only tenant records it and is not refused. Store errors
+/// refuse the claim, as admission does.
 fn tenant_budget_refusal(
-    db: &crate::db::runtime_db::RuntimeDb,
+    quota: &std::sync::Arc<crate::db::runtime_db::RuntimeDb>,
     tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
-    namespace: &str,
+    work: &crate::sekai::governed_transform::TransformWork,
 ) -> Result<Option<crate::enterprise::IsolatedProcessRefusal>, Status> {
     let Some(tenant) = tenant_context.and_then(|context| context.tenant.as_ref()) else {
         return Ok(None);
     };
     let limits = crate::composition::transform_run_admission::configured_run_limits(
-        db,
+        quota,
         &tenant.tenant_id,
-        namespace,
+        &work.namespace,
     )
     .map_err(Status::internal)?;
-    Ok(limits.refusal_larger_than_budget(DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS))
+    if limits.mode == crate::chisei::tenant_quota::QuotaMode::Enforce {
+        return Ok(limits.refusal_larger_than_budget(DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS));
+    }
+    if let Some(breach) = limits
+        .breach_larger_than_budget(&tenant.tenant_id, DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS)
+    {
+        transform_quota_gate(quota.clone())?
+            .report_breaches(&tenant.tenant_id, &claim_run_key(work), &[breach])
+            .map_err(map_quota_error)?;
+    }
+    Ok(None)
+}
+
+/// The quota idempotency key of a claim of `work`.
+fn claim_run_key(work: &crate::sekai::governed_transform::TransformWork) -> String {
+    format!("transform-claim:{}", work.run_id)
 }
 
 /// Admits a transform run in `namespace` against its tenant's and its

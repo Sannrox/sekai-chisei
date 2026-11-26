@@ -95,6 +95,12 @@ pub trait BudgetSekaiDbExt {
         &self,
         scope_id: &str,
     ) -> Result<Vec<(String, String, i64, String)>, String>;
+    /// Sets the quota `mode` of every limit row stored under exactly
+    /// `scope_id` (#3044, ADR 0168 part 1c). Returns how many rows it set.
+    fn budget_set_scope_mode(&self, scope_id: &str, mode: &str) -> Result<usize, String>;
+    /// The distinct `mode` values of the limit rows stored under exactly
+    /// `scope_id`, not its parents.
+    fn budget_scope_modes(&self, scope_id: &str) -> Result<Vec<String>, String>;
     fn budget_set_limit(
         &self,
         scope_id: &str,
@@ -326,6 +332,26 @@ impl BudgetSekaiDbExt for SekaiDb {
             }
         }
         Ok(limits)
+    }
+
+    fn budget_set_scope_mode(&self, scope_id: &str, mode: &str) -> Result<usize, String> {
+        self.conn()
+            .execute(
+                "UPDATE chisei_budget_limits SET mode=?1 WHERE scope_id=?2",
+                params![mode, scope_id],
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    fn budget_scope_modes(&self, scope_id: &str) -> Result<Vec<String>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT mode FROM chisei_budget_limits WHERE scope_id=?1")
+            .map_err(|e| e.to_string())?;
+        stmt.query_map(params![scope_id], |row| row.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())
     }
 
     fn budget_set_limit(
@@ -580,7 +606,8 @@ impl BudgetSekaiDbExt for SekaiDb {
                 .unwrap_or(0);
             if used + amount > max_amount {
                 return Err(format!(
-                    "budget exceeded at {scope}: used {used} + {amount} > {max_amount}"
+                    "{}{scope}: used {used} + {amount} > {max_amount}",
+                    crate::chisei::budget::BUDGET_EXCEEDED_PREFIX
                 ));
             }
         }
@@ -660,7 +687,8 @@ impl BudgetSekaiDbExt for SekaiDb {
                 .unwrap_or(0);
             if used + amount > max_amount {
                 return Err(format!(
-                    "budget exceeded at {scope}: used {used} + {amount} > {max_amount}"
+                    "{}{scope}: used {used} + {amount} > {max_amount}",
+                    crate::chisei::budget::BUDGET_EXCEEDED_PREFIX
                 ));
             }
         }

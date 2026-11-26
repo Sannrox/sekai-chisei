@@ -986,6 +986,10 @@ pub trait ChiseiRuntimeDb {
         scope_id: &str,
     ) -> Result<Vec<(String, String, i64, String)>, String>;
 
+    fn budget_set_scope_mode(&self, scope_id: &str, mode: &str) -> Result<usize, String>;
+
+    fn budget_scope_modes(&self, scope_id: &str) -> Result<Vec<String>, String>;
+
     fn budget_namespace_pressure(
         &self,
         namespace: &str,
@@ -3586,6 +3590,24 @@ impl ChiseiRuntimeDb for RuntimeDb {
             Self::Sqlite(db) => db.budget_limits_for_scope(scope_id),
             Self::Postgres(db) => {
                 sekai_core::db::postgres::off_runtime(|| db.budget_limits_for_scope(scope_id))
+            }
+        }
+    }
+
+    fn budget_set_scope_mode(&self, scope_id: &str, mode: &str) -> Result<usize, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_set_scope_mode(scope_id, mode),
+            Self::Postgres(db) => {
+                sekai_core::db::postgres::off_runtime(|| db.budget_set_scope_mode(scope_id, mode))
+            }
+        }
+    }
+
+    fn budget_scope_modes(&self, scope_id: &str) -> Result<Vec<String>, String> {
+        match self {
+            Self::Sqlite(db) => db.budget_scope_modes(scope_id),
+            Self::Postgres(db) => {
+                sekai_core::db::postgres::off_runtime(|| db.budget_scope_modes(scope_id))
             }
         }
     }

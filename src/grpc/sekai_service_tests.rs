@@ -26544,6 +26544,7 @@ fn fill_tenant_concurrency(svc: &SekaiServiceImpl, tenant_id: &str) {
         &crate::composition::transform_run_admission::RunQuotaLimits {
             tenant: Some(limits),
             namespace: None,
+            mode: Default::default(),
         },
         "held-unit",
         0,
@@ -26795,6 +26796,78 @@ async fn an_isolated_run_larger_than_the_whole_tenant_budget_is_refused_for_good
 }
 
 #[tokio::test]
+async fn a_report_only_tenant_claims_a_run_larger_than_its_budget_and_audits_it() {
+    use crate::chisei::budget::PeriodType;
+    use crate::chisei::tenant_quota::{QUOTA_REPORT_ONLY_ACTION, QuotaMode, TenantQuotaLimits};
+    use crate::chisei_store::ChiseiDecisionStore;
+
+    let svc = isolated_claim_service(false);
+    let gate =
+        crate::composition::transform_run_admission::quota_gate(svc.db.runtime_arc()).unwrap();
+    gate.configure(
+        "tenant-a",
+        &TenantQuotaLimits {
+            version: 1,
+            max_requests_per_period: Some(10),
+            max_tokens_per_period: None,
+            max_compute_seconds_per_period: None,
+            max_concurrency: Some(0),
+            max_storage_bytes: None,
+            period: PeriodType::Daily,
+        },
+    )
+    .unwrap();
+    assert!(
+        gate.configure_mode("tenant-a", QuotaMode::ReportOnly)
+            .unwrap()
+    );
+    enqueue_isolated_claim(&svc, "t-iso-report").await;
+    let claimed = svc
+        .claim_transform_work(with_tenant_admin(
+            ClaimTransformWorkRequest {
+                namespace: "ops".into(),
+                runtime_id: "runner-a".into(),
+                run_id: String::new(),
+                ttl_ms: 60_000,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .work
+        .unwrap();
+    assert_eq!(claimed.transform_id, "t-iso-report");
+    let store =
+        crate::chisei_store::ChiseiStore::try_from_shared_runtime(svc.db.runtime_arc()).unwrap();
+    let recorded = store
+        .list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
+            action: Some(QUOTA_REPORT_ONLY_ACTION.into()),
+            target_id: Some(format!("transform-claim:{}", claimed.run_id)),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+    let reasons: Vec<_> = recorded
+        .iter()
+        .map(|decision| {
+            (
+                decision.evidence["reason"].as_str(),
+                decision.evidence["would"].as_str(),
+            )
+        })
+        .collect();
+    assert!(
+        reasons.contains(&(
+            crate::composition::transform_run_admission::REFUSAL_LARGER_THAN_BUDGET,
+            "refuse"
+        )),
+        "{reasons:?}"
+    );
+    assert!(reasons.contains(&("concurrency", "queue")), "{reasons:?}");
+}
+
+#[tokio::test]
 async fn an_isolated_run_whose_budget_is_spent_is_refused_and_reserves_nothing() {
     use crate::chisei::budget::PeriodType;
     use crate::chisei::tenant_quota::{NamespaceQuotaScope, TenantQuotaLimits};
@@ -26824,6 +26897,7 @@ async fn an_isolated_run_whose_budget_is_spent_is_refused_and_reserves_nothing()
             &RunQuotaLimits {
                 tenant: Some(requests(2)),
                 namespace: namespace.map(|scope| (scope, requests(1))),
+                mode: Default::default(),
             },
             key,
             0,

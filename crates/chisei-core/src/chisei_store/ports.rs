@@ -127,6 +127,8 @@ chisei_store_trait! {
         fn budget_transfer_capacity(&self, transfer_id: &str, metric: &str, from_scope_id: &str, to_scope_id: &str, amount: i64, actor: &str, now_ms: i64) -> Result<sekai_core::db::chisei_budget::BudgetTransferRecord, String>;
         fn budget_record_transfer_refused(&self, transfer_id: &str, metric: &str, from_scope_id: &str, to_scope_id: &str, amount: i64, actor: &str, reason: &str, now_ms: i64) -> Result<sekai_core::db::chisei_budget::BudgetTransferRecord, String>;
         fn budget_limits_for_scope(&self, scope_id: &str) -> Result<Vec<(String, String, i64, String)>, String>;
+        fn budget_set_scope_mode(&self, scope_id: &str, mode: &str) -> Result<usize, String>;
+        fn budget_scope_modes(&self, scope_id: &str) -> Result<Vec<String>, String>;
         fn budget_set_limit(&self, scope_id: &str, metric: &str, max_amount: i64, period_type: &str) -> Result<(), String>;
         fn budget_adjust_chain(&self, scope_id: &str, metric: &str, delta: i64, now_ms: i64) -> Result<(), String>;
     }

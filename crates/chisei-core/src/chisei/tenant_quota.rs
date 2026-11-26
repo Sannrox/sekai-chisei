@@ -15,11 +15,16 @@
 //! the chain reserves on the tenant and the namespace or on neither, and the
 //! stricter limit wins. A namespace concurrency limit is a second hold beside
 //! the tenant's.
+//!
+//! A tenant's [`QuotaMode`] (ADR 0168 part 1c) is the `mode` column of its
+//! budget limit rows. In `report_only` the gate still evaluates every metric,
+//! reserves what fits, and returns each refusal or queue it would have made
+//! as a [`QuotaBreach`] instead of refusing.
 
 use serde::{Deserialize, Serialize};
 
 use crate::chisei::budget::{BudgetTracker, PeriodType};
-use crate::chisei_store::ChiseiStore;
+use crate::chisei_store::{ChiseiBudgetStore, ChiseiStore};
 use sekai_core::db::chisei_budget::{METRIC_REQUESTS, METRIC_TOKENS};
 
 /// Seconds of isolated-process compute per period (#3044, ADR 0168 part 2b).
@@ -83,6 +88,80 @@ impl TenantQuotaLimits {
         }
     }
 }
+
+/// Whether a tenant's assignment refuses and queues work or only reports what
+/// it would have done (#3044, ADR 0168 part 1c). It applies to the tenant and
+/// all its namespaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum QuotaMode {
+    #[default]
+    Enforce,
+    ReportOnly,
+}
+
+impl QuotaMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforce => "enforce",
+            Self::ReportOnly => "report_only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "enforce" => Ok(Self::Enforce),
+            "report_only" => Ok(Self::ReportOnly),
+            other => Err(format!(
+                "quota mode must be enforce or report_only, not {other:?}"
+            )),
+        }
+    }
+
+    /// The mode the `mode` values of a scope's own limit rows assign. Only
+    /// rows that all say `report_only` report; a row an older plane wrote
+    /// (default `enforce`), an unknown value or no row at all enforces.
+    pub fn from_stored(modes: &[String]) -> Self {
+        let report_only =
+            !modes.is_empty() && modes.iter().all(|mode| mode == Self::ReportOnly.as_str());
+        if report_only {
+            Self::ReportOnly
+        } else {
+            Self::Enforce
+        }
+    }
+}
+
+/// What enforcing would have done to work a report-only tenant admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum QuotaWould {
+    Refuse,
+    Queue,
+}
+
+impl QuotaWould {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Refuse => "refuse",
+            Self::Queue => "queue",
+        }
+    }
+}
+
+/// One refusal or queue a report-only admission did not apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaBreach {
+    /// `tenant:{id}` or `tenant:{id}/namespace:{ns}`.
+    pub scope_id: String,
+    pub metric: String,
+    pub would: QuotaWould,
+    /// The refusal code enforcing would store, or `concurrency` for a queue.
+    pub reason: String,
+}
+
+/// Audit action of a report-only breach decision.
+pub const QUOTA_REPORT_ONLY_ACTION: &str = "tenant_quota_report_only";
 
 /// Stable exhaustion / retry outcomes for tenant quotas.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +351,78 @@ impl TenantQuotaGate {
         Ok(())
     }
 
+    /// Sets the mode of a tenant's stored assignment. False, and nothing
+    /// stored, when the tenant has no limit rows: a mode needs an assignment
+    /// to apply to. A limit row written later starts as `enforce`, which
+    /// enforces the whole tenant, so set the mode again after adding a metric.
+    pub fn configure_mode(
+        &self,
+        tenant_id: &str,
+        mode: QuotaMode,
+    ) -> Result<bool, TenantQuotaError> {
+        self.store
+            .budget_set_scope_mode(&tenant_scope_id(tenant_id), mode.as_str())
+            .map(|updated| updated > 0)
+            .map_err(TenantQuotaError::Storage)
+    }
+
+    /// The mode of a tenant's stored assignment.
+    pub fn mode(&self, tenant_id: &str) -> Result<QuotaMode, TenantQuotaError> {
+        self.store
+            .budget_scope_modes(&tenant_scope_id(tenant_id))
+            .map(|modes| QuotaMode::from_stored(&modes))
+            .map_err(TenantQuotaError::Storage)
+    }
+
+    /// Records each breach a report-only admission of `run_key` did not
+    /// apply as one audit decision. The id is the run key, scope, metric and
+    /// reason, so a retried or reclaimed admission records each once.
+    pub fn report_breaches(
+        &self,
+        tenant_id: &str,
+        run_key: &str,
+        breaches: &[QuotaBreach],
+    ) -> Result<(), TenantQuotaError> {
+        use crate::chisei_store::ChiseiDecisionStore;
+        let now = wall_ms();
+        let decisions: Vec<_> = breaches
+            .iter()
+            .map(|breach| sekai_core::sekai::audit::Decision {
+                id: format!(
+                    "{QUOTA_REPORT_ONLY_ACTION}:{run_key}:{}:{}:{}",
+                    breach.scope_id, breach.metric, breach.reason
+                ),
+                timestamp: now,
+                actor: "chisei-tenant-quota".into(),
+                action: QUOTA_REPORT_ONLY_ACTION.into(),
+                reason: format!(
+                    "report-only quota would {} on {} in {}",
+                    breach.would.as_str(),
+                    breach.metric,
+                    breach.scope_id
+                ),
+                evidence: [
+                    ("tenant_id", tenant_id),
+                    ("scope_id", breach.scope_id.as_str()),
+                    ("metric", breach.metric.as_str()),
+                    ("would", breach.would.as_str()),
+                    ("reason", breach.reason.as_str()),
+                    ("mode", QuotaMode::ReportOnly.as_str()),
+                ]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+                target_id: run_key.into(),
+                outcome: "admitted".into(),
+            })
+            .collect();
+        self.store
+            .record_decisions_idempotently_by(&decisions, |existing, requested| {
+                existing.id == requested.id
+            })
+            .map_err(TenantQuotaError::Storage)
+    }
+
     /// Atomic multi-dimension admission for one tenant operation.
     ///
     /// Reserves request (1), estimated tokens, and one concurrency unit when
@@ -327,6 +478,37 @@ impl TenantQuotaGate {
         )
     }
 
+    /// [`Self::admit_in_namespace`] for a report-only tenant: each metric
+    /// that fits is reserved as enforcing would, and each that would refuse
+    /// or queue reserves nothing and is returned as a breach. Only a missing
+    /// tenant, a stale assignment or a storage error still fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_in_namespace_reporting(
+        &self,
+        context: &AuthenticatedContext,
+        limits: &TenantQuotaLimits,
+        namespace: Option<(&NamespaceQuotaScope, &TenantQuotaLimits)>,
+        min_assignment_version: u64,
+        estimated_tokens: i32,
+        estimated_compute_seconds: i32,
+        idempotency_key: &str,
+    ) -> Result<(TenantQuotaAdmission, Vec<QuotaBreach>), TenantQuotaError> {
+        let now = wall_ms();
+        let mut breaches = Vec::new();
+        self.admit_evaluating(
+            context,
+            limits,
+            namespace,
+            min_assignment_version,
+            estimated_tokens,
+            estimated_compute_seconds,
+            idempotency_key,
+            now..=now.saturating_add(CONCURRENCY_HOLD_MS),
+            Some(&mut breaches),
+        )
+        .map(|admission| (admission, breaches))
+    }
+
     /// Admit with an explicit hold window `[now, until]` so expiry is testable.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn admit_at(
@@ -339,6 +521,34 @@ impl TenantQuotaGate {
         estimated_compute_seconds: i32,
         idempotency_key: &str,
         hold: std::ops::RangeInclusive<i64>,
+    ) -> Result<TenantQuotaAdmission, TenantQuotaError> {
+        self.admit_evaluating(
+            context,
+            limits,
+            namespace,
+            min_assignment_version,
+            estimated_tokens,
+            estimated_compute_seconds,
+            idempotency_key,
+            hold,
+            None,
+        )
+    }
+
+    /// Shared admission. With `report` set, a metric that does not fit is
+    /// pushed there and skipped; without it, it rolls back and refuses.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_evaluating(
+        &self,
+        context: &AuthenticatedContext,
+        limits: &TenantQuotaLimits,
+        namespace: Option<(&NamespaceQuotaScope, &TenantQuotaLimits)>,
+        min_assignment_version: u64,
+        estimated_tokens: i32,
+        estimated_compute_seconds: i32,
+        idempotency_key: &str,
+        hold: std::ops::RangeInclusive<i64>,
+        mut report: Option<&mut Vec<QuotaBreach>>,
     ) -> Result<TenantQuotaAdmission, TenantQuotaError> {
         let now_ms = *hold.start();
         let until_ms = *hold.end();
@@ -371,38 +581,50 @@ impl TenantQuotaGate {
         };
 
         if either(|limits| limits.max_requests_per_period.is_some()) {
-            self.tracker
+            match self
+                .tracker
                 .check_and_reserve_with_metric(&scope, 1, METRIC_REQUESTS)
-                .map_err(|_| exhausted(METRIC_REQUESTS, &scope))?;
-            reserved.reserved_request = true;
+            {
+                Ok(()) => reserved.reserved_request = true,
+                Err(error) => self.refuse_or_report(
+                    &reserved,
+                    &error,
+                    exhausted(METRIC_REQUESTS, &scope),
+                    report.as_deref_mut(),
+                )?,
+            }
         }
         if either(|limits| limits.max_tokens_per_period.is_some()) && estimated_tokens > 0 {
-            if let Err(err) =
-                self.tracker
-                    .check_and_reserve_idempotent(&scope, estimated_tokens, idempotency_key)
-            {
-                let _ = self.rollback_partial(&reserved);
-                let _ = err;
-                return Err(exhausted(METRIC_TOKENS, &scope));
+            match self.tracker.check_and_reserve_idempotent(
+                &scope,
+                estimated_tokens,
+                idempotency_key,
+            ) {
+                Ok(()) => reserved.reserved_tokens = estimated_tokens,
+                Err(error) => self.refuse_or_report(
+                    &reserved,
+                    &error,
+                    exhausted(METRIC_TOKENS, &scope),
+                    report.as_deref_mut(),
+                )?,
             }
-            reserved.reserved_tokens = estimated_tokens;
         }
         if either(|limits| limits.max_compute_seconds_per_period.is_some())
             && estimated_compute_seconds > 0
         {
-            if self
-                .tracker
-                .check_and_reserve_with_metric(
-                    &scope,
-                    estimated_compute_seconds,
-                    METRIC_COMPUTE_SECONDS,
-                )
-                .is_err()
-            {
-                let _ = self.rollback_partial(&reserved);
-                return Err(exhausted(METRIC_COMPUTE_SECONDS, &scope));
+            match self.tracker.check_and_reserve_with_metric(
+                &scope,
+                estimated_compute_seconds,
+                METRIC_COMPUTE_SECONDS,
+            ) {
+                Ok(()) => reserved.reserved_compute_seconds = estimated_compute_seconds,
+                Err(error) => self.refuse_or_report(
+                    &reserved,
+                    &error,
+                    exhausted(METRIC_COMPUTE_SECONDS, &scope),
+                    report.as_deref_mut(),
+                )?,
             }
-            reserved.reserved_compute_seconds = estimated_compute_seconds;
         }
         // The tenant's hold first, then the namespace's, under one holder.
         let tenant_scope = tenant_scope_id(&tenant.tenant_id);
@@ -429,6 +651,17 @@ impl TenantQuotaGate {
                 now_ms,
                 until_ms,
             );
+            if matches!(taken, Ok(false))
+                && let Some(report) = report.as_deref_mut()
+            {
+                report.push(QuotaBreach {
+                    scope_id: queue_scope.to_string(),
+                    metric: METRIC_CONCURRENCY.into(),
+                    would: QuotaWould::Queue,
+                    reason: METRIC_CONCURRENCY.into(),
+                });
+                continue;
+            }
             if !matches!(taken, Ok(true)) {
                 if reserved.reserved_concurrency {
                     let _ = self.release_concurrency(&reserved);
@@ -443,6 +676,40 @@ impl TenantQuotaGate {
             reserved.concurrency_holder = holder.clone();
         }
         Ok(reserved)
+    }
+
+    /// Handles a reservation that failed with `store_error`. Without
+    /// `report`, rolls back what `reserved` holds and refuses with
+    /// `exhausted`, as enforcing always has. With it, a spent budget is
+    /// recorded as a would-be refusal in the scope the store names, which on
+    /// a namespace's chain may be its tenant, and admission goes on; a
+    /// storage failure still rolls back and fails, so nothing runs
+    /// unaccounted.
+    fn refuse_or_report(
+        &self,
+        reserved: &TenantQuotaAdmission,
+        store_error: &str,
+        exhausted: TenantQuotaError,
+        report: Option<&mut Vec<QuotaBreach>>,
+    ) -> Result<(), TenantQuotaError> {
+        let error = match (report, exhausted) {
+            (Some(report), TenantQuotaError::Exhausted { metric, .. })
+                if let Some(scope_id) =
+                    crate::chisei::budget::budget_exceeded_scope(store_error) =>
+            {
+                report.push(QuotaBreach {
+                    scope_id: scope_id.to_string(),
+                    metric,
+                    would: QuotaWould::Refuse,
+                    reason: REFUSAL_BUDGET_EXHAUSTED.into(),
+                });
+                return Ok(());
+            }
+            (Some(_), _) => TenantQuotaError::Storage(store_error.to_string()),
+            (None, exhausted) => exhausted,
+        };
+        let _ = self.rollback_partial(reserved);
+        Err(error)
     }
 
     /// Gives back the tenant's concurrency hold and, for a namespace
@@ -695,6 +962,10 @@ impl TenantQuotaAdmission {
         }
     }
 }
+
+/// Refusal code for a run whose tenant or namespace budget is spent (#3044,
+/// ADR 0168): budgets refuse, only concurrency waits.
+pub const REFUSAL_BUDGET_EXHAUSTED: &str = "quota_budget_exhausted";
 
 fn exhausted(metric: &str, scope_id: &str) -> TenantQuotaError {
     TenantQuotaError::Exhausted {

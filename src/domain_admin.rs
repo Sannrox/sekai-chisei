@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::chisei::entitlements::{EffectiveEntitlement, EntitlementError, EntitlementRegistry};
 use crate::chisei::tenant_quota::{
-    NamespaceQuotaScope, TenantQuotaError, TenantQuotaGate, TenantQuotaLimits,
+    NamespaceQuotaScope, QuotaMode, TenantQuotaError, TenantQuotaGate, TenantQuotaLimits,
     TenantQuotaReceiptNote,
 };
 use crate::chisei::usage_ledger::{UsageAggregate, UsageUnit};
@@ -332,6 +332,34 @@ impl DomainAdminSurface {
         })
     }
 
+    /// Sets a tenant's quota mode (#3044, ADR 0168 part 1c). The tenant
+    /// needs a stored assignment; configure its quotas first.
+    pub fn configure_quota_mode(
+        &self,
+        context: &AuthenticatedContext,
+        tenant_id: &str,
+        mode: QuotaMode,
+    ) -> Result<(), DomainAdminError> {
+        self.require_role(context, tenant_id, AdminRole::can_manage_quotas)?;
+        let stored = self
+            .quotas
+            .configure_mode(tenant_id, mode)
+            .map_err(DomainAdminError::Quota)?;
+        if !stored {
+            return Err(DomainAdminError::Invalid(format!(
+                "tenant {tenant_id} has no quota assignment to set a mode on"
+            )));
+        }
+        self.audit(
+            &context.principal.subject,
+            tenant_id,
+            "configure_quota_mode",
+            mode.as_str(),
+            "ok",
+        );
+        Ok(())
+    }
+
     pub fn rotate_provider_credential(
         &self,
         context: &AuthenticatedContext,
@@ -565,6 +593,31 @@ mod tests {
         assert_eq!(stored, 2);
         assert!(admin.audit_log().iter().any(|entry| {
             entry.action == "configure_namespace_quotas" && entry.target == scope
+        }));
+
+        // A mode needs the tenant's own assignment and a quota role.
+        assert!(matches!(
+            admin.configure_quota_mode(&alice, "tenant-a", QuotaMode::ReportOnly),
+            Err(DomainAdminError::Invalid(_))
+        ));
+        admin.configure_quotas(&alice, "tenant-a", &limits).unwrap();
+        assert!(matches!(
+            admin.configure_quota_mode(
+                &tenant_context("tenant-a", "bob"),
+                "tenant-a",
+                QuotaMode::ReportOnly
+            ),
+            Err(DomainAdminError::Unauthorized)
+        ));
+        admin
+            .configure_quota_mode(&alice, "tenant-a", QuotaMode::ReportOnly)
+            .unwrap();
+        assert_eq!(
+            admin.quotas.mode("tenant-a").unwrap(),
+            QuotaMode::ReportOnly
+        );
+        assert!(admin.audit_log().iter().any(|entry| {
+            entry.action == "configure_quota_mode" && entry.target == "report_only"
         }));
     }
 
