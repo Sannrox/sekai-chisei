@@ -254,13 +254,25 @@ package.
   digest, and the response's `ontology_digest` is the same value. Governed
   transforms are not carried.
 - One `dataset_version` entry per selected dataset carries its name, columns
-  (name, type, classification) and partition keys, never rows. Its digest
-  covers columns and partition keys. A dataset that is missing, unreadable, or
+  (name, type, classification) and partition keys. Its digest covers columns
+  and partition keys. A dataset that is missing, unreadable, or
   has an unreadable column is `PERMISSION_DENIED` with `dataset <id> is not
   readable`; one not bound to an object in the namespace is
   `FAILED_PRECONDITION`.
-- `withheld` counts the definition members the caller may not read, by kind,
-  never naming them.
+- For the datasets also named in `content_dataset_ids`, the entry sets
+  `content_included` and carries the rows of the latest version inline, with
+  a `content_digest` over them. Content needs an export grant on the
+  namespace (`GrantNamespaceExport`), or the export is
+  `PERMISSION_DENIED` with `dataset <id> content needs an export grant on
+  namespace <ns>`. A column whose classification the caller's allowed egress
+  may not receive, or a restricted column the caller may not read, stays in
+  the schema and is left out of every row. A dataset whose bound object type
+  has cell grants cannot carry content. All rows together are at most
+  2 MiB of canonical JSON (`MAX_PACKAGE_CONTENT_BYTES`); beyond that the
+  export is refused with `namespace_package_content_too_large`.
+- `withheld` counts, by kind and never by name, the definition members the
+  caller may not read and the columns left out of carried rows
+  (`dataset_column`).
 - The package digest covers the whole manifest and is signed with the
   definition package key above. Verification refuses with
   `namespace_package_unverified`, `namespace_package_tampered`, or
@@ -278,9 +290,14 @@ the caller may write. Every check comes before the first write:
   target with no entry, or a mismatched input is refused by name;
 - the namespace holds no published definitions.
 
-The definitions then open as proposal `package/<name>/v<version>`, which goes
-through the namespace's normal review. The output datasets are created
-without rows. `GetNamespacePackageInstallation` reports the installation as
+Carried rows are checked against the output's columns and types as part of
+those checks. The definitions then open as proposal
+`package/<name>/v<version>`, which goes through the namespace's normal
+review. The output datasets are created, and the carried rows of each are
+appended as one new version under the caller's dataset write grant; source
+version ids are not carried. A retry appends rows only to a dataset that has
+none yet, and refuses one whose rows differ from the package's as changed
+outside the installation, so the rows land once per package and dataset. `GetNamespacePackageInstallation` reports the installation as
 `pending_definitions` until that proposal merges, then `installed`, or
 `diverged` when the merged definitions do not reproduce the ontology digest.
 Installing the same package again returns the same installation; another

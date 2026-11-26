@@ -19,7 +19,8 @@ without write authority, so they cannot install resources into another
 tenant.
 
 The maintainer accepted the `sekai.namespace-package/v1` decision on #3093 on
-2026-11-24 (decisions 1 to 8) and amendments A, B and C on 2026-11-25.
+2026-11-24 (decisions 1 to 8), amendments A, B and C on 2026-11-25, and
+amendments D, E and F (dataset content) on 2026-11-26.
 
 ## Decision
 
@@ -70,9 +71,9 @@ The maintainer accepted the `sekai.namespace-package/v1` decision on #3093 on
    signature, before anything is trusted. Refusals name a reason:
    `namespace_package_unverified`, `namespace_package_tampered`, or
    `namespace_package_incompatible`.
-9. A package never carries credentials, run history, receipts, audit entries
-   or rows. `content_included` is false in this layer, and a verifier refuses
-   an entry that sets it.
+9. A package never carries credentials, run history, receipts or audit
+   entries. It carries rows only for the datasets the exporter opts into
+   content (decision 13); a verifier refuses content on any other entry.
 10. Install verifies the package before any write and opens the
     definitions as a proposal in the target namespace. The installation is
     `pending_definitions` until that proposal applies, then `installed` when
@@ -104,20 +105,50 @@ The maintainer accepted the `sekai.namespace-package/v1` decision on #3093 on
     written last, so a retry after a crash converges, and the first record
     stored wins a race.
 
+13. Dataset content (amendments D, E and F). The export request names, of the
+    selected datasets, those whose rows the package carries.
+    - The rows of the dataset's latest version go inline in its
+      `dataset_version` entry, which sets `content_included`. Its document
+      adds `content_digest`, SHA-256 over the canonical rows, and the rows to
+      the definition. The entry digest stays the schema digest, and the
+      package digest and signature cover the rows. All rows of a package
+      together are at most `MAX_PACKAGE_CONTENT_BYTES` (2 MiB of canonical
+      JSON, so a package fits one gRPC message); over it, export is refused
+      with `namespace_package_content_too_large`. No separate content stream
+      in v1.
+    - Content needs an export grant on the namespace, as `ExportDatasetVersion`
+      does, beyond read; without one the export is refused by name.
+    - A column whose classification the exporter's allowed egress may not
+      receive stays in the schema and is absent from the rows, counted as
+      `dataset_column` in the withheld list without ids. A restricted column
+      the exporter may not read is withheld the same way, and a dataset whose
+      bound object type has cell grants cannot carry content.
+    - Rows are checked against the columns and types (`int`, `float`, `bool`;
+      an empty value is null) at export, at verification and at install, and
+      a mismatch is refused by name.
+    - Install appends the rows to the created dataset as one new version
+      under the caller's dataset write grant. Source version ids are not
+      carried. Content apply is idempotent per `(package digest, target
+      dataset)`: a retry appends only to a dataset without versions, and a
+      dataset whose latest version holds other rows is refused as changed
+      outside the installation. Upgrade appends only when the content digest
+      changed (decision 8, its own layer).
+
 `ExportNamespacePackage` (experimental) builds and signs the package from the
 published head. It needs read access to the namespace, as a definition export
 does. `GetNamespacePackageInstallation` reads an installation with its status
 under namespace read access. Delivery is layered: this format and the export
 first, then install with input mapping and installation records, then opt-in
-dataset content (rows the caller's egress may not receive are withheld and
-counted), then upgrade of an existing installation (decision 8).
+dataset content (decision 13), then upgrade of an existing installation
+(decision 8).
 
 ## Consequences
 
 - One versioned format the core verifies on both ends; a composing platform
   drops its own bundle schema.
-- Installing data still needs a governed dataset-version import path (the
-  content layer).
+- Carried rows install through the governed append path, so the target's
+  dataset write grant applies. Datasets over the content bound still move
+  as definitions only.
 - An export of a namespace whose definitions are partly unreadable is signed
   and verifiable but partial, and says so through the withheld counts.
 - Installations live in `sekai_namespace_package_installations` (SQLite on

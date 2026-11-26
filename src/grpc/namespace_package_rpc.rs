@@ -4,13 +4,17 @@
 //! signed `sekai.namespace-package/v1` manifest. It carries the published
 //! definitions the caller may read, counting the rest by member kind, and the
 //! definitions (columns, classifications, partition keys) of the datasets the
-//! caller selects. Governed transforms stay out of v1. It is signed with the
-//! definition package key (`SEKAI_DEFINITION_PACKAGE_*`). Export writes
-//! nothing.
+//! caller selects. For the datasets opted into content it also carries the
+//! rows of their latest version, which takes an export grant and leaves out
+//! the columns the caller's egress may not release. Governed transforms stay
+//! out of v1. It is signed with the definition package key
+//! (`SEKAI_DEFINITION_PACKAGE_*`). Export writes nothing but a refusal record
+//! when the export grant is missing.
 //!
-//! `InstallNamespacePackage` verifies a package and every dataset mapping
-//! before its first write, then opens the definitions as a proposal, creates
-//! the output datasets bound to objects in the target namespace, and records
+//! `InstallNamespacePackage` verifies a package and every dataset mapping,
+//! carried rows included, before its first write. It then opens the
+//! definitions as a proposal, creates the output datasets bound to objects in
+//! the target namespace, appends carried rows as one new version, and records
 //! the installation. Each step is idempotent, so a retry after a crash
 //! converges; the record is written last.
 
@@ -26,8 +30,9 @@ use crate::sekai::definition_package::{
     self as definition_package, MEMBER_KIND_TRANSFORM, PackageProvenance,
 };
 use crate::sekai::namespace_package::{
-    self as package_domain, DatasetDocument, EntryRole, InstalledResource, KIND_DATASET_VERSION,
-    KIND_DEFINITION_PACKAGE, MAX_PACKAGE_DATASETS, NamespacePackageInstallation as Installation,
+    self as package_domain, ContentRow, DatasetContentDocument, DatasetDocument, EntryRole,
+    InstalledResource, KIND_DATASET_VERSION, KIND_DEFINITION_PACKAGE, MAX_PACKAGE_CONTENT_BYTES,
+    MAX_PACKAGE_DATASETS, NamespacePackageInstallation as Installation,
 };
 use crate::shomei::TrustedKeyring;
 
@@ -95,6 +100,12 @@ pub(super) fn export_namespace_package_as(
             "a package selects at most {MAX_PACKAGE_DATASETS} datasets"
         )));
     }
+    let with_content: BTreeSet<String> = input.content_dataset_ids.into_iter().collect();
+    if let Some(id) = with_content.difference(&selected).next() {
+        return Err(Status::invalid_argument(format!(
+            "content dataset {id} is not one of the selected datasets"
+        )));
+    }
     authorize_source_sync_namespace(
         service,
         &principals,
@@ -136,6 +147,8 @@ pub(super) fn export_namespace_package_as(
     let definitions = definition_package::build_package(readable).map_err(Status::internal)?;
 
     let mut outputs = Vec::with_capacity(selected.len());
+    let mut content = BTreeMap::new();
+    let mut content_budget = MAX_PACKAGE_CONTENT_BYTES;
     for id in &selected {
         // Missing and unreadable read alike, so a refusal discloses nothing.
         let refused = || Status::permission_denied(format!("dataset {id} is not readable"));
@@ -152,18 +165,42 @@ pub(super) fn export_namespace_package_as(
                 input.namespace
             )));
         }
+        if with_content.contains(id) {
+            let (rows, withheld_columns) = packaged_rows(
+                service,
+                &principals,
+                tenant_context.as_ref(),
+                &input.namespace,
+                &dataset,
+                &mut content_budget,
+            )?;
+            if withheld_columns > 0 {
+                *withheld
+                    .entry(package_domain::WITHHELD_DATASET_COLUMN.into())
+                    .or_default() += withheld_columns;
+            }
+            content.insert(id.clone(), rows);
+        }
         outputs.push(dataset);
     }
 
-    let package = package_domain::build_namespace_package(
+    let package = package_domain::build_namespace_package_with_content(
         &input.package_name,
         input.package_version,
         &definitions,
         &outputs,
         &[],
+        content,
         withheld,
     )
-    .map_err(Status::internal)?;
+    .map_err(|error| {
+        // Rows the store holds that their column type does not parse as.
+        if error.starts_with(package_domain::REFUSAL_INCOMPATIBLE) {
+            Status::failed_precondition(error)
+        } else {
+            Status::internal(error)
+        }
+    })?;
     let envelope = package_domain::sign_namespace_package(
         package,
         PackageProvenance {
@@ -184,6 +221,119 @@ pub(super) fn export_namespace_package_as(
     }))
 }
 
+/// The rows of `dataset`'s latest version that a package carries, and how
+/// many columns it leaves out. Taking rows out of the plane needs an export
+/// grant on `namespace`, as `ExportDatasetVersion` does; a caller without one
+/// is refused by name. A column the caller's egress may not release, or a
+/// restricted column the caller (or the actor it acts for) may not read, is
+/// left out of every row. Rows count against `budget`, the bytes the package
+/// may still carry.
+fn packaged_rows(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&RequestEnterpriseContext>,
+    namespace: &str,
+    dataset: &crate::sekai::dataset::Dataset,
+    budget: &mut usize,
+) -> Result<(Vec<ContentRow>, u64), Status> {
+    let id = &dataset.id;
+    let db = service.db.runtime();
+    super::data_export_rpc::export_grantee(db, principals, namespace, KIND_DATASET_VERSION, id)
+        .map_err(|_| {
+            Status::permission_denied(format!(
+                "dataset {id} content needs an export grant on namespace {namespace}"
+            ))
+        })?;
+    let object = db
+        .get_object(&dataset.object_id)
+        .map_err(Status::internal)?
+        .ok_or_else(|| Status::permission_denied(format!("dataset {id} is not readable")))?;
+    // Cell grants name object value instances, which rows do not carry.
+    if db
+        .active_object_policy(&object.namespace, &object.kind)
+        .map_err(|_| Status::unavailable("object authorization unavailable"))?
+        .is_some_and(|policy| policy.value_instance_grants_enforced())
+    {
+        return Err(Status::failed_precondition(format!(
+            "dataset {id} content cannot be packaged: its bound object type has cell grants"
+        )));
+    }
+    let restricted_readable =
+        can_read_restricted_properties(&service.security, &object, principals)
+            && tenant_context
+                .and_then(|context| context.act.as_ref())
+                .is_none_or(|actor| {
+                    can_read_restricted_properties(
+                        &service.security,
+                        &object,
+                        std::slice::from_ref(actor),
+                    )
+                });
+    let disclosure = service.egress_disclosure(principals, tenant_context);
+    let released: BTreeSet<&str> = dataset
+        .columns
+        .iter()
+        .filter(|column| {
+            disclosure.releases(&column.classification)
+                && (restricted_readable
+                    || !crate::sekai::schema::is_restricted_property_classification(
+                        &column.classification,
+                    ))
+        })
+        .map(|column| column.name.as_str())
+        .collect();
+    let withheld_columns = (dataset.columns.len() - released.len()) as u64;
+
+    let version_id = db.latest_dataset_version_id(id).map_err(Status::internal)?;
+    let mut rows = Vec::new();
+    if version_id.is_empty() {
+        return Ok((rows, withheld_columns));
+    }
+    let version = db
+        .get_dataset_version(id, &version_id, 0)
+        .map_err(Status::internal)?;
+    if version.purged {
+        return Err(Status::failed_precondition(format!(
+            "dataset {id} content is past retention"
+        )));
+    }
+    let too_large = || {
+        Status::failed_precondition(format!(
+            "{}: dataset {id} brings the package over {MAX_PACKAGE_CONTENT_BYTES} bytes of rows",
+            package_domain::REFUSAL_CONTENT_TOO_LARGE
+        ))
+    };
+    let mut after = i64::MIN;
+    loop {
+        let page = db
+            .dataset_version_rows_after(id, &version_id, after, CONTENT_PAGE)
+            .map_err(Status::internal)?;
+        let Some((last, _)) = page.last() else {
+            break;
+        };
+        after = *last;
+        for (_, values) in page {
+            let row: ContentRow = values
+                .into_iter()
+                .filter(|(name, _)| released.contains(name.as_str()))
+                .collect();
+            let bytes = package_domain::row_bytes(&row).map_err(Status::internal)?;
+            *budget = budget.checked_sub(bytes).ok_or_else(too_large)?;
+            rows.push(row);
+        }
+    }
+    Ok((rows, withheld_columns))
+}
+
+/// Version rows read per page while packaging content.
+const CONTENT_PAGE: usize = 1_000;
+
+/// Carried rows of an output, and whether install still has to append them.
+struct PlannedContent {
+    rows: Vec<std::collections::HashMap<String, String>>,
+    append: bool,
+}
+
 /// One dataset entry, checked against its target before anything is
 /// written.
 enum PlannedDataset {
@@ -191,6 +341,7 @@ enum PlannedDataset {
     Output {
         dataset: crate::sekai::dataset::Dataset,
         exists: bool,
+        content: Option<PlannedContent>,
     },
     Input,
 }
@@ -302,11 +453,21 @@ pub(super) fn install_namespace_package_with(
     for (entry, dataset_id, plan) in planned {
         if let PlannedDataset::Output {
             dataset,
-            exists: false,
+            exists,
+            content,
         } = &plan
         {
-            db.create_dataset(dataset)
-                .map_err(|_| Status::aborted(format!("dataset {dataset_id} was not created")))?;
+            if !exists {
+                db.create_dataset(dataset).map_err(|_| {
+                    Status::aborted(format!("dataset {dataset_id} was not created"))
+                })?;
+            }
+            // One append, so the rows land as one new version.
+            if let Some(PlannedContent { rows, append: true }) = content {
+                db.append_rows(&dataset_id, rows).map_err(|_| {
+                    Status::aborted(format!("dataset {dataset_id} content was not written"))
+                })?;
+            }
         }
         resources.push(InstalledResource {
             kind: entry.kind.clone(),
@@ -383,8 +544,16 @@ fn plan_dataset(
                         "entry {name} needs an object in namespace {namespace} to bind to"
                     ))
                 })?;
-            let document: DatasetDocument = serde_json::from_str(&entry.document_json)
-                .map_err(|_| Status::failed_precondition(format!("entry {name} is unreadable")))?;
+            let unreadable = || Status::failed_precondition(format!("entry {name} is unreadable"));
+            let (document, rows) = if entry.content_included {
+                let carried: DatasetContentDocument =
+                    serde_json::from_str(&entry.document_json).map_err(|_| unreadable())?;
+                (carried.definition(), Some(carried.rows))
+            } else {
+                let document: DatasetDocument =
+                    serde_json::from_str(&entry.document_json).map_err(|_| unreadable())?;
+                (document, None)
+            };
             let dataset = crate::sekai::dataset::Dataset {
                 id: target.dataset_id.clone(),
                 name: document.name,
@@ -412,7 +581,14 @@ fn plan_dataset(
                     )));
                 }
             };
-            Ok(PlannedDataset::Output { dataset, exists })
+            let content = rows
+                .map(|rows| plan_content(service, &name, &dataset, exists, rows))
+                .transpose()?;
+            Ok(PlannedDataset::Output {
+                dataset,
+                exists,
+                content,
+            })
         }
         EntryRole::Input => {
             if !target.object_id.is_empty() {
@@ -448,6 +624,67 @@ fn plan_dataset(
             "entry {name} has an unsupported role"
         ))),
     }
+}
+
+/// Checks carried rows against the schema of the dataset they go into, and
+/// decides whether they still have to be appended. A dataset the install has
+/// not created yet takes them. One a retry finds already created takes them
+/// when it has no version yet, and is done when its latest version holds
+/// exactly these rows; any other content was written outside the install and
+/// is refused by name rather than appended to. So the rows land once per
+/// `(package digest, target dataset)`.
+fn plan_content(
+    service: &SekaiServiceImpl,
+    name: &str,
+    dataset: &crate::sekai::dataset::Dataset,
+    exists: bool,
+    rows: Vec<ContentRow>,
+) -> Result<PlannedContent, Status> {
+    let schema = DatasetDocument::of(dataset);
+    package_domain::check_rows(&schema.columns, &rows)
+        .map_err(|error| Status::failed_precondition(format!("entry {name}: {error}")))?;
+    let rows: Vec<std::collections::HashMap<String, String>> = rows
+        .into_iter()
+        .map(|row| row.into_iter().collect())
+        .collect();
+    if !exists {
+        return Ok(PlannedContent {
+            append: !rows.is_empty(),
+            rows,
+        });
+    }
+    let db = service.db.runtime();
+    let version_id = db
+        .latest_dataset_version_id(&dataset.id)
+        .map_err(Status::internal)?;
+    if version_id.is_empty() {
+        return Ok(PlannedContent {
+            append: !rows.is_empty(),
+            rows,
+        });
+    }
+    // One row more than carried is enough to tell the contents apart.
+    let stored = db
+        .dataset_version_rows_after(&dataset.id, &version_id, i64::MIN, rows.len() + 1)
+        .map_err(Status::internal)?;
+    let canonical = |row: &std::collections::HashMap<String, String>| {
+        let row: ContentRow = row.clone().into_iter().collect();
+        serde_json::to_string(&row).unwrap_or_default()
+    };
+    let mut found: Vec<String> = stored.iter().map(|(_, row)| canonical(row)).collect();
+    let mut carried: Vec<String> = rows.iter().map(canonical).collect();
+    found.sort();
+    carried.sort();
+    if found != carried {
+        return Err(Status::failed_precondition(format!(
+            "entry {name}: dataset {} changed outside the installation",
+            dataset.id
+        )));
+    }
+    Ok(PlannedContent {
+        rows,
+        append: false,
+    })
 }
 
 /// A dataset a retry finds is the one this install creates: same name,
