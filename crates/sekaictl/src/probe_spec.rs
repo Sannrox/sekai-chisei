@@ -265,6 +265,86 @@ pub fn validate_set(specs: &[ProbeSpec]) -> Result<(), String> {
     Ok(())
 }
 
+/// The final report of an agent run that proposes probes (#1622): specs to
+/// run, and the RPCs the format cannot express yet.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProposalReport {
+    pub specs: Vec<ProbeSpec>,
+    #[serde(default)]
+    pub unsupported: Vec<UnsupportedRpc>,
+}
+
+/// An RPC the agent found no spec for, with its one-line reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnsupportedRpc {
+    pub rpc: String,
+    pub why: String,
+}
+
+/// What [`import_report`] did with each spec.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ImportOutcome {
+    pub written: Vec<String>,
+    pub unchanged: Vec<String>,
+    pub unsupported: Vec<UnsupportedRpc>,
+}
+
+/// Write every spec of an agent's report to `<dir>/<id>.json`, the layout
+/// `load_dir` and `run --specs` read. The report is untrusted: it is parsed
+/// strictly and the whole set is validated before any file is written. An id
+/// whose file already holds the same spec is left alone, so a rerun is a
+/// no-op; one that holds a different spec refuses the import. Each file is
+/// written beside its target and renamed into place, so a crash never
+/// leaves a torn spec.
+pub fn import_report(json: &str, dir: &std::path::Path) -> Result<ImportOutcome, String> {
+    let report: ProposalReport =
+        serde_json::from_str(json).map_err(|error| format!("invalid proposal report: {error}"))?;
+    validate_set(&report.specs)?;
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("probe specs {}: {error}", dir.display()))?;
+    let mut fresh = Vec::new();
+    let mut outcome = ImportOutcome {
+        unsupported: report.unsupported,
+        ..ImportOutcome::default()
+    };
+    for spec in &report.specs {
+        let path = dir.join(format!("{}.json", spec.id));
+        match std::fs::read_to_string(&path) {
+            Ok(existing) if ProbeSpec::parse(&existing).as_ref() == Ok(spec) => {
+                outcome.unchanged.push(spec.id.clone());
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "probe spec {} already holds a different spec",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fresh.push(spec),
+            Err(error) => return Err(format!("probe spec {}: {error}", path.display())),
+        }
+    }
+    for spec in fresh {
+        write_spec(dir, spec)?;
+        outcome.written.push(spec.id.clone());
+    }
+    Ok(outcome)
+}
+
+fn write_spec(dir: &std::path::Path, spec: &ProbeSpec) -> Result<(), String> {
+    use std::io::Write;
+    let path = dir.join(format!("{}.json", spec.id));
+    let staged = dir.join(format!(".{}.json.tmp", spec.id));
+    let mut body = serde_json::to_string_pretty(spec).map_err(|error| error.to_string())?;
+    body.push('\n');
+    let fail = |error: std::io::Error| format!("probe spec {}: {error}", path.display());
+    let mut file = std::fs::File::create(&staged).map_err(fail)?;
+    file.write_all(body.as_bytes()).map_err(fail)?;
+    file.sync_all().map_err(fail)?;
+    std::fs::rename(&staged, &path).map_err(fail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +445,44 @@ mod tests {
         assert!(matches!(spec.judge(&down), SpecVerdict::Mismatch(_)));
         spec.expect.reason = Some("tenant boundary".into());
         assert!(matches!(spec.judge(&denied), SpecVerdict::Mismatch(_)));
+    }
+
+    fn report(specs: &[&str]) -> String {
+        format!(
+            r#"{{"specs": [{}], "unsupported": [{{"rpc": "SekaiService.ReadObjectSeries", "why": "not in the format"}}]}}"#,
+            specs.join(",")
+        )
+    }
+
+    #[test]
+    fn an_imported_report_is_the_spec_set_the_runner_loads_and_a_rerun_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = import_report(&report(&[CROSS_TENANT]), dir.path()).unwrap();
+        assert_eq!(outcome.written, ["links-cross-tenant"]);
+        assert_eq!(outcome.unsupported[0].rpc, "SekaiService.ReadObjectSeries");
+        let loaded = load_dir(dir.path()).unwrap();
+        assert_eq!(loaded, vec![ProbeSpec::parse(CROSS_TENANT).unwrap()]);
+        let again = import_report(&report(&[CROSS_TENANT]), dir.path()).unwrap();
+        assert!(again.written.is_empty());
+        assert_eq!(again.unchanged, ["links-cross-tenant"]);
+    }
+
+    #[test]
+    fn one_invalid_spec_or_a_changed_id_refuses_the_report_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let pointed = CROSS_TENANT.replace(
+            r#""as": "tenant","#,
+            r#""as": "tenant", "target": "https://prod.example.test","#,
+        );
+        assert!(import_report(&report(&[CROSS_TENANT, &pointed]), dir.path()).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        import_report(&report(&[CROSS_TENANT]), dir.path()).unwrap();
+        let changed = CROSS_TENANT.replace("outgoing", "incoming");
+        let error = import_report(&report(&[&changed]), dir.path()).unwrap_err();
+        assert!(error.contains("different spec"), "{error}");
+        assert_eq!(
+            load_dir(dir.path()).unwrap(),
+            vec![ProbeSpec::parse(CROSS_TENANT).unwrap()]
+        );
     }
 }

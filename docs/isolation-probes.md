@@ -85,6 +85,36 @@ catalogue: the test suite runs every spec there against an isolating
 in-process deployment and requires each to be denied. Promote a finding by
 adding its spec there; it fails until the bypass is fixed.
 
+## Agent-proposed specs
+
+A red-team agent keeps the catalogue level with new surface. The agent only
+reads its inputs and writes a report. It never calls an RPC and holds no
+endpoint or credential, so the only way to reach a target is through the
+guarded runner:
+
+1. Assemble the inputs in a scratch directory: `surface.diff` is the
+   `proto/` diff since the last release tag (`git diff <tag>..HEAD --
+   proto/`), and `bugs/<n>.md` holds one closed `risk:security` issue each.
+2. Run the agent harness's red-team profile in that directory. Its final
+   report is `{"specs": [...], "unsupported": [{"rpc", "why"}]}`. A run has a
+   turn and time budget, and a model-cost cap of $25 a run and $60 a month.
+3. Import the report:
+   `sekaictl admin assurance probes import --report <summary.json> --specs <dir>`.
+   The whole report is validated as one spec set before anything is
+   written, so one invalid spec refuses all of it. Each spec is written as
+   `<id>.json`. A spec that is already there is left alone; an id that
+   already holds a different spec refuses the import. The output lists what
+   was written, what was unchanged, and the `unsupported` RPCs.
+4. Run the imported specs against a test deployment with
+   `probes run --specs <dir>`, never against production.
+5. Promote a spec that found a bypass by copying it into
+   `tests/fixtures/probe_specs/`. It fails there until the bypass is fixed.
+
+A spec can only call the five RPCs above. When the diff adds an RPC that a
+spec cannot express, the agent lists it under `unsupported` with the
+reason, and does not stretch another RPC to cover it. Supporting such an RPC
+is a change to `sekai.probe-spec/v1`, shaped as its own issue.
+
 ## Ledger, summary and findings
 
 Every attempt, including a refused run, is appended (fsynced) to the JSON
