@@ -325,7 +325,7 @@ impl SekaiDb {
         let conn = self.conn();
         let mut statement = conn
             .prepare(
-                "SELECT row_id, data FROM sekai_dataset_version_rows
+                "SELECT row_id, data FROM sekai_dataset_version_content
                  WHERE dataset_id = ?1 AND version_id = ?2 AND row_id > ?3
                  ORDER BY row_id LIMIT ?4",
             )
@@ -617,7 +617,7 @@ impl PostgresDb {
     ) -> Result<Vec<VersionRow>, String> {
         self.connection()?
             .query(
-                "SELECT row_id, data FROM sekai_dataset_version_rows
+                "SELECT row_id, data FROM sekai_dataset_version_content
                  WHERE dataset_id = $1 AND version_id = $2 AND row_id > $3
                  ORDER BY row_id LIMIT $4",
                 &[&dataset_id, &version_id, &after_row_id, &(limit as i64)],

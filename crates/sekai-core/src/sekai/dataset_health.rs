@@ -853,7 +853,7 @@ fn load_version_rows_tx(
 ) -> Result<Vec<HashMap<String, String>>, String> {
     let mut stmt = tx
         .prepare(
-            "SELECT data FROM sekai_dataset_version_rows
+            "SELECT data FROM sekai_dataset_version_content
              WHERE dataset_id = ?1 AND version_id = ?2 ORDER BY row_id",
         )
         .map_err(|error| error.to_string())?;

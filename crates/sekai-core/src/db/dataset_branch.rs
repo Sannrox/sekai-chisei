@@ -1038,7 +1038,7 @@ fn branch_records_budgeted(
         return Ok(Vec::new());
     } else {
         (
-            "SELECT data FROM sekai_dataset_version_rows
+            "SELECT data FROM sekai_dataset_version_content
              WHERE dataset_id = ?1 AND version_id = ?2 ORDER BY row_id",
             branch.base_version_id.as_str(),
         )

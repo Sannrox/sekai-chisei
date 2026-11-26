@@ -5312,7 +5312,7 @@ mod tests {
             sqlite
                 .conn()
                 .query_row(
-                    "SELECT COUNT(*) FROM sekai_dataset_version_rows WHERE dataset_id=?1",
+                    "SELECT COUNT(*) FROM sekai_dataset_version_content WHERE dataset_id=?1",
                     params![LLM_CALLS_DATASET],
                     |row| row.get(0),
                 )

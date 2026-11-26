@@ -101,6 +101,10 @@ fn sqlite_lookups_seek_the_source_key_indexes() {
             crate::sekai::dataset::LATEST_SOURCE_VERSION_ROW_SQL,
             "idx_dataset_version_rows_source_key",
         ),
+        (
+            crate::sekai::dataset::LATEST_SOURCE_VERSION_ROW_SQL,
+            "idx_dataset_row_spans_source_key",
+        ),
     ] {
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
         let plan: Vec<String> = stmt
@@ -153,6 +157,10 @@ fn postgres_lookups_can_seek_the_source_key_indexes() {
         (
             crate::db::postgres_dataset::LATEST_SOURCE_VERSION_ROW_SQL,
             "idx_dataset_version_rows_source_key",
+        ),
+        (
+            crate::db::postgres_dataset::LATEST_SOURCE_VERSION_ROW_SQL,
+            "idx_dataset_row_spans_source_key",
         ),
     ] {
         let explain = format!(
