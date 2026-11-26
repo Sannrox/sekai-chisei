@@ -10,7 +10,8 @@ const NAME_PROPERTY: &str = "_name";
 
 /// The effect a grant of `instance` would make now, for an approver who read
 /// it as `principals`. Reuses the plan simulation of one step, so the
-/// prediction is the `PreviewObjectAction` path with nothing applied.
+/// prediction is the `PreviewObjectAction` path with nothing applied; a
+/// create is planned from its parameters (`simulate_create_step`).
 pub(super) fn current_instance_effect(
     service: &SekaiServiceImpl,
     principals: &[String],
@@ -18,7 +19,9 @@ pub(super) fn current_instance_effect(
     policy_context: &crate::sekai::object_security::PrincipalPolicyContext,
     instance: &crate::sekai::action_instance::ActionInstance,
 ) -> Result<PreviewActionInstanceEffectResponse, Status> {
-    use crate::sekai::action_plan::{PlanStep, SimulationContext, parameter_target, simulate_step};
+    use crate::sekai::action_plan::{
+        PlanStep, SimulationContext, parameter_target, simulate_create_step, simulate_step,
+    };
 
     if instance.status != crate::sekai::action_instance::STATUS_PARKED {
         return Err(Status::failed_precondition(
@@ -52,7 +55,22 @@ pub(super) fn current_instance_effect(
         object_id: parameter_target(&instance.parameters_json).unwrap_or_default(),
         parameters_json: instance.parameters_json.clone(),
     };
-    let simulated = simulate_step(
+    // A create has no existing object to preview against (#3528): it is
+    // planned from its parameters instead.
+    let creates = service
+        .db
+        .runtime()
+        .get_governed_action_type(&instance.namespace, &instance.type_id, &instance.version)
+        .map_err(Status::internal)?
+        .is_some_and(|definition| {
+            definition.object_mutation == crate::sekai::governed_action_type::OBJECT_MUTATION_CREATE
+        });
+    let simulate = if creates {
+        simulate_create_step
+    } else {
+        simulate_step
+    };
+    let simulated = simulate(
         service.db.runtime(),
         &SimulationContext {
             actor: &instance.principal,
@@ -80,8 +98,8 @@ pub(super) fn current_instance_effect(
                 service,
                 principals,
                 tenant_context,
-                &effect.object_id,
-                &effect.changed_properties,
+                &effect,
+                &instance.namespace,
             )?;
             let (shown, withheld): (Vec<_>, Vec<_>) = effect
                 .changed_properties
@@ -137,24 +155,34 @@ fn effect_digest(
     format!("sha256:{:x}", Sha256::digest(canonical))
 }
 
-/// The `changed` properties the approver may not read. Each is probed on
-/// the stored object, a property the write would add included, and is
-/// withheld when the response projection removes or rewrites it.
+/// The changed properties of `effect` the approver may not read. Each is
+/// probed on the stored object, or on the object a create would add, and is
+/// withheld when the response projection removes or rewrites it. A create
+/// has no object grants yet, so a restricted property it sets is withheld
+/// from everyone short of the operator.
 fn withheld_properties(
     service: &SekaiServiceImpl,
     principals: &[String],
     tenant_context: Option<&RequestEnterpriseContext>,
-    object_id: &str,
-    changed: &[String],
+    effect: &crate::sekai::action_plan::StepEffect,
+    namespace: &str,
 ) -> Result<std::collections::BTreeSet<String>, Status> {
-    let Some(mut probe) = service
+    let changed = &effect.changed_properties;
+    let mut probe = service
         .db
         .runtime()
-        .get_object(object_id)
+        .get_object(&effect.object_id)
         .map_err(Status::internal)?
-    else {
-        return Ok(Default::default());
-    };
+        .unwrap_or_else(|| crate::domain::Object {
+            id: effect.object_id.clone(),
+            kind: effect.object_kind.clone(),
+            name: String::new(),
+            namespace: namespace.to_owned(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 0,
+            updated: 0,
+        });
     for property in changed.iter().filter(|property| *property != NAME_PROPERTY) {
         probe
             .properties
@@ -178,7 +206,7 @@ fn withheld_properties(
 }
 
 /// Reads the predicted effect of a parked instance for a caller who may
-/// read the instance and its target object.
+/// read the instance and, for an update, its target object.
 pub(super) async fn preview_action_instance_effect(
     service: &SekaiServiceImpl,
     req: Request<PreviewActionInstanceEffectRequest>,

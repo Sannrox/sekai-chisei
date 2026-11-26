@@ -331,6 +331,16 @@ revision and the full effect, withheld properties included; it changes only
 when the write would. The caller needs the read a `GetActionInstance` needs;
 an instance that is not parked is refused with `FailedPrecondition`.
 
+An instance whose type creates an object (#3528) has no existing object to
+preview against, so the read plans the write from its parameters. The effect
+has mutation `create`, the object kind, and every property the write sets
+plus `_name`; `object_revision` is empty. The outcome is `valid`, or
+`invalid` with `failing_criterion` when the write would be refused, for
+example because its object id is taken; the digest then changes, so a grant
+bound to the earlier read is refused. Nobody holds grants on an object that
+does not exist yet, so a restricted property a create sets is withheld from
+every reader short of the operator.
+
 `DecideActionInstance` takes that digest as `expected_effect_digest`. On a
 grant the server predicts the effect again; if the digest differs, the grant
 is refused with `FailedPrecondition` and a message starting

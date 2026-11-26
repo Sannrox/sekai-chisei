@@ -463,6 +463,72 @@ pub fn simulate_step(
     })
 }
 
+/// Predicts the object a step whose Action type creates one would add
+/// (#3528). There is no existing object to preview against, so the step is
+/// planned straight from its parameters: the outcome is `valid` with the
+/// effect, or `invalid` with why the write would be refused (an id already
+/// taken among them). Applies nothing. The caller authorizes the namespace;
+/// [`simulate_step`] stays the path for steps on existing objects.
+pub fn simulate_create_step(
+    db: &RuntimeDb,
+    context: &SimulationContext<'_>,
+    index: u32,
+    namespace: &str,
+    step: &PlanStep,
+) -> Result<StepSimulation, PlanError> {
+    let Some(type_def) = db.get_governed_action_type(namespace, &step.type_id, &step.version)?
+    else {
+        return Ok(unavailable_step(index, step));
+    };
+    if !type_def.enabled
+        || type_def.object_mutation != crate::sekai::governed_action_type::OBJECT_MUTATION_CREATE
+    {
+        return Ok(unavailable_step(index, step));
+    }
+    let invalid = |reason_code: &str, failing_criterion: String| StepSimulation {
+        outcome: PREVIEW_INVALID.into(),
+        reason_code: reason_code.into(),
+        failing_criterion,
+        ..unavailable_step(index, step)
+    };
+    if let Err(error) = crate::sekai::parameter_schema::validate_parameters(
+        &type_def.parameter_schema_json,
+        &step.parameters_json,
+    ) {
+        return Ok(invalid(
+            "invalid_parameters",
+            format!("action parameters invalid: {error}"),
+        ));
+    }
+    let planned = match action_object_mutation::plan(
+        db,
+        &type_def,
+        namespace,
+        &step.parameters_json,
+        Some(action_object_mutation::Submitter::classified_now(
+            db,
+            context.actor,
+        )),
+        None,
+        context.now_ms,
+    ) {
+        Ok(planned) => planned,
+        Err(action_object_mutation::ActionObjectMutationError::Internal(error)) => {
+            return Err(PlanError::Store(error));
+        }
+        Err(
+            action_object_mutation::ActionObjectMutationError::FailedPrecondition(error)
+            | action_object_mutation::ActionObjectMutationError::InvalidArgument(error),
+        ) => return Ok(invalid("invalid_write", error)),
+    };
+    Ok(StepSimulation {
+        outcome: PREVIEW_VALID.into(),
+        reason_code: String::new(),
+        effect: planned.as_ref().map(changed_properties),
+        ..unavailable_step(index, step)
+    })
+}
+
 /// The digest of a simulation: the canonical plan and what each step was
 /// predicted to do, against which object revision. Ids of the simulation
 /// and times are left out, so an unchanged world digests the same.
