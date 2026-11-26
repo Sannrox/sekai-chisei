@@ -753,6 +753,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "envelope-keys"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f92cc45a0de9e2e5e8b15ed1266515952c7544613f74946b471e73dd08d8756b"
+dependencies = [
+ "aes-gcm",
+ "libc",
+ "rand 0.8.8",
+ "serde",
+ "zeroize",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1720,21 +1733,21 @@ dependencies = [
 
 [[package]]
 name = "mikura"
-version = "0.6.0"
-source = "git+https://github.com/Sannrox/mikura?tag=v0.6.0#1b0977953899615ec43babb6c64f33d90959b9b8"
+version = "0.7.0"
+source = "git+https://github.com/Sannrox/mikura?tag=v0.7.0#2af7f3360790556dd9f291135b5b5e49f70c493e"
 dependencies = [
  "aes-gcm",
  "crc32fast",
+ "envelope-keys",
  "rand 0.8.8",
- "sekai-keys",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "mikura-host"
-version = "0.6.0"
-source = "git+https://github.com/Sannrox/mikura?tag=v0.6.0#1b0977953899615ec43babb6c64f33d90959b9b8"
+version = "0.7.0"
+source = "git+https://github.com/Sannrox/mikura?tag=v0.7.0#2af7f3360790556dd9f291135b5b5e49f70c493e"
 dependencies = [
  "mikura",
  "mikura-ingest",
@@ -1744,8 +1757,8 @@ dependencies = [
 
 [[package]]
 name = "mikura-ingest"
-version = "0.6.0"
-source = "git+https://github.com/Sannrox/mikura?tag=v0.6.0#1b0977953899615ec43babb6c64f33d90959b9b8"
+version = "0.7.0"
+source = "git+https://github.com/Sannrox/mikura?tag=v0.7.0#2af7f3360790556dd9f291135b5b5e49f70c493e"
 dependencies = [
  "mikura",
 ]

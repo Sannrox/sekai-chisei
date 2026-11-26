@@ -192,6 +192,14 @@ which the drain uses (see below). It also changes the format of new logs.
   because a `MIKURAV4` commit leaves the stub unchanged.
 - `v0.6.0` answers a zero-hop, unfiltered breakdown on one root property of
   the root's own measure from commit-time count and sum rollups. Those groups
-  carry no min, max, or average divisor. The dual-read canary skips `min`,
-  `max`, and `avg` for that shape with a fixed reason instead of reporting a
-  mismatch. Serving those answers from the object log needs an upstream fix.
+  carry no min, max, or average divisor. The dual-read canary skipped `min`,
+  `max`, and `avg` for that shape until #3496.
+
+## Amendment: pin mikura `v0.7.0` (#3496)
+
+The pin moves to the `v0.7.0` tag. Commit-time groups now carry min, max, n,
+and the avg divisor, so the dual-read canary compares those measures on the
+one-property root breakdown. This crate does not call `ingest_versioned`;
+logs stay on the `v0.6.0` bytes until a versioned write. `ObjectRecord`
+gains `source_version` (0 when unused). Do not roll a mixed 0.6/0.7 writer
+set after the first versioned write.
