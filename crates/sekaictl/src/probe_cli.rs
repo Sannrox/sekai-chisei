@@ -4,7 +4,8 @@
 //! once against one allow-listed target and appends to the ledger, then any
 //! declarative probe specs from `--specs <dir>` (#1680), all validated before
 //! the first call. Tokens are read from files so they never appear in
-//! arguments or logs.
+//! arguments or logs. `import` turns an agent's proposal report (#1622) into
+//! the spec files `--specs` reads.
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,7 @@ pub fn usage() -> &'static str {
      --foreign-tenant <ns> --foreign-token-file <file> --foreign-object <id> --ledger <file> --advisories <dir> \
      [--specs <dir>]\n  \
      sekaictl admin assurance probes summary --ledger <file> --week-start-ms <ms>\n  \
+     sekaictl admin assurance probes import --report <file> --specs <dir>\n  \
      (targets must be listed in SEKAI_PROBE_TARGET_ALLOWLIST; both tenants must be synthetic)"
 }
 
@@ -96,6 +98,20 @@ pub async fn run_probes_command(args: Vec<String>) -> Result<(), BoxErr> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&summary).map_err(std::io::Error::other)?
+            );
+            Ok(())
+        }
+        Some("import") => {
+            let report = PathBuf::from(flag(rest, "--report")?);
+            let json = std::fs::read_to_string(&report).map_err(|error| {
+                std::io::Error::other(format!("report {}: {error}", report.display()))
+            })?;
+            let outcome =
+                crate::probe_spec::import_report(&json, Path::new(&flag(rest, "--specs")?))
+                    .map_err(std::io::Error::other)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&outcome).map_err(std::io::Error::other)?
             );
             Ok(())
         }

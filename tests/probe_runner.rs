@@ -512,6 +512,54 @@ async fn a_spec_against_a_seeded_bypass_is_a_finding_reproduced_by_the_spec() {
 }
 
 #[tokio::test]
+async fn an_imported_agent_report_finds_a_seeded_bypass_through_the_guard() {
+    // The red-team agent's report goes through `probes import`; its specs
+    // then run behind the same guard and fail the way a catalogue probe does.
+    let deployment = deployment(|db, north, south| {
+        db.create_grant(&Grant {
+            id: "seeded-bypass".into(),
+            object_id: south.objects[0].id.clone(),
+            principal: viewer(north),
+            role: Role::Viewer,
+            created: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let specs = dir.path().join("specs");
+    let report = r#"{
+        "specs": [{
+            "schema": "sekai.probe-spec/v1",
+            "id": "agent-get-linked-objects-cross-tenant",
+            "as": "tenant",
+            "call": {"rpc": "GetLinkedObjects", "direction": "outgoing"},
+            "expect": {"codes": ["PermissionDenied", "NotFound"]}
+        }],
+        "unsupported": [{"rpc": "NewRpc", "why": "not object-scoped"}]
+    }"#;
+    let outcome = sekaictl::probe_spec::import_report(report, &specs).unwrap();
+    assert_eq!(outcome.written, ["agent-get-linked-objects-cross-tenant"]);
+    assert_eq!(outcome.unsupported[0].rpc, "NewRpc");
+    let report = run(
+        TargetGuard::parse(Some(&deployment.endpoint)),
+        &target(&deployment),
+        sekaictl::probe_spec::load_dir(&specs),
+        &dir.path().join("ledger.jsonl"),
+        &dir.path().join("advisories"),
+    )
+    .await
+    .unwrap();
+    let attempt = report
+        .attempts
+        .iter()
+        .find(|attempt| attempt.spec.as_deref() == Some("agent-get-linked-objects-cross-tenant"))
+        .unwrap();
+    assert_eq!(attempt.outcome, ProbeOutcome::Bypass);
+}
+
+#[tokio::test]
 async fn a_malformed_spec_refuses_the_run_before_any_call() {
     let deployment = deployment(|_, _, _| {}).await;
     let dir = tempfile::tempdir().unwrap();
