@@ -46,10 +46,14 @@ They stay out of the default RPC surface.
 pack. `lifecycle_state` is `disabled` unless the runtime flag or build
 feature is on. Visibility of that entry is not permission to invoke an
 experimental RPC. The core pack also reports `sekai.transforms.projection`,
-`sekai.transforms.analytical`, and `sekai.transforms.isolated_process` as
-governed transform profiles; their `lifecycle_state` is `disabled` unless
-the experimental RPC gate is on, matching `sekai.rpc.experimental`.
-Put/run/get/list and isolated-process claim RPCs stay experimental.
+`sekai.transforms.analytical`, and `sekai.transforms.scheduler` as governed
+transform profiles; they are `active` on the default build.
+`sekai.transforms.preview` and `sekai.transforms.chain` are also `active`
+(`advanced` and `experimental` product tiers).
+`sekai.transforms.isolated_process`, `sekai.transforms.adhoc`, and
+`sekai.transforms.object-set-inputs` stay `disabled` unless the experimental
+RPC gate is on. Isolated-process claim, ad-hoc, shadow, replay, on-branch,
+streaming, and chain list/get RPCs stay experimental.
 
 SDK generation for the stable set succeeds without a denylist. Experimental
 RPCs are omitted automatically.
@@ -208,13 +212,13 @@ Edit the fixture, then regenerate with
 | `SekaiService.ListEmbeddingSpecs` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.DeleteEmbeddingSpec` | `sekai.graph` | yes | none | `experimental` |
 | `SekaiService.PutObjectTypeIndexEdit` | `sekai.datasets` | yes | host | `stable` |
-| `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
-| `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | cli | `experimental` |
+| `SekaiService.PutGovernedTransform` | `sekai.datasets` | yes | cli | `stable` |
+| `SekaiService.RunGovernedTransform` | `sekai.datasets` | yes | cli | `stable` |
 | `SekaiService.RunAdHocGovernedTransform` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.PreviewGovernedTransform` | `sekai.datasets` | yes | mcp | `experimental` |
-| `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | cli | `experimental` |
-| `SekaiService.ListGovernedTransforms` | `sekai.datasets` | yes | example | `experimental` |
-| `SekaiService.ListGovernedTransformRuns` | `sekai.datasets` | yes | example | `experimental` |
+| `SekaiService.PreviewGovernedTransform` | `sekai.datasets` | yes | mcp | `stable` |
+| `SekaiService.GetGovernedTransformRun` | `sekai.datasets` | yes | cli | `stable` |
+| `SekaiService.ListGovernedTransforms` | `sekai.datasets` | yes | example | `stable` |
+| `SekaiService.ListGovernedTransformRuns` | `sekai.datasets` | yes | example | `stable` |
 | `SekaiService.RegisterTransformRuntime` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ListClaimableTransformWork` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.WakeSiteAgentInstance` | `sekai.graph, sekai.audit` | yes | none | `experimental` |
@@ -233,12 +237,12 @@ Edit the fixture, then regenerate with
 | `SekaiService.ReadTransformRunInputs` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.WriteTransformRunResult` | `sekai.datasets` | yes | example | `experimental` |
 | `SekaiService.ApplyStreamingTransformBatch` | `sekai.graph` | yes | example | `experimental` |
-| `SekaiService.TickGovernedTransforms` | `sekai.datasets` | yes | example | `experimental` |
-| `SekaiService.GetTransformOutputState` | `sekai.datasets` | yes | example | `experimental` |
-| `SekaiService.CancelGovernedTransformRun` | `sekai.datasets` | yes | example | `experimental` |
-| `SekaiService.PutTransformChain` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.RunTransformChain` | `sekai.datasets` | yes | none | `experimental` |
-| `SekaiService.GetTransformChainRun` | `sekai.datasets` | yes | none | `experimental` |
+| `SekaiService.TickGovernedTransforms` | `sekai.datasets` | yes | example | `stable` |
+| `SekaiService.GetTransformOutputState` | `sekai.datasets` | yes | example | `stable` |
+| `SekaiService.CancelGovernedTransformRun` | `sekai.datasets` | yes | example | `stable` |
+| `SekaiService.PutTransformChain` | `sekai.datasets` | yes | none | `stable` |
+| `SekaiService.RunTransformChain` | `sekai.datasets` | yes | none | `stable` |
+| `SekaiService.GetTransformChainRun` | `sekai.datasets` | yes | none | `stable` |
 | `SekaiService.ListTransformChains` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.GetTransformChain` | `sekai.datasets` | yes | none | `experimental` |
 | `SekaiService.ListTransformChainRuns` | `sekai.datasets` | yes | none | `experimental` |

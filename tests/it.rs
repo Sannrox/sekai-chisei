@@ -215,6 +215,7 @@ mod split_pool_budget;
 mod store_relocate_online;
 mod team_namespace_backend_conformance;
 mod tenant_isolation_conformance;
+mod transform_backend_conformance;
 mod transform_llm_step;
 mod two_plane_processes;
 

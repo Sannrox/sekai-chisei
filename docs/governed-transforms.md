@@ -60,20 +60,25 @@ stay on disk and historical output row IDs stay stable. Get/List/run/write-back
 replace partition identities and member digests with `redacted` unless the
 caller can read the datasets bound by the run's definition. Arrow/Parquet remains out of scope (#879).
 
-The gRPC RPCs (`PutGovernedTransform`, `RunGovernedTransform`,
-`GetGovernedTransformRun`, `ListGovernedTransforms`,
-`ListGovernedTransformRuns`, `RegisterTransformRuntime`, `ListClaimableTransformWork`,
-`ClaimTransformWork`, `HeartbeatTransformClaim`, `ReadTransformRunInputs`,
-`WriteTransformRunResult`, `ApplyStreamingTransformBatch`, `TickGovernedTransforms`,
-`GetTransformOutputState`, `CancelGovernedTransformRun`,
-`ShadowGovernedTransform`) are `experimental`. `TickGovernedTransforms` also
-admits due site agent schedule wakes (ADR 0137):
-start the plane with `SEKAI_EXPERIMENTAL_RPCS=1` or the `experimental-rpcs`
-feature. See [rpc-maturity.md](rpc-maturity.md). `DiscoverCapabilities`
-reports `sekai.transforms.projection`, `sekai.transforms.analytical`,
-`sekai.transforms.isolated_process`, and `sekai.transforms.scheduler` on the
-core pack; `lifecycle_state` is `disabled` unless experimental RPCs are
-enabled. Enterprise-scoped sessions may `PutGovernedTransform` with
+The gRPC RPCs `PutGovernedTransform`, `ListGovernedTransforms`,
+`PreviewGovernedTransform`, `RunGovernedTransform`, `GetGovernedTransformRun`,
+`ListGovernedTransformRuns`, `CancelGovernedTransformRun`,
+`GetTransformOutputState`, `TickGovernedTransforms`, `PutTransformChain`,
+`RunTransformChain`, and `GetTransformChainRun` are `stable`. Isolated-process
+claim, ad-hoc, shadow, replay, on-branch, streaming, and chain list/get RPCs
+(`RegisterTransformRuntime`, `ListClaimableTransformWork`, `ClaimTransformWork`,
+`HeartbeatTransformClaim`, `ReadTransformRunInputs`, `WriteTransformRunResult`,
+`ApplyStreamingTransformBatch`, `ShadowGovernedTransform`, `RunAdHocGovernedTransform`,
+`ListTransformChains`, `GetTransformChain`, `ListTransformChainRuns`) are
+`experimental`: start the plane with `SEKAI_EXPERIMENTAL_RPCS=1` or the
+`experimental-rpcs` feature. See [rpc-maturity.md](rpc-maturity.md).
+`TickGovernedTransforms` also admits due site agent schedule wakes (ADR 0137).
+`DiscoverCapabilities` reports `sekai.transforms.projection`,
+`sekai.transforms.analytical`, and `sekai.transforms.scheduler` as `active`
+on the core pack. `sekai.transforms.preview` and `sekai.transforms.chain`
+are also `active` (`advanced` and `experimental` product tiers).
+`sekai.transforms.isolated_process` stays `disabled` unless experimental
+RPCs are enabled. Enterprise-scoped sessions may `PutGovernedTransform` with
 namespace Write and read access to the bound datasets; community credentials
 still require credential administration. `RunGovernedTransform` stays
 unadmitted for scoped sessions.

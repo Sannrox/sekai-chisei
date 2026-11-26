@@ -52,11 +52,13 @@ pub const LIST_WORKING_MEMORY_TOOL: &str = "sekai.agents.memory.list";
 /// values to the same cap; the tool refuses them instead of truncating.
 pub const MAX_WORKING_MEMORY_PAGE: i64 = crate::domain::MAX_LIST_LIMIT as i64;
 /// Rehearsal tools (#2432): each runs the no-effect form of its RPC and
-/// submits nothing; ADR 0109 holds, a trace is never certification. All four
-/// RPCs are experimental, so the tools are listed only when experimental RPCs
-/// are enabled. A plan simulation is keyed by the call's `operation_id`, so
-/// calling again with it returns the stored simulation; a transform preview
-/// that runs isolated returns a `previewId` to read back the same way.
+/// submits nothing; ADR 0109 holds, a trace is never certification. Preview
+/// backs onto a stable RPC (#2414). Dry-run agent, plan simulate, and change-
+/// bundle dry-run stay experimental, so those tools are listed only when
+/// experimental RPCs are enabled. A plan simulation is keyed by the call's
+/// `operation_id`, so calling again with it returns the stored simulation; a
+/// transform preview that runs isolated returns a `previewId` to read back
+/// the same way.
 pub const DRY_RUN_AGENT_TOOL: &str = "sekai.agents.dry_run";
 pub const SIMULATE_PLAN_TOOL: &str = "sekai.plans.simulate";
 pub const PREVIEW_TRANSFORM_TOOL: &str = "sekai.transforms.preview";
@@ -69,7 +71,7 @@ pub const CREATE_DATASET_BRANCH_TOOL: &str = "sekai.datasets.branch.create";
 pub const RUN_TRANSFORM_ON_BRANCH_TOOL: &str = "sekai.transforms.run_on_branch";
 pub const COMPARE_DATASET_BRANCH_TOOL: &str = "sekai.datasets.branch.compare";
 pub const PROPOSE_DATASET_MERGE_TOOL: &str = "sekai.datasets.branch.propose_merge";
-/// Experimental (#2119). Listed only when experimental RPCs are enabled.
+/// Transform chain run and status (#2119, #2414). Backing RPCs are stable.
 pub const RUN_TRANSFORM_CHAIN_TOOL: &str = "sekai.transforms.chain.run";
 pub const GET_TRANSFORM_CHAIN_RUN_TOOL: &str = "sekai.transforms.chain.status";
 
@@ -85,7 +87,7 @@ const RESERVED_ARGUMENT_KEYS: &[&str] = &[
     "principal",
 ];
 
-pub fn well_known_tools() -> [&'static str; 20] {
+pub fn well_known_tools() -> [&'static str; 23] {
     [
         GET_OBJECT_TOOL,
         EVALUATE_SET_TOOL,
@@ -107,6 +109,9 @@ pub fn well_known_tools() -> [&'static str; 20] {
         GET_LINEAGE_TOOL,
         GET_CLASS_TOOL,
         NEIGHBORHOOD_TOOL,
+        PREVIEW_TRANSFORM_TOOL,
+        RUN_TRANSFORM_CHAIN_TOOL,
+        GET_TRANSFORM_CHAIN_RUN_TOOL,
     ]
 }
 
@@ -920,6 +925,30 @@ fn well_known_entries() -> Vec<CapabilityEntry> {
             "sekai.ExpandNeighborhoodResponse",
             "read",
         ),
+        capability_entry(
+            PREVIEW_TRANSFORM_TOOL,
+            "Preview a governed transform's output rows without running or storing it, or read back a preview by preview_id.",
+            "query",
+            "sekai.PreviewGovernedTransformRequest",
+            "sekai.PreviewGovernedTransformResponse",
+            "read",
+        ),
+        capability_entry(
+            RUN_TRANSFORM_CHAIN_TOOL,
+            "Run one registered transform chain as a governed, receipted operation.",
+            "action",
+            "sekai.RunTransformChainRequest",
+            "sekai.RunTransformChainResponse",
+            "write",
+        ),
+        capability_entry(
+            GET_TRANSFORM_CHAIN_RUN_TOOL,
+            "Read the status and receipt of one transform chain run.",
+            "query",
+            "sekai.GetTransformChainRunRequest",
+            "sekai.GetTransformChainRunResponse",
+            "read",
+        ),
     ]
 }
 
@@ -982,14 +1011,6 @@ fn experimental_entries() -> Vec<CapabilityEntry> {
             "read",
         ),
         capability_entry(
-            PREVIEW_TRANSFORM_TOOL,
-            "Preview a governed transform's output rows without running or storing it, or read back a preview by preview_id.",
-            "query",
-            "sekai.PreviewGovernedTransformRequest",
-            "sekai.PreviewGovernedTransformResponse",
-            "read",
-        ),
-        capability_entry(
             DRY_RUN_CHANGE_BUNDLE_TOOL,
             "Dry-run the backfills a definition change would need between two revisions and report the rows they would change.",
             "query",
@@ -1003,22 +1024,6 @@ fn experimental_entries() -> Vec<CapabilityEntry> {
             "query",
             "sekai.ListOntologyClassesRequest",
             "sekai.ListOntologyClassesResponse",
-            "read",
-        ),
-        capability_entry(
-            RUN_TRANSFORM_CHAIN_TOOL,
-            "Run one registered transform chain as a governed, receipted operation.",
-            "action",
-            "sekai.RunTransformChainRequest",
-            "sekai.RunTransformChainResponse",
-            "write",
-        ),
-        capability_entry(
-            GET_TRANSFORM_CHAIN_RUN_TOOL,
-            "Read the status and receipt of one transform chain run.",
-            "query",
-            "sekai.GetTransformChainRunRequest",
-            "sekai.GetTransformChainRunResponse",
             "read",
         ),
     ]
@@ -1258,6 +1263,9 @@ mod tests {
                 GET_LINEAGE_TOOL,
                 GET_CLASS_TOOL,
                 NEIGHBORHOOD_TOOL,
+                PREVIEW_TRANSFORM_TOOL,
+                RUN_TRANSFORM_CHAIN_TOOL,
+                GET_TRANSFORM_CHAIN_RUN_TOOL,
             ]
         );
         assert_eq!(
