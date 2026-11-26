@@ -26,7 +26,7 @@ template.
 | `SEKAI_SOCKET` | `./data/sekai.sock` | Unix socket path; set empty to disable |
 | `OPS_BIND` | `127.0.0.1` | Health, metrics, and operator console bind address |
 | `OPS_PORT` | `9464` | Health, metrics, and console port; set empty to disable |
-| `SEKAI_HTTP_BIND` | `127.0.0.1` | HTTP/JSON projection of stable gRPC; loopback unless `SEKAI_ALLOW_PLAINTEXT=1` |
+| `SEKAI_HTTP_BIND` | `127.0.0.1` | HTTP/JSON projection of stable gRPC and `POST /mcp`. Beyond loopback it serves TLS with `SEKAI_TLS_CERT`/`SEKAI_TLS_KEY` (and requires a client certificate when `SEKAI_TLS_CLIENT_CA` is set), or plaintext under `SEKAI_ALLOW_PLAINTEXT=1`, where `/mcp` is refused |
 | `SEKAI_HTTP_PORT` | `50080` | HTTP/JSON projection port; set empty to disable. Not the gateway and not `OPS_PORT` |
 | `SEKAI_INSECURE` | unset | Set `1` only for unauthenticated local development |
 | `SEKAI_EXPERIMENTAL_RPCS` | unset | Set `1` to invoke RPCs classified `experimental` or `remove`; off by default. See [rpc-maturity.md](rpc-maturity.md). |

@@ -3,6 +3,11 @@
 //! Routes are the proto service paths. Bodies are proto3 JSON of the same
 //! messages. Authorization, maturity, and hidden-row rules stay on the
 //! existing interceptors and service impls. Streaming RPCs stay on gRPC.
+//!
+//! The listener serves TLS with the gRPC certificate when `SEKAI_TLS_CERT` and
+//! `SEKAI_TLS_KEY` are set (#3172). `/mcp` is served only over TLS or on a
+//! loopback bind, and each MCP tool call is authorized by the interceptor
+//! against that tool's RPC path, as on gRPC.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -20,7 +25,7 @@ use tokio::net::TcpListener;
 use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::combined_stores::CombinedStoreLayout;
 use crate::config::{Config, GrpcTcpMode};
@@ -55,12 +60,27 @@ pub struct HttpProjectionState<I> {
     chisei: Arc<ChiseiServiceImpl>,
     interceptor: I,
     stores: Option<Arc<CombinedStoreLayout>>,
+    /// Why `/mcp` is refused on this listener, when it is.
+    mcp_refusal: Option<&'static str>,
 }
+
+/// `/mcp` carries bearer credentials, so it is refused on a plaintext
+/// listener that is reachable beyond loopback, even when the RPC routes run
+/// there under `SEKAI_ALLOW_PLAINTEXT=1`.
+const MCP_NEEDS_TLS: &str =
+    "MCP on a non-loopback HTTP listener requires TLS; set SEKAI_TLS_CERT and SEKAI_TLS_KEY";
+
+/// The RPC path `/mcp` authenticates before any tool runs: listing tools reads
+/// the namespace's capability catalog.
+const MCP_DOOR_RPC: &str = "/sekai.SekaiService/DiscoverCapabilities";
 
 pub fn should_bind(config: &Config, tcp_mode: &GrpcTcpMode) -> bool {
     config.http_port.is_some() && (tcp_mode.token_auth_mode || config.insecure)
 }
 
+/// Refuse a bind that would put credentials on the network unprotected. A
+/// non-loopback bind needs TLS, or `SEKAI_ALLOW_PLAINTEXT=1` for the RPC routes
+/// only (`/mcp` stays refused there).
 pub fn validate_bind(bind: &str, config: &Config) -> Result<(), String> {
     if is_loopback(bind) {
         return Ok(());
@@ -68,13 +88,70 @@ pub fn validate_bind(bind: &str, config: &Config) -> Result<(), String> {
     if config.insecure {
         return Err("SEKAI_HTTP_BIND must be loopback when SEKAI_INSECURE=1".into());
     }
-    if !config.allow_plaintext {
-        return Err(
-            "non-loopback HTTP projection requires SEKAI_ALLOW_PLAINTEXT=1; TLS is not hosted on this listener"
-                .into(),
-        );
+    if tls_configured(config) || config.allow_plaintext {
+        return Ok(());
     }
-    Ok(())
+    Err("non-loopback HTTP projection requires TLS (SEKAI_TLS_CERT and SEKAI_TLS_KEY) or SEKAI_ALLOW_PLAINTEXT=1".into())
+}
+
+/// Whether the projection serves TLS: the gRPC certificate and key are both
+/// set. A half-set pair is refused by the gRPC listener's own policy.
+pub fn tls_configured(config: &Config) -> bool {
+    let set = |value: &Option<String>| value.as_deref().is_some_and(|v| !v.trim().is_empty());
+    set(&config.tls_cert) && set(&config.tls_key)
+}
+
+/// The projection's TLS acceptor from the gRPC certificate and key, requiring
+/// a client certificate signed by `client_ca` when one is set, as gRPC does.
+/// Unreadable or invalid files fail here, before listen.
+pub fn tls_acceptor(
+    cert: &str,
+    key: &str,
+    client_ca: Option<&str>,
+) -> Result<tokio_rustls::TlsAcceptor, std::io::Error> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let invalid = |what: &str, error: &dyn std::fmt::Display| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{what}: {error}"))
+    };
+    let chain = CertificateDer::pem_file_iter(cert)
+        .and_then(|certs| certs.collect::<Result<Vec<_>, _>>())
+        .map_err(|error| invalid("SEKAI_TLS_CERT", &error))?;
+    let key =
+        PrivateKeyDer::from_pem_file(key).map_err(|error| invalid("SEKAI_TLS_KEY", &error))?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|error| invalid("TLS", &error))?;
+    let builder = match client_ca.filter(|path| !path.trim().is_empty()) {
+        Some(path) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for ca in CertificateDer::pem_file_iter(path)
+                .map_err(|error| invalid("SEKAI_TLS_CLIENT_CA", &error))?
+            {
+                roots
+                    .add(ca.map_err(|error| invalid("SEKAI_TLS_CLIENT_CA", &error))?)
+                    .map_err(|error| invalid("SEKAI_TLS_CLIENT_CA", &error))?;
+            }
+            let verifier =
+                rustls::server::WebPkiClientVerifier::builder_with_provider(roots.into(), provider)
+                    .build()
+                    .map_err(|error| invalid("SEKAI_TLS_CLIENT_CA", &error))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let mut config = builder
+        .with_single_cert(chain, key)
+        .map_err(|error| invalid("SEKAI_TLS_CERT", &error))?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Why `/mcp` is refused on a listener at `bind`: plaintext beyond loopback.
+fn mcp_refusal(bind: &str, tls: bool) -> Option<&'static str> {
+    (!tls && !is_loopback(bind)).then_some(MCP_NEEDS_TLS)
 }
 
 fn is_loopback(bind: &str) -> bool {
@@ -92,6 +169,7 @@ where
         .with_state(state)
 }
 
+/// Bind the projection without TLS. See [`bind_and_spawn_with_tls`].
 pub async fn bind_and_spawn<I>(
     bind: &str,
     port: u16,
@@ -103,25 +181,90 @@ pub async fn bind_and_spawn<I>(
 where
     I: Interceptor + Clone + Send + Sync + 'static,
 {
+    bind_and_spawn_with_tls(bind, port, sekai, chisei, interceptor, stores, None).await
+}
+
+/// Bind the projection, serving TLS through `tls` when given. `/mcp` is
+/// refused unless the listener has TLS or the bind is loopback.
+pub async fn bind_and_spawn_with_tls<I>(
+    bind: &str,
+    port: u16,
+    sekai: Arc<SekaiServiceImpl>,
+    chisei: Arc<ChiseiServiceImpl>,
+    interceptor: I,
+    stores: Arc<CombinedStoreLayout>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) -> Result<std::net::SocketAddr, Box<dyn std::error::Error>>
+where
+    I: Interceptor + Clone + Send + Sync + 'static,
+{
     let listener = TcpListener::bind((bind, port)).await?;
     let addr = listener.local_addr()?;
+    let mcp_refusal = mcp_refusal(bind, tls.is_some());
+    if let Some(reason) = mcp_refusal {
+        warn!(addr = %addr, reason, "HTTP projection refuses /mcp");
+    }
     let app = router(HttpProjectionState {
         sekai,
         chisei,
         interceptor,
         stores: Some(stores),
+        mcp_refusal,
     });
     info!(
         addr = %addr,
         contract = HTTP_PROJECTION_CONTRACT,
+        tls = tls.is_some(),
         "HTTP/JSON projection of stable gRPC listening"
     );
-    tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, app).await {
-            error!(error = %err, "HTTP projection listener exited");
+    match tls {
+        None => {
+            tokio::spawn(async move {
+                if let Err(err) = axum::serve(listener, app).await {
+                    error!(error = %err, "HTTP projection listener exited");
+                }
+            });
         }
-    });
+        Some(acceptor) => {
+            tokio::spawn(serve_tls(listener, acceptor, app));
+        }
+    }
     Ok(addr)
+}
+
+/// Accept TLS connections and serve `app` on each. A handshake runs in its own
+/// task, so a slow or failed handshake never blocks the next accept.
+async fn serve_tls(listener: TcpListener, acceptor: tokio_rustls::TlsAcceptor, app: Router) {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::server::conn::auto::Builder;
+    use hyper_util::service::TowerToHyperService;
+
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                warn!(error = %err, "HTTP projection accept failed");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            let stream = match acceptor.accept(stream).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    warn!(peer = %peer, error = %err, "HTTP projection TLS handshake failed");
+                    return;
+                }
+            };
+            if let Err(err) = Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), TowerToHyperService::new(app))
+                .await
+            {
+                warn!(peer = %peer, error = %err, "HTTP projection connection ended");
+            }
+        });
+    }
 }
 
 async fn rpc_handler<I>(
@@ -134,7 +277,7 @@ where
     I: Interceptor + Clone + Send + Sync + 'static,
 {
     let path = format!("/{service}/{method}");
-    let authenticated = match authenticate(&state.interceptor, &headers) {
+    let authenticated = match authenticate(&state.interceptor, &headers, None) {
         Ok(request) => request,
         Err(status) => return status_response(status),
     };
@@ -165,10 +308,17 @@ async fn mcp_handler<I>(
 where
     I: Interceptor + Clone + Send + Sync + 'static,
 {
-    let authenticated = match authenticate(&state.interceptor, &headers) {
-        Ok(request) => request.into_parts().0,
+    if let Some(reason) = state.mcp_refusal {
+        return status_response(Status::failed_precondition(reason));
+    }
+    // The door: no tool runs, and no tool is listed, for a caller the
+    // interceptor refuses for the catalog read. Each tool call is then
+    // authorized again for its own RPC.
+    let door = match authenticate(&state.interceptor, &headers, Some(MCP_DOOR_RPC)) {
+        Ok(request) => request,
         Err(status) => return status_response(status),
     };
+    let authenticated = door.metadata().clone();
     let message = match serde_json::from_slice::<Value>(&body) {
         Ok(value) => value,
         Err(error) => {
@@ -189,6 +339,9 @@ where
     let surface = HttpMcpSurface {
         sekai: state.sekai.clone(),
         chisei: state.chisei.clone(),
+        interceptor: state.interceptor.clone(),
+        headers,
+        door: crate::mcp_adapter::CallerIdentity::authenticated(door),
         principal,
         namespace,
     };
@@ -198,16 +351,23 @@ where
     }
 }
 
-fn authenticate<I>(interceptor: &I, headers: &HeaderMap) -> Result<Request<()>, Status>
+/// Run the interceptor on the caller's headers. `rpc_path` is the server-chosen
+/// RPC the request is authorized for; enterprise-scoped credentials are
+/// refused without one.
+fn authenticate<I>(
+    interceptor: &I,
+    headers: &HeaderMap,
+    rpc_path: Option<&str>,
+) -> Result<Request<()>, Status>
 where
     I: Interceptor + Clone,
 {
     let mut interceptor = interceptor.clone();
-    interceptor.call(Request::from_parts(
-        headers_to_metadata(headers),
-        Default::default(),
-        (),
-    ))
+    let mut request = Request::from_parts(headers_to_metadata(headers), Default::default(), ());
+    if let Some(path) = rpc_path {
+        crate::grpc::rpc_identity::set_server_rpc_path(&mut request, path);
+    }
+    interceptor.call(request)
 }
 
 async fn dispatch<I>(
@@ -1117,15 +1277,24 @@ fn grpc_code_name(code: tonic::Code) -> &'static str {
     }
 }
 
-struct HttpMcpSurface {
+/// MCP over the projection. The catalog read runs as the door's identity;
+/// each tool call re-runs the interceptor on the caller's original headers
+/// for that tool's RPC path and dispatches as the identity it returns.
+struct HttpMcpSurface<I> {
     sekai: Arc<SekaiServiceImpl>,
     chisei: Arc<ChiseiServiceImpl>,
+    interceptor: I,
+    headers: HeaderMap,
+    door: crate::mcp_adapter::CallerIdentity,
     principal: String,
     namespace: String,
 }
 
 #[async_trait::async_trait]
-impl NativeSurface for HttpMcpSurface {
+impl<I> NativeSurface for HttpMcpSurface<I>
+where
+    I: Interceptor + Clone + Send + Sync + 'static,
+{
     async fn discover(
         &self,
     ) -> Result<crate::mcp_adapter::CatalogSnapshot, crate::mcp_adapter::AdapterError> {
@@ -1139,6 +1308,7 @@ impl NativeSurface for HttpMcpSurface {
             page_size: 200,
             ..Default::default()
         });
+        self.door.apply(&mut request);
         bind_identity(&mut request, &self.principal, &self.namespace);
         let response = self
             .sekai
@@ -1165,12 +1335,19 @@ impl NativeSurface for HttpMcpSurface {
         rpc: crate::mcp_adapter::NativeRpc,
         invocation: crate::capability_projection::SdkInvocation,
     ) -> Result<Value, crate::mcp_adapter::AdapterError> {
-        crate::mcp_adapter::dispatch_native(
+        use crate::mcp_adapter::{CallerIdentity, dispatch_native_as, status_error};
+
+        let path = format!("/{}/{}", rpc.service_name(), rpc.rpc_name());
+        let caller = authenticate(&self.interceptor, &self.headers, Some(&path))
+            .map(CallerIdentity::authenticated)
+            .map_err(status_error)?;
+        dispatch_native_as(
             &self.sekai,
             &self.chisei,
             rpc,
             invocation,
             experimental_rpcs_enabled(),
+            &caller,
         )
         .await
     }
@@ -1261,6 +1438,16 @@ mod tests {
             .unwrap();
         let store = Arc::new(PrincipalCredentialStore::new());
         store.load(&db.list_active_credentials().unwrap());
+        let (sekai, chisei) = services_for(db.clone());
+        (
+            sekai,
+            chisei,
+            TokenAuthInterceptor::new(store, crate::db::store::SekaiStore::from_shared_runtime(db)),
+            token.into(),
+        )
+    }
+
+    fn services_for(db: Arc<RuntimeDb>) -> (Arc<SekaiServiceImpl>, Arc<ChiseiServiceImpl>) {
         let sekai_store = crate::db::store::SekaiStore::from_shared_runtime(db.clone());
         let chisei_store = crate::chisei_store::ChiseiStore::from_shared_runtime(db.clone());
         let budget = Arc::new(BudgetTracker::new(chisei_store.clone()));
@@ -1279,12 +1466,7 @@ mod tests {
                 ))
                 .unwrap(),
         );
-        (
-            sekai,
-            chisei,
-            TokenAuthInterceptor::new(store, crate::db::store::SekaiStore::from_shared_runtime(db)),
-            token.into(),
-        )
+        (sekai, chisei)
     }
 
     fn router_for(
@@ -1297,6 +1479,7 @@ mod tests {
             chisei,
             interceptor,
             stores: None,
+            mcp_refusal: None,
         })
     }
 
@@ -1797,6 +1980,261 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{payload}");
+    }
+
+    #[test]
+    fn a_non_loopback_bind_needs_tls_or_explicit_plaintext() {
+        let mut config = fixture_config();
+        assert!(validate_bind("0.0.0.0", &config).is_err());
+        config.tls_cert = Some("cert.pem".into());
+        config.tls_key = Some("key.pem".into());
+        assert!(validate_bind("0.0.0.0", &config).is_ok());
+        assert_eq!(mcp_refusal("0.0.0.0", true), None);
+        // Plaintext beyond loopback keeps the RPC routes and refuses `/mcp`.
+        assert_eq!(mcp_refusal("0.0.0.0", false), Some(MCP_NEEDS_TLS));
+        assert_eq!(mcp_refusal("127.0.0.1", false), None);
+    }
+
+    #[tokio::test]
+    async fn mcp_on_a_plaintext_listener_beyond_loopback_is_refused_before_auth() {
+        let (sekai, chisei, interceptor, token) = token_world();
+        let app = router(HttpProjectionState {
+            sekai,
+            chisei,
+            interceptor,
+            stores: None,
+            mcp_refusal: mcp_refusal("0.0.0.0", false),
+        });
+        let (status, payload) = http_json(
+            app,
+            "/mcp",
+            Some(&token),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{payload}");
+        assert!(payload.to_string().contains("requires TLS"), "{payload}");
+    }
+
+    const ENTERPRISE_TOKEN: &str = "enterprise-bearer";
+
+    /// An installed identity provider: one bearer for `erin` in `tenant-a`,
+    /// which may use namespace `acme` only.
+    struct OneTenantExtension;
+
+    impl crate::enterprise::EnterpriseExtension for OneTenantExtension {
+        fn authenticate_bearer(
+            &self,
+            bearer_token: &str,
+        ) -> Result<crate::enterprise::AuthenticatedPrincipal, crate::enterprise::ExtensionError>
+        {
+            (bearer_token == ENTERPRISE_TOKEN)
+                .then(|| crate::enterprise::AuthenticatedPrincipal {
+                    subject: "erin".into(),
+                    credential_id: "erin-credential".into(),
+                })
+                .ok_or(crate::enterprise::ExtensionError::CredentialNotFound)
+        }
+
+        fn authenticate_context(
+            &self,
+            bearer_token: &str,
+        ) -> Result<crate::enterprise::AuthenticatedContext, crate::enterprise::ExtensionError>
+        {
+            let principal = self.authenticate_bearer(bearer_token)?;
+            Ok(crate::enterprise::AuthenticatedContext {
+                contract_version: crate::enterprise::IDENTITY_EXTENSION_VERSION,
+                home_tenant: None,
+                tenant: Some(self.tenant_context(&principal)?),
+                principal,
+                credential_kind: crate::enterprise::CredentialKind::HumanSession,
+                space: None,
+                space_role: None,
+                act: None,
+                scopes: vec!["sekai.read".into()],
+                issuer: "https://issuer.test".into(),
+                resource: "https://sekai.test".into(),
+                expires_at: i64::MAX,
+                device: None,
+            })
+        }
+
+        fn tenant_context(
+            &self,
+            principal: &crate::enterprise::AuthenticatedPrincipal,
+        ) -> Result<crate::enterprise::TenantContext, crate::enterprise::ExtensionError> {
+            Ok(crate::enterprise::TenantContext {
+                tenant_id: "tenant-a".into(),
+                subject: principal.subject.clone(),
+            })
+        }
+
+        fn authorize_namespace(
+            &self,
+            _context: &crate::enterprise::TenantContext,
+            namespace: &str,
+            _action: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            (namespace == "acme")
+                .then_some(())
+                .ok_or(crate::enterprise::ExtensionError::PermissionDenied)
+        }
+
+        fn authorize_unscoped_namespace(
+            &self,
+            _principal: &crate::enterprise::AuthenticatedPrincipal,
+            _namespace: &str,
+            _action: crate::enterprise::NamespaceAction,
+        ) -> Result<(), crate::enterprise::ExtensionError> {
+            Err(crate::enterprise::ExtensionError::PermissionDenied)
+        }
+    }
+
+    /// A projection under enterprise auth with one object `erin` may read.
+    fn enterprise_router() -> Router {
+        let db = Arc::new(RuntimeDb::Sqlite(Arc::new(
+            SekaiDb::new_with_enterprise_extension(":memory:", Some(Arc::new(OneTenantExtension)))
+                .unwrap(),
+        )));
+        crate::chisei_store::apply_chisei_schema(&db);
+        db.ensure_team_namespace("acme", "erin", Role::Admin, "local")
+            .unwrap();
+        db.create_object(&sekai_domain::domain::Object {
+            id: "ticket-1".into(),
+            kind: "ticket".into(),
+            name: "first".into(),
+            namespace: "acme".into(),
+            external_id: String::new(),
+            properties: Default::default(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+        let (sekai, chisei) = services_for(db.clone());
+        router_for(
+            sekai,
+            chisei,
+            TokenAuthInterceptor::new(
+                Arc::new(PrincipalCredentialStore::new()),
+                crate::db::store::SekaiStore::from_shared_runtime(db),
+            ),
+        )
+    }
+
+    async fn mcp_call(app: Router, token: Option<&str>, tool: &str, input: Value) -> Value {
+        let (status, payload) = http_json_with(
+            app,
+            "/mcp",
+            token,
+            &[],
+            json!({
+                "jsonrpc":"2.0",
+                "id":2,
+                "method":"tools/call",
+                "params":{"name": tool, "arguments":{"operation_id":"op-1","input": input}}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        payload["result"].clone()
+    }
+
+    #[tokio::test]
+    async fn an_enterprise_credential_reaches_mcp_tools_authorized_per_tool() {
+        let app = enterprise_router();
+        let (status, payload) = http_json_with(
+            app.clone(),
+            "/mcp",
+            Some(ENTERPRISE_TOKEN),
+            &[],
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+
+        // The handler sees the enterprise authenticated context, so the read
+        // runs as erin in tenant-a; without it the plane refuses the read.
+        let read = mcp_call(
+            app.clone(),
+            Some(ENTERPRISE_TOKEN),
+            "sekai.objects.get",
+            json!({"id":"ticket-1"}),
+        )
+        .await;
+        assert_eq!(read["isError"], false, "{read}");
+        assert!(read.to_string().contains("ticket-1"), "{read}");
+
+        // Admitted at the door is not admitted for every tool: GetLineage is
+        // not served to enterprise-scoped credentials.
+        let lineage = mcp_call(
+            app.clone(),
+            Some(ENTERPRISE_TOKEN),
+            "sekai.lineage.get",
+            json!({"object_id":"ticket-1"}),
+        )
+        .await;
+        assert_eq!(lineage["isError"], true, "{lineage}");
+        assert!(
+            lineage
+                .to_string()
+                .contains("not available to enterprise-scoped credentials"),
+            "{lineage}"
+        );
+
+        let (status, _) = http_json_with(
+            app,
+            "/mcp",
+            Some("some-other-bearer"),
+            &[],
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_projection_serves_mcp_over_tls_with_the_grpc_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_path = dir.path().join("tls.crt");
+        let key_path = dir.path().join("tls.key");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        let acceptor = tls_acceptor(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let (sekai, chisei, interceptor, token) = token_world();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve_tls(
+            listener,
+            acceptor,
+            router_for(sekai, chisei, interceptor),
+        ));
+        let client = reqwest::Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(cert.cert.pem().as_bytes()).unwrap(),
+            )
+            .build()
+            .unwrap();
+        let response = client
+            .post(format!("https://localhost:{port}/mcp"))
+            .bearer_auth(&token)
+            .header("x-sekai-namespace", "acme")
+            .json(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let plaintext = reqwest::Client::new()
+            .post(format!("http://localhost:{port}/mcp"))
+            .bearer_auth(&token)
+            .send()
+            .await;
+        assert!(plaintext.is_err(), "a plaintext request must not be served");
     }
 
     #[tokio::test]

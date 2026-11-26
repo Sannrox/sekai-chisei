@@ -42,6 +42,16 @@ use tower::Layer;
 const AUTH_SOURCE_HEADER: &str = "x-sekai-auth-source";
 const CREDENTIAL_ID_HEADER: &str = "x-sekai-credential-id";
 const TENANT_CONTEXT_HEADER: &str = "x-sekai-tenant-id";
+
+/// The metadata the interceptor writes after it strips any caller-sent copy:
+/// the identity a handler trusts. An in-process caller that authenticated a
+/// request carries exactly these onto the request it dispatches.
+pub(crate) const AUTHENTICATED_METADATA: [&str; 4] = [
+    "x-principal",
+    AUTH_SOURCE_HEADER,
+    CREDENTIAL_ID_HEADER,
+    TENANT_CONTEXT_HEADER,
+];
 /// Caller metadata that the community authentication boundary accepts as
 /// authority-bearing. Tenant hints are stripped and therefore absent here.
 pub const COMMUNITY_ACCEPTED_AUTHORITY_METADATA_KEYS: &[&str] = &["authorization", "x-principal"];
@@ -1513,8 +1523,15 @@ pub fn run_for_plane(
                 .expect("HTTP projection bind requires SEKAI_HTTP_PORT");
             crate::http_projection::validate_bind(&config.http_bind, &config)
                 .map_err(std::io::Error::other)?;
+            // The projection serves TLS with the gRPC certificate (#3172).
+            let http_tls = match (&config.tls_cert, &config.tls_key) {
+                (Some(cert), Some(key)) if crate::http_projection::tls_configured(&config) => Some(
+                    crate::http_projection::tls_acceptor(cert, key, client_ca_path().as_deref())?,
+                ),
+                _ => None,
+            };
             if tcp_mode.token_auth_mode {
-                crate::http_projection::bind_and_spawn(
+                crate::http_projection::bind_and_spawn_with_tls(
                     &config.http_bind,
                     http_port,
                     sekai_svc.clone(),
@@ -1526,10 +1543,11 @@ pub fn run_for_plane(
                     )
                     .with_actor_rate_gate(actor_rate_gate.clone()),
                     stores.clone(),
+                    http_tls,
                 )
                 .await?;
             } else {
-                crate::http_projection::bind_and_spawn(
+                crate::http_projection::bind_and_spawn_with_tls(
                     &config.http_bind,
                     http_port,
                     sekai_svc.clone(),
@@ -1541,6 +1559,7 @@ pub fn run_for_plane(
                         actor_rate_gate.clone(),
                     ),
                     stores.clone(),
+                    http_tls,
                 )
                 .await?;
             }

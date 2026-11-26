@@ -14,3 +14,6 @@ spec:
     - name: ops
       port: 9464
       targetPort: ops
+    - name: http
+      port: 50080
+      targetPort: http
