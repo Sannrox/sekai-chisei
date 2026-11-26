@@ -5,7 +5,7 @@
 - Owners: @Sannrox
 - Issue: https://github.com/Sannrox/sekai-chisei/issues/3088 (#3088)
 - Supersedes: none
-- Superseded by: none
+- Superseded by: [ADR 0171](0171-a-series-read-needs-the-property-and-the-samples-dataset.md) for the access clause only
 - Related: [ADR 0027](0027-explicit-property-grants.md), [ADR 0030](0030-row-scoped-query-access.md), [ADR 0046](0046-bounded-source-health.md)
 
 ## Context

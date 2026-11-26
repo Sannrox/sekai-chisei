@@ -564,6 +564,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "ReadObjectSeries",
+      "storage_path": "sekai.datasets, sekai.graph",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "UpdateObject",
       "storage_path": "sekai.graph",
       "real_backend": "yes",

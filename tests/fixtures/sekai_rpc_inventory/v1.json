@@ -859,6 +859,20 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "ReadObjectSeries",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets",
+        "sekai.graph"
+      ],
+      "evidence": [
+        "src/grpc/object_series_rpc.rs",
+        "crates/sekai-core/src/db/series_samples.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "UpdateObject",
       "kind": "persistent",
       "surfaces": [

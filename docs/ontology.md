@@ -101,6 +101,20 @@ stored definition JSON when empty, so existing definitions keep their bytes
 and digests. Generated clients type the value as a string. A struct field
 cannot be a series, and a local twin cannot generate a required one.
 
+`ReadObjectSeries` (experimental, ADR 0171) reads one object's series over
+`[start_ms, end_ms)` for a target point count. Within the target it returns
+the samples, oldest first; past it, one bucket per fixed-width slice with
+start, count, min, max and mean. The reader needs the property, as
+`GetObject` shows it, and the samples dataset: its grant and markings, every
+sample column readable, and every sample column released to its egress. A
+withheld or unset property fails `NOT_FOUND` "series not found". Every
+dataset refusal is the same `PERMISSION_DENIED` "series dataset access
+denied". Timestamps are integer milliseconds and values finite numbers;
+another stored sample fails `series_sample_invalid`. A target above 10,000
+points is lowered to it. A range holding more than 1,000,000 samples fails
+`series_scan_cap_exceeded`, and a quarantined samples dataset fails
+`series_dataset_quarantined`.
+
 Document versions:
 
 - Domain: `sekai.ontology-product/v1` (`tests/fixtures/product_loop/domain-v1.json`).

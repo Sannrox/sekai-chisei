@@ -196,4 +196,5 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0168: Tenant and namespace quota assignments](0168-tenant-and-namespace-quota-assignments.md)
 - [ADR 0169: A namespace package is a signed manifest of its governed resources](0169-namespace-packages.md)
 - [ADR 0170: Sandboxed change capture and the replication slot lifecycle](0170-sandboxed-change-capture-and-slot-lifecycle.md)
+- [ADR 0171: A series read needs the property and the samples dataset](0171-a-series-read-needs-the-property-and-the-samples-dataset.md)
 <!-- adr-index:end -->

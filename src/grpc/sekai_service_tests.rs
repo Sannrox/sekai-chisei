@@ -6334,6 +6334,284 @@ async fn series_property_round_trips_its_samples_dataset() {
     .unwrap();
 }
 
+/// `ReadObjectSeries` (#3472, ADR 0171): the property read and the samples
+/// dataset read must both pass, and every dataset refusal looks the same.
+#[tokio::test]
+async fn read_object_series_needs_the_property_and_the_samples_dataset() {
+    use crate::sekai::object_security::{
+        OBJECT_SECURITY_POLICY_VERSION, ObjectSecurityOperation, ObjectSecurityPolicy,
+        ObjectSecurityPredicate, ObjectSecurityRule, PropertyGrant, PropertyGrantAccess,
+    };
+    use std::collections::BTreeMap;
+
+    let mut svc = service();
+    grant_schema_admin(&svc);
+    let series_property = |name: &str, dataset: &str| PropertyDef {
+        name: name.into(),
+        r#type: "series".into(),
+        required: false,
+        description: "".into(),
+        enum_values: vec![],
+        link_kind: "".into(),
+        compute_expr: "".into(),
+        classification: "public".into(),
+        struct_fields: vec![],
+        series_dataset: dataset.into(),
+    };
+    let mut widget = widget_schema_type();
+    widget
+        .properties
+        .push(series_property("temperature", "sensor-samples"));
+    widget
+        .properties
+        .push(series_property("humidity", "missing-samples"));
+    svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+        r#type: Some(widget),
+    }))
+    .await
+    .unwrap();
+    let runtime = svc.db.runtime();
+    for (id, kind, properties) in [
+        (
+            "probe",
+            "widget",
+            HashMap::from([
+                ("name".to_string(), "probe".to_string()),
+                ("temperature".to_string(), "probe-7".to_string()),
+                ("humidity".to_string(), "probe-7".to_string()),
+            ]),
+        ),
+        (
+            "unset-probe",
+            "widget",
+            HashMap::from([("name".to_string(), "unset".to_string())]),
+        ),
+        ("hub", "hub", HashMap::new()),
+    ] {
+        runtime
+            .create_object(&domain::Object {
+                id: id.into(),
+                kind: kind.into(),
+                name: id.into(),
+                namespace: "plant".into(),
+                external_id: format!("{kind}:{id}"),
+                properties,
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+    runtime
+        .create_dataset(&crate::sekai::dataset::Dataset {
+            id: "sensor-samples".into(),
+            name: "sensor-samples".into(),
+            columns: [
+                ("series_id", "public"),
+                ("timestamp", "public"),
+                ("value", "internal"),
+            ]
+            .map(|(name, classification)| crate::sekai::dataset::ColumnDef {
+                name: name.into(),
+                col_type: "string".into(),
+                classification: classification.into(),
+            })
+            .into(),
+            object_id: "hub".into(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+    let rows = [
+        ("probe-7", 10, "1"),
+        ("probe-7", 20, "2"),
+        ("probe-7", 30, "4"),
+        ("probe-7", 100, "9"),
+        ("probe-8", 15, "50"),
+    ]
+    .map(|(series_id, timestamp, value)| {
+        HashMap::from([
+            ("series_id".to_string(), series_id.to_string()),
+            ("timestamp".to_string(), timestamp.to_string()),
+            ("value".to_string(), value.to_string()),
+        ])
+    });
+    runtime.append_rows("sensor-samples", &rows).unwrap();
+    async fn read(
+        svc: &SekaiServiceImpl,
+        object_id: &str,
+        property: &str,
+        target_points: u32,
+    ) -> Result<Response<ReadObjectSeriesResponse>, Status> {
+        svc.read_object_series(with_principal(ReadObjectSeriesRequest {
+            object_id: object_id.into(),
+            property: property.into(),
+            start_ms: 0,
+            end_ms: 40,
+            target_points,
+        }))
+        .await
+    }
+    /// Activates `grants` (kind, readable properties) as plant's policies.
+    fn activate(svc: &SekaiServiceImpl, step: &str, grants: [(&str, &[&str]); 2]) {
+        let runtime = svc.db.runtime();
+        let revisions = grants.map(|(kind, properties)| {
+            let policy = ObjectSecurityPolicy {
+                contract_version: OBJECT_SECURITY_POLICY_VERSION.into(),
+                namespace: "plant".into(),
+                kind: kind.into(),
+                rules: vec![ObjectSecurityRule {
+                    operation: ObjectSecurityOperation::Read,
+                    predicates: vec![ObjectSecurityPredicate::AllowAll],
+                }],
+                property_grants: Some(
+                    properties
+                        .iter()
+                        .map(|property| PropertyGrant {
+                            property: property.to_string(),
+                            access: PropertyGrantAccess::Read,
+                        })
+                        .collect(),
+                ),
+                value_instance_grants: None,
+                required_purpose: None,
+            };
+            let revision = runtime
+                .put_object_security_policy(&policy, "root", &format!("put-{step}-{kind}"), 1)
+                .unwrap();
+            (kind.to_string(), revision.revision_digest)
+        });
+        runtime
+            .activate_object_security_policies(
+                "plant",
+                &BTreeMap::from(revisions),
+                "root",
+                &format!("activate-{step}"),
+                2,
+            )
+            .unwrap();
+    }
+
+    // Within the target: the samples in range, oldest first.
+    let raw = read(&svc, "probe", "temperature", 10)
+        .await
+        .unwrap()
+        .into_inner();
+    let points: Vec<_> = raw
+        .samples
+        .iter()
+        .map(|sample| (sample.timestamp_ms, sample.value))
+        .collect();
+    assert_eq!(points, [(10, 1.0), (20, 2.0), (30, 4.0)]);
+    assert!(raw.buckets.is_empty());
+    // Over the target: at most that many buckets, spikes kept by min and max.
+    let bucketed = read(&svc, "probe", "temperature", 2)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(bucketed.samples.is_empty());
+    assert_eq!(bucketed.bucket_width_ms, 20);
+    assert_eq!(
+        bucketed.buckets,
+        [
+            SeriesBucket {
+                start_ms: 0,
+                count: 1,
+                min: 1.0,
+                max: 1.0,
+                mean: 1.0,
+            },
+            SeriesBucket {
+                start_ms: 20,
+                count: 2,
+                min: 2.0,
+                max: 4.0,
+                mean: 3.0,
+            },
+        ]
+    );
+
+    let refusal = |status: Status| (status.code(), status.message().to_string());
+    let not_found = (tonic::Code::NotFound, "series not found".to_string());
+    let denied = (
+        tonic::Code::PermissionDenied,
+        "series dataset access denied".to_string(),
+    );
+    assert_eq!(
+        refusal(
+            read(&svc, "unset-probe", "temperature", 10)
+                .await
+                .unwrap_err()
+        ),
+        not_found
+    );
+    assert_eq!(
+        read(&svc, "probe", "name", 10).await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        read(&svc, "absent", "temperature", 10)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    // A dataset that does not exist is refused like one the caller may not read.
+    assert_eq!(
+        refusal(read(&svc, "probe", "humidity", 10).await.unwrap_err()),
+        denied
+    );
+
+    // Egress that releases only public data withholds the internal values.
+    let egress = crate::composition::gateway_egress_policy::EgressPolicies::new(["edge".into()]);
+    egress
+        .load(
+            "edge",
+            serde_json::json!({
+                "format": "chisei.gateway-policy/v1",
+                "generation": 1,
+                "principals": [
+                    {"name": "tester", "routes": [{"provider": "hosted", "models": ["*"]}]},
+                ],
+                "egress": [{"provider": "hosted", "data_classes": ["public"]}],
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    svc.set_egress_policies(egress);
+    assert_eq!(
+        refusal(read(&svc, "probe", "temperature", 10).await.unwrap_err()),
+        denied
+    );
+    svc.set_egress_policies(crate::composition::gateway_egress_policy::EgressPolicies::new([]));
+
+    // A column grant on the dataset's binding object that leaves out a
+    // sample column refuses the same way, with nothing about its rows.
+    activate(
+        &svc,
+        "columns",
+        [
+            ("hub", &["series_id"]),
+            ("widget", &["name", "temperature", "humidity"]),
+        ],
+    );
+    let err = read(&svc, "probe", "temperature", 10).await.unwrap_err();
+    assert_eq!(refusal(err), denied);
+
+    // A property withheld by grant is absent, exactly like an unset one.
+    activate(
+        &svc,
+        "property",
+        [
+            ("hub", &["series_id", "timestamp", "value"]),
+            ("widget", &["name"]),
+        ],
+    );
+    assert_eq!(
+        refusal(read(&svc, "probe", "temperature", 10).await.unwrap_err()),
+        not_found
+    );
+}
 #[tokio::test]
 async fn struct_property_round_trips_through_create_update_and_list() {
     let svc = service();

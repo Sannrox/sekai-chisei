@@ -133,6 +133,7 @@ pub mod ontology_health_trend;
 pub mod ontology_lint;
 pub mod plan_execution;
 pub mod plan_review;
+pub mod series;
 pub mod sync_scope;
 pub use sekai_types::object_security;
 pub mod decision_memory;
