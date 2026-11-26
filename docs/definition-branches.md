@@ -305,7 +305,9 @@ Classification vocabulary:
 - `compatible`: additive optional properties and new `object_type`,
   `interface_type`, `ontology_class`, `ontology_relation`, or `link_type`
   members. Removing a required constraint without removing the property is
-  compatible.
+  compatible, as are changes to `owner`, `lint_suppressions`, `source_turn`,
+  and the [text fields](#descriptions-and-alternative-names) of object and
+  link types.
 - `conditional`: new `action_type`, `function`, `transform`, `policy`, or
   `control` members, `access_marking` changes, and known field changes such
   as `name` or `mode`. These require live authorization or review before
@@ -538,6 +540,35 @@ with the member through publication, and changing it is a compatible change
 (`changed_source_turn`). Markings are drafted as `access_marking` on the
 member they protect. Agent members do not take `source_turn`: the Agent
 document contract is strict, so an Agent definition carrying it is refused.
+
+#### Descriptions and alternative names
+
+Object and link types can carry human text inside `definition_json`
+(#2298). Every field is optional:
+
+| Field | Value |
+| --- | --- |
+| `description` | one string, at most 1,024 bytes |
+| `alternative_names` | up to 32 distinct names people use for the type, each at most 128 bytes |
+| `property_descriptions` | object type only: declared property to a description |
+| `property_alternative_names` | object type only: declared property to its alternative names |
+| `unreviewed` | paths of texts nobody has reviewed yet: `description`, `alternative_names`, `property_descriptions/<property>`, `property_alternative_names/<property>` |
+
+Texts are non-empty, with no control characters or surrounding whitespace.
+A definition edit is refused when a property key is not in `properties`, or
+when an `unreviewed` path names a text the definition does not hold. A
+reviewer accepts a text by removing its path from `unreviewed`, after
+editing it if needed; there is no accept call. Each remaining path is one
+`unreviewed_text` lint warning ([ontology lint](ontology-lint.md)).
+
+Text never touches facts, so changing any of these fields is compatible
+(`changed_description`, `changed_unreviewed`, and so on). On other member
+kinds the keys are not part of the document and stay unknown fields.
+`GetDefinitionMember` and the published revision reads return the fields as
+part of `definition_json`; there is no separate search call. A plane that
+predates these fields still stores and reads them, but classifies a change
+to a member that carries them as `unknown`, so it refuses that merge until
+the newer version serves it.
 
 Before proposing, the agent can lint the draft with `GetOntologyLintReport`
 and `branch_id` ([ontology lint](ontology-lint.md)). The draft is then an

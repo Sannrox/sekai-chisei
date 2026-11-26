@@ -230,6 +230,7 @@ impl DefinitionMemberInput {
             return Err("definition_json must be a JSON object".into());
         }
         crate::sekai::ontology_lint::suppressions(&self.member_kind, &value)?;
+        crate::sekai::definition_text::validate(&self.member_kind, &value)?;
         validate_source_turn(&value)?;
         // The Agent document contract is strict and read by other services;
         // a turn reference would break their parsing.
