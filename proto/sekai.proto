@@ -7067,7 +7067,7 @@ service SekaiService {
   rpc TickGovernedTransforms(TickGovernedTransformsRequest) returns (TickGovernedTransformsResponse);
   rpc GetTransformOutputState(GetTransformOutputStateRequest) returns (GetTransformOutputStateResponse);
   rpc CancelGovernedTransformRun(CancelGovernedTransformRunRequest) returns (CancelGovernedTransformRunResponse);
-  // Experimental (#2119): a static DAG of governed transforms executed as one
+  // Stable (#2414): a static DAG of governed transforms executed as one
   // receipted operation. Named edges compile at Put; Run walks claims in
   // dependency order through the existing transform runner.
   rpc PutTransformChain(PutTransformChainRequest) returns (PutTransformChainResponse);

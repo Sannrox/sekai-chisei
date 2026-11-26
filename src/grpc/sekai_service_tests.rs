@@ -18112,10 +18112,7 @@ async fn capability_discovery_defaults_to_core_and_requires_explicit_expansion()
         .find(|entry| entry.name == crate::sekai::governed_transform::HOSTED_COMPUTE_CAPABILITY)
         .expect("core catalog reports the in-process transform host");
     assert_eq!(transform.product_tier, "core");
-    assert_eq!(
-        transform.lifecycle_state,
-        if enabled { "active" } else { "disabled" }
-    );
+    assert_eq!(transform.lifecycle_state, "active");
     assert!(transform.description.contains("dataset transform host"));
     let analytical = core
         .capabilities
@@ -18123,10 +18120,13 @@ async fn capability_discovery_defaults_to_core_and_requires_explicit_expansion()
         .find(|entry| entry.name == crate::sekai::governed_transform::ANALYTICAL_COMPUTE_CAPABILITY)
         .expect("core catalog reports the analytical transform profile");
     assert_eq!(analytical.product_tier, "core");
-    assert_eq!(
-        analytical.lifecycle_state,
-        if enabled { "active" } else { "disabled" }
-    );
+    assert_eq!(analytical.lifecycle_state, "active");
+    let scheduler = core
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == crate::sekai::governed_transform::SCHEDULER_COMPUTE_CAPABILITY)
+        .expect("core catalog reports the transform scheduler profile");
+    assert_eq!(scheduler.lifecycle_state, "active");
     let isolated = core
         .capabilities
         .iter()
@@ -18137,6 +18137,19 @@ async fn capability_discovery_defaults_to_core_and_requires_explicit_expansion()
         isolated.lifecycle_state,
         if enabled { "active" } else { "disabled" }
     );
+    let preview = all
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == crate::sekai::governed_transform::PREVIEW_COMPUTE_CAPABILITY)
+        .expect("expanded catalog reports the transform preview profile");
+    assert_eq!(preview.lifecycle_state, "active");
+    let chain = all
+        .capabilities
+        .iter()
+        .find(|entry| entry.name == crate::sekai::transform_chain::CHAIN_COMPUTE_CAPABILITY)
+        .expect("expanded catalog reports the transform chain profile");
+    assert_eq!(chain.lifecycle_state, "active");
+    assert_eq!(chain.product_tier, "experimental");
 }
 
 #[tokio::test]

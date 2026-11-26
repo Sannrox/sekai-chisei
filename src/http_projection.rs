@@ -925,6 +925,78 @@ async fn dispatch<I>(
             })
             .await
         }
+        ("sekai.SekaiService", "PutGovernedTransform") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::put_governed_transform(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ListGovernedTransforms") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::list_governed_transforms(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "PreviewGovernedTransform") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::preview_governed_transform(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "RunGovernedTransform") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::run_governed_transform(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "GetGovernedTransformRun") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_governed_transform_run(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "ListGovernedTransformRuns") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::list_governed_transform_runs(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "CancelGovernedTransformRun") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::cancel_governed_transform_run(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "GetTransformOutputState") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_transform_output_state(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "TickGovernedTransforms") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::tick_governed_transforms(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "PutTransformChain") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::put_transform_chain(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "RunTransformChain") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::run_transform_chain(&*svc, req).await
+            })
+            .await
+        }
+        ("sekai.SekaiService", "GetTransformChainRun") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::get_transform_chain_run(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "CreateCredential") => {
             invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::create_credential(&*svc, req).await

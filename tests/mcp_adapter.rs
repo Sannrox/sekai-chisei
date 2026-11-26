@@ -37,6 +37,9 @@ async fn independent_client_lists_reads_invokes_and_inspects_receipt() {
             "sekai.lineage.get",
             "sekai.ontology.classes.get",
             "sekai.relations.neighborhood",
+            "sekai.transforms.preview",
+            "sekai.transforms.chain.run",
+            "sekai.transforms.chain.status",
             "sekai.agents.memory.list",
             "sekai.datasets.branch.create",
             "sekai.transforms.run_on_branch",
@@ -44,11 +47,8 @@ async fn independent_client_lists_reads_invokes_and_inspects_receipt() {
             "sekai.datasets.branch.propose_merge",
             "sekai.agents.dry_run",
             "sekai.plans.simulate",
-            "sekai.transforms.preview",
             "sekai.definitions.change_bundle.dry_run",
-            "sekai.ontology.classes.list",
-            "sekai.transforms.chain.run",
-            "sekai.transforms.chain.status"
+            "sekai.ontology.classes.list"
         ]
     );
     assert_eq!(report.object_id, "widget-1");

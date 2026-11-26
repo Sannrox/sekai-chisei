@@ -193,13 +193,14 @@ provenance on the receipt (`reported_catalog_version`), not a grant.
 The graph retrieval capabilities advertise
 `epistemic_descriptor_projection` and bounded descriptor source-list limits.
 `DiscoverCapabilities` reports `sekai.transforms.projection`,
-`sekai.transforms.analytical`, and `sekai.transforms.isolated_process` on
-the core pack as governed dataset transform profiles. `lifecycle_state` is
-`disabled` unless the experimental RPC gate is on. Invocation of
-`PutGovernedTransform` / `RunGovernedTransform` /
-`GetGovernedTransformRun` / `ListGovernedTransforms` /
-`ListGovernedTransformRuns` / isolated-process claim RPCs still requires
-that gate. See [governed-transforms.md](governed-transforms.md),
+`sekai.transforms.analytical`, and `sekai.transforms.scheduler` on the core
+pack as `active` governed dataset transform profiles.
+`sekai.transforms.preview` and `sekai.transforms.chain` are also `active`
+(`advanced` and `experimental` product tiers).
+`sekai.transforms.isolated_process` stays `disabled` unless the experimental
+RPC gate is on. Isolated-process claim, ad-hoc, shadow, replay, on-branch,
+streaming, and chain list/get RPCs still require `SEKAI_EXPERIMENTAL_RPCS=1`
+or the `experimental-rpcs` feature. See [governed-transforms.md](governed-transforms.md),
 [ADR 0097](decisions/0097-in-process-transform-host.md),
 [ADR 0101](decisions/0101-analytical-transform-profile.md), and
 [ADR 0102](decisions/0102-isolated-process-transform-profile.md).
@@ -584,17 +585,27 @@ backfill, or writes an object; a trace is evidence, not certification
 - `sekai.plans.simulate` → `SimulatePlan` requires `planId`. The adapter uses
   the call's `operation_id` as `simulationId`, so calling again with the same
   `operation_id` returns the stored simulation instead of running it again.
-- `sekai.transforms.preview` → `PreviewGovernedTransform` takes `transform`
-  and `rowCap`, or only `previewId`. A preview that runs isolated returns a
-  `previewId`; calling again with it reads the stored rows. A preview from
-  another namespace reads as not found, even when the principal may read it
-  over direct gRPC.
+- `sekai.transforms.preview` → `PreviewGovernedTransform` (`stable`, always
+  listed) takes `transform` and `rowCap`, or only `previewId`. A preview that
+  runs isolated returns a `previewId`; calling again with it reads the stored
+  rows. A preview from another namespace reads as not found, even when the
+  principal may read it over direct gRPC.
 - `sekai.definitions.change_bundle.dry_run` → `DryRunDefinitionChangeBundle`
   requires `fromRevisionDigest` and `toRevisionDigest`, accepts `hints` and
   `bundleDigest`, and reports the rows each backfill would change.
 
-All four RPCs are `experimental`, so these tools are listed and run only when
-experimental RPCs are enabled (`SEKAI_EXPERIMENTAL_RPCS=1`).
+`PreviewGovernedTransform` is `stable` (#2414). `DryRunAgent`, `SimulatePlan`,
+and `DryRunDefinitionChangeBundle` stay `experimental`, so those three tools
+are listed and run only when experimental RPCs are enabled
+(`SEKAI_EXPERIMENTAL_RPCS=1`).
+
+### Transform chain tools
+
+`tools/list` also returns transform-chain tools whose backing RPCs are
+`stable` (#2414): `sekai.transforms.chain.run` → `RunTransformChain` and
+`sekai.transforms.chain.status` → `GetTransformChainRun`. Each call binds the
+session namespace. `RunTransformChain` needs a credential administrator, like
+the RPC. Chain list/get RPCs stay `experimental`.
 
 The SDK bindings under `sdk/` consume the same serialized projection. TypeScript
 `getQualityTrend` and Python `get_quality_trend` send `chisei.quality.read` and

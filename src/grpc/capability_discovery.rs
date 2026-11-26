@@ -58,13 +58,14 @@ impl SekaiServiceImpl {
         entries.push(neighborhood_capability(experimental));
         entries.push(paths_capability(experimental));
         entries.push(experimental_rpc_capability(experimental));
-        entries.push(hosted_transform_capability(experimental));
-        entries.push(analytical_transform_capability(experimental));
+        // Hosted, analytical, preview, scheduler, and chain are stable (#2414).
+        entries.push(hosted_transform_capability());
+        entries.push(analytical_transform_capability());
         entries.push(isolated_transform_capability(experimental));
-        entries.push(scheduler_transform_capability(experimental));
-        entries.push(preview_transform_capability(experimental));
+        entries.push(scheduler_transform_capability());
+        entries.push(preview_transform_capability());
         entries.push(adhoc_transform_capability(experimental));
-        entries.push(transform_chain_capability(experimental));
+        entries.push(transform_chain_capability());
         entries.push(object_set_inputs_capability(experimental));
         entries.push(agent_turn_runtime_token_capability(experimental));
         entries.push(agent_turn_parked_capability(experimental));
@@ -397,9 +398,7 @@ fn object_query_capability(
     entry
 }
 
-/// Reference-platform analog: experimental catalog entries stay visible and gated off
-/// so discovery does not advertise them as production-ready.
-fn hosted_transform_capability(enabled: bool) -> CapabilityEntry {
+fn hosted_transform_capability() -> CapabilityEntry {
     let mut entry = base_capability(
         crate::sekai::governed_transform::HOSTED_COMPUTE_CAPABILITY.into(),
         "In-process governed dataset transform host. Put, run, and inspect a JobSpec; outputs are datasets.".into(),
@@ -409,11 +408,11 @@ fn hosted_transform_capability(enabled: bool) -> CapabilityEntry {
     );
     entry.required_scopes = vec!["namespace:write".into(), "dataset:read".into()];
     entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
-    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry.lifecycle_state = "active".into();
     entry
 }
 
-fn analytical_transform_capability(enabled: bool) -> CapabilityEntry {
+fn analytical_transform_capability() -> CapabilityEntry {
     let mut entry = base_capability(
         crate::sekai::governed_transform::ANALYTICAL_COMPUTE_CAPABILITY.into(),
         "In-process analytical SQL transform profile. Multi-input join, aggregate, and derived columns on governed datasets.".into(),
@@ -423,10 +422,12 @@ fn analytical_transform_capability(enabled: bool) -> CapabilityEntry {
     );
     entry.required_scopes = vec!["namespace:write".into(), "dataset:read".into()];
     entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
-    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry.lifecycle_state = "active".into();
     entry
 }
 
+/// Isolated-process, ad-hoc, and object-set-input catalog entries stay visible
+/// and gated off so discovery does not advertise them as production-ready.
 fn isolated_transform_capability(enabled: bool) -> CapabilityEntry {
     let mut entry = base_capability(
         crate::sekai::governed_transform::ISOLATED_COMPUTE_CAPABILITY.into(),
@@ -441,7 +442,7 @@ fn isolated_transform_capability(enabled: bool) -> CapabilityEntry {
     entry
 }
 
-fn transform_chain_capability(enabled: bool) -> CapabilityEntry {
+fn transform_chain_capability() -> CapabilityEntry {
     let mut entry = base_capability(
         crate::sekai::transform_chain::CHAIN_COMPUTE_CAPABILITY.into(),
         "Static DAG of governed transforms executed as one receipted operation. Discovery is not a grant.".into(),
@@ -451,12 +452,12 @@ fn transform_chain_capability(enabled: bool) -> CapabilityEntry {
     );
     entry.required_scopes = vec!["namespace:write".into(), "dataset:read".into()];
     entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
-    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry.lifecycle_state = "active".into();
     entry.product_tier = "experimental".into();
     entry
 }
 
-fn scheduler_transform_capability(enabled: bool) -> CapabilityEntry {
+fn scheduler_transform_capability() -> CapabilityEntry {
     let mut entry = base_capability(
         crate::sekai::governed_transform::SCHEDULER_COMPUTE_CAPABILITY.into(),
         "Plane-owned scheduled and change-triggered transform admission. Idempotent ticks, dependency graph, and output freshness.".into(),
@@ -466,7 +467,7 @@ fn scheduler_transform_capability(enabled: bool) -> CapabilityEntry {
     );
     entry.required_scopes = vec!["namespace:write".into(), "dataset:write".into()];
     entry.policy_decision_points = vec!["namespace_access".into(), "credential_admin".into()];
-    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry.lifecycle_state = "active".into();
     entry
 }
 
@@ -509,7 +510,7 @@ fn adhoc_transform_capability(enabled: bool) -> CapabilityEntry {
     entry
 }
 
-fn preview_transform_capability(enabled: bool) -> CapabilityEntry {
+fn preview_transform_capability() -> CapabilityEntry {
     let mut entry = base_capability(
         crate::sekai::governed_transform::PREVIEW_COMPUTE_CAPABILITY.into(),
         "Preview an unsaved governed transform on a bounded sample without committing output, receipt, or lineage.".into(),
@@ -524,7 +525,7 @@ fn preview_transform_capability(enabled: bool) -> CapabilityEntry {
         "marking".into(),
         "property_grant".into(),
     ];
-    entry.lifecycle_state = if enabled { "active" } else { "disabled" }.into();
+    entry.lifecycle_state = "active".into();
     entry
 }
 
@@ -948,24 +949,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hosted_transform_capability_is_disabled_when_experimental_rpcs_are_off() {
-        let off = hosted_transform_capability(false);
-        assert_eq!(off.lifecycle_state, "disabled");
+    fn hosted_transform_capability_is_active_without_the_experimental_flag() {
+        let entry = hosted_transform_capability();
+        assert_eq!(entry.lifecycle_state, "active");
         assert_eq!(
-            off.name,
+            entry.name,
             crate::sekai::governed_transform::HOSTED_COMPUTE_CAPABILITY
         );
-
-        let on = hosted_transform_capability(true);
-        assert_eq!(on.lifecycle_state, "active");
     }
 
     #[test]
-    fn analytical_transform_capability_is_disabled_when_experimental_rpcs_are_off() {
-        let off = analytical_transform_capability(false);
-        assert_eq!(off.lifecycle_state, "disabled");
+    fn analytical_transform_capability_is_active_without_the_experimental_flag() {
+        let entry = analytical_transform_capability();
+        assert_eq!(entry.lifecycle_state, "active");
         assert_eq!(
-            off.name,
+            entry.name,
             crate::sekai::governed_transform::ANALYTICAL_COMPUTE_CAPABILITY
         );
     }
@@ -983,43 +981,38 @@ mod tests {
     }
 
     #[test]
-    fn transform_chain_capability_follows_the_experimental_gate() {
-        let off = transform_chain_capability(false);
-        assert_eq!(off.lifecycle_state, "disabled");
+    fn transform_chain_capability_is_active_without_the_experimental_flag() {
+        let entry = transform_chain_capability();
+        assert_eq!(entry.lifecycle_state, "active");
         assert_eq!(
-            off.name,
+            entry.name,
             crate::sekai::transform_chain::CHAIN_COMPUTE_CAPABILITY
         );
-        assert_eq!(off.product_tier, "experimental");
+        assert_eq!(entry.product_tier, "experimental");
         assert_eq!(
-            crate::rpc_maturity::capability_backing_rpc(&off.name),
+            crate::rpc_maturity::capability_backing_rpc(&entry.name),
             Some("RunTransformChain")
         );
-        assert_eq!(transform_chain_capability(true).lifecycle_state, "active");
     }
 
     #[test]
-    fn preview_transform_capability_is_disabled_when_experimental_rpcs_are_off() {
-        let off = preview_transform_capability(false);
-        assert_eq!(off.lifecycle_state, "disabled");
+    fn preview_transform_capability_is_active_without_the_experimental_flag() {
+        let entry = preview_transform_capability();
+        assert_eq!(entry.lifecycle_state, "active");
         assert_eq!(
-            off.name,
+            entry.name,
             crate::sekai::governed_transform::PREVIEW_COMPUTE_CAPABILITY
         );
-        let on = preview_transform_capability(true);
-        assert_eq!(on.lifecycle_state, "active");
     }
 
     #[test]
-    fn scheduler_transform_capability_is_disabled_when_experimental_rpcs_are_off() {
-        let off = scheduler_transform_capability(false);
-        assert_eq!(off.lifecycle_state, "disabled");
+    fn scheduler_transform_capability_is_active_without_the_experimental_flag() {
+        let entry = scheduler_transform_capability();
+        assert_eq!(entry.lifecycle_state, "active");
         assert_eq!(
-            off.name,
+            entry.name,
             crate::sekai::governed_transform::SCHEDULER_COMPUTE_CAPABILITY
         );
-        let on = scheduler_transform_capability(true);
-        assert_eq!(on.lifecycle_state, "active");
     }
 
     #[test]
