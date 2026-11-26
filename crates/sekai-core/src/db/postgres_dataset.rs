@@ -943,6 +943,8 @@ pub(crate) fn get_dataset_version_pg(
         .ok_or_else(|| dataset_version::DATASET_VERSION_NOT_FOUND.to_string())
 }
 
+/// Writes a `snapshot` version of the dataset's live rows (ADR 0172), as
+/// `crate::sekai::dataset::snapshot_dataset_version_tx` does on SQLite.
 pub fn snapshot_dataset_version_pg(
     tx: &mut postgres::Transaction<'_>,
     dataset_id: &str,
@@ -959,72 +961,260 @@ pub fn snapshot_dataset_version_pg(
     if exists.is_none() {
         return Err(dataset_version::DATASET_NOT_FOUND.into());
     }
-    let seq: i64 = tx
-        .query_one(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM sekai_dataset_versions WHERE dataset_id = $1",
-            &[&dataset_id],
-        )
-        .map_err(|error| error.to_string())?
-        .get(0);
-    let prev_ms: i64 = tx
-        .query_one(
-            "SELECT COALESCE(MAX(created_at_ms), 0) FROM sekai_dataset_versions WHERE dataset_id = $1",
-            &[&dataset_id],
-        )
-        .map_err(|error| error.to_string())?
-        .get(0);
-    let created_at_ms = created_at_ms.max(prev_ms.saturating_add(1));
-    let live = tx
+    let next = next_version_pg(tx, dataset_id, created_at_ms)?;
+    let jsons: Vec<String> = tx
         .query(
-            "SELECT id, data, COALESCE(partition_key, '') FROM sekai_dataset_rows
-             WHERE dataset_id = $1 ORDER BY id",
+            "SELECT data FROM sekai_dataset_rows WHERE dataset_id = $1 ORDER BY id",
             &[&dataset_id],
         )
-        .map_err(|error| error.to_string())?;
-    let row_jsons: Vec<(i64, String, String)> = live
+        .map_err(|error| error.to_string())?
         .into_iter()
-        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .map(|row| row.get(0))
         .collect();
-    let jsons: Vec<String> = row_jsons.iter().map(|(_, data, _)| data.clone()).collect();
-    let version_id = dataset_version::version_id(dataset_id, seq, created_at_ms, &jsons);
-    let row_count =
-        i32::try_from(row_jsons.len()).map_err(|_| "too many dataset rows".to_string())?;
     tx.execute(
-        "INSERT INTO sekai_dataset_versions
-         (dataset_id, version_id, seq, created_at_ms, actor, tenant, reason,
-          restored_from_version_id, row_count, purged)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0)",
-        &[
-            &dataset_id,
-            &version_id,
-            &seq,
-            &created_at_ms,
-            &actor,
-            &tenant,
-            &reason,
-            &restored_from_version_id,
-            &row_count,
-        ],
+        "UPDATE sekai_dataset_row_spans SET to_seq = $2 WHERE dataset_id = $1 AND to_seq IS NULL",
+        &[&dataset_id, &next.seq],
     )
     .map_err(|error| error.to_string())?;
-    for (row_id, data, partition_key) in &row_jsons {
+    tx.execute(OPEN_LIVE_SPANS_PG, &[&dataset_id, &next.seq])
+        .map_err(|error| error.to_string())?;
+    let row_count = i64::try_from(jsons.len()).map_err(|_| "too many dataset rows".to_string())?;
+    insert_span_version_pg(
+        tx,
+        dataset_id,
+        &next,
+        VersionChange {
+            kind: "snapshot",
+            changed: &jsons,
+            row_count,
+        },
+        VersionMeta {
+            actor,
+            tenant,
+            reason,
+            restored_from_version_id,
+        },
+    )
+}
+
+/// Lands source records into a source dataset as one span version, as
+/// `crate::sekai::dataset::land_source_rows_tx` does on SQLite, under the
+/// dataset rows lock.
+pub(crate) fn land_source_rows_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+    rows: &[HashMap<String, String>],
+) -> Result<(i64, i64), String> {
+    if rows.is_empty() {
+        return Ok((0, 0));
+    }
+    lock_dataset_rows(tx, dataset_id)?;
+    let rows = crate::db::source_batch_dataset::last_row_per_key(rows);
+    let keys_json: String = tx
+        .query_opt(
+            "SELECT partition_keys FROM sekai_datasets WHERE id=$1",
+            &[&dataset_id],
+        )
+        .map_err(|error| error.to_string())?
+        .map(|row| row.get(0))
+        .ok_or_else(|| dataset_version::DATASET_NOT_FOUND.to_string())?;
+    let keys = crate::sekai::dataset::parse_partition_keys(&keys_json)?;
+    let next = next_version_pg(tx, dataset_id, dataset_version::now_ms())?;
+    let source_ids: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row.get(crate::db::source_batch_dataset::KEY_COLUMN))
+        .map(String::as_str)
+        .collect();
+    let replaced: Vec<i64> = tx
+        .query(
+            "SELECT id FROM sekai_dataset_rows
+             WHERE dataset_id LIKE 'srcds:%' AND dataset_id = $1
+               AND (data::jsonb)->>'source_id' = ANY($2)
+             ORDER BY id",
+            &[&dataset_id, &source_ids],
+        )
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    if !replaced.is_empty() {
+        if next.on_spans {
+            tx.execute(
+                "UPDATE sekai_dataset_row_spans SET to_seq = $3
+                 WHERE dataset_id = $1 AND row_id = ANY($2) AND to_seq IS NULL",
+                &[&dataset_id, &replaced, &next.seq],
+            )
+            .map_err(|error| error.to_string())?;
+        }
         tx.execute(
-            "INSERT INTO sekai_dataset_version_rows
-             (dataset_id, version_id, row_id, data, partition_key)
-             VALUES ($1,$2,$3,$4,$5)",
-            &[&dataset_id, &version_id, row_id, data, partition_key],
+            "DELETE FROM sekai_dataset_rows WHERE id = ANY($1)",
+            &[&replaced],
         )
         .map_err(|error| error.to_string())?;
     }
+    if !next.on_spans {
+        tx.execute(OPEN_LIVE_SPANS_PG, &[&dataset_id, &next.seq])
+            .map_err(|error| error.to_string())?;
+    }
+    let mut changed: Vec<String> = replaced.iter().map(|id| format!("-{id}")).collect();
+    let (mut first, mut last) = (0i64, 0i64);
+    for row in &rows {
+        let data = serde_json::to_string(row).map_err(|error| error.to_string())?;
+        let partition_key = crate::sekai::governed_transform::partition_value(&keys, row);
+        let id: i64 = tx
+            .query_one(
+                "INSERT INTO sekai_dataset_rows (dataset_id,data,partition_key) VALUES ($1,$2,$3) RETURNING id",
+                &[&dataset_id, &data, &partition_key],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        tx.execute(
+            "INSERT INTO sekai_dataset_row_spans (dataset_id, row_id, from_seq, data, partition_key)
+             VALUES ($1,$2,$3,$4,$5)",
+            &[&dataset_id, &id, &next.seq, &data, &partition_key],
+        )
+        .map_err(|error| error.to_string())?;
+        if first == 0 {
+            first = id;
+        }
+        last = id;
+        changed.push(data);
+    }
+    let row_count = if next.on_spans {
+        i64::from(next.previous_row_count) + rows.len() as i64 - replaced.len() as i64
+    } else {
+        tx.query_one(
+            "SELECT COUNT(*) FROM sekai_dataset_rows WHERE dataset_id = $1",
+            &[&dataset_id],
+        )
+        .map_err(|error| error.to_string())?
+        .get(0)
+    };
+    insert_span_version_pg(
+        tx,
+        dataset_id,
+        &next,
+        VersionChange {
+            kind: if replaced.is_empty() {
+                "append"
+            } else {
+                "update"
+            },
+            changed: &changed,
+            row_count,
+        },
+        VersionMeta::default(),
+    )?;
+    Ok((first, last))
+}
+
+/// Opens a span at seq `$2` for every live row of dataset `$1`.
+const OPEN_LIVE_SPANS_PG: &str =
+    "INSERT INTO sekai_dataset_row_spans (dataset_id, row_id, from_seq, data, partition_key)
+     SELECT dataset_id, id, $2, data, COALESCE(partition_key, '')
+     FROM sekai_dataset_rows WHERE dataset_id = $1";
+
+/// Where the next version of a dataset goes; see the SQLite `NextVersion`.
+struct NextVersion {
+    seq: i64,
+    created_at_ms: i64,
+    previous_version_id: String,
+    on_spans: bool,
+    previous_row_count: i32,
+}
+
+fn next_version_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+    created_at_ms: i64,
+) -> Result<NextVersion, String> {
+    let latest = tx
+        .query_opt(
+            "SELECT seq, created_at_ms, version_id, layout = 'span', row_count
+             FROM sekai_dataset_versions WHERE dataset_id = $1
+             ORDER BY seq DESC LIMIT 1",
+            &[&dataset_id],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(match latest {
+        Some(row) => NextVersion {
+            seq: row.get::<_, i64>(0) + 1,
+            created_at_ms: created_at_ms.max(row.get::<_, i64>(1).saturating_add(1)),
+            previous_version_id: row.get(2),
+            on_spans: row.get(3),
+            previous_row_count: row.get(4),
+        },
+        None => NextVersion {
+            seq: 1,
+            created_at_ms,
+            previous_version_id: String::new(),
+            on_spans: false,
+            previous_row_count: 0,
+        },
+    })
+}
+
+struct VersionChange<'a> {
+    kind: &'a str,
+    changed: &'a [String],
+    row_count: i64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct VersionMeta<'a> {
+    actor: &'a str,
+    tenant: &'a str,
+    reason: &'a str,
+    restored_from_version_id: &'a str,
+}
+
+/// Records a `span` version whose spans are already written, then judges its
+/// health and prunes past retention.
+fn insert_span_version_pg(
+    tx: &mut postgres::Transaction<'_>,
+    dataset_id: &str,
+    next: &NextVersion,
+    change: VersionChange<'_>,
+    meta: VersionMeta<'_>,
+) -> Result<DatasetVersion, String> {
+    let row_count =
+        i32::try_from(change.row_count).map_err(|_| "too many dataset rows".to_string())?;
+    let version_id = dataset_version::span_version_id(
+        dataset_id,
+        next.seq,
+        next.created_at_ms,
+        change.kind,
+        &next.previous_version_id,
+        change.changed,
+    );
+    tx.execute(
+        "INSERT INTO sekai_dataset_versions
+         (dataset_id, version_id, seq, created_at_ms, actor, tenant, reason,
+          restored_from_version_id, row_count, purged, kind, layout)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,'span')",
+        &[
+            &dataset_id,
+            &version_id,
+            &next.seq,
+            &next.created_at_ms,
+            &meta.actor,
+            &meta.tenant,
+            &meta.reason,
+            &meta.restored_from_version_id,
+            &row_count,
+            &change.kind,
+        ],
+    )
+    .map_err(|error| error.to_string())?;
     let version = DatasetVersion {
         dataset_id: dataset_id.into(),
         version_id,
-        seq,
-        created_at_ms,
-        actor: actor.into(),
-        tenant: tenant.into(),
-        reason: reason.into(),
-        restored_from_version_id: restored_from_version_id.into(),
+        seq: next.seq,
+        created_at_ms: next.created_at_ms,
+        actor: meta.actor.into(),
+        tenant: meta.tenant.into(),
+        reason: meta.reason.into(),
+        restored_from_version_id: meta.restored_from_version_id.into(),
         row_count,
         purged: false,
     };
@@ -1032,7 +1222,7 @@ pub fn snapshot_dataset_version_pg(
         tx,
         dataset_id,
         &version,
-        created_at_ms,
+        next.created_at_ms,
     )?;
     prune_dataset_versions_pg(tx, dataset_id)?;
     Ok(version)
@@ -1273,5 +1463,150 @@ mod tests {
                 "{dataset} {range:?}"
             );
         }
+    }
+
+    /// ADR 0172 on PostgreSQL: after `copy` versions from the release before,
+    /// a landed batch writes an `append`, then an `update` that replaces a
+    /// row by its external id; every version reads its own rows, the live
+    /// rows equal the latest version, and rollback and retention keep each
+    /// retained version's content.
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for a TLS PostgreSQL server the test may create databases on"]
+    fn postgres_landed_batches_write_span_versions_after_copy_versions() {
+        const ID: &str = "srcds:spans";
+        let row = |key: &str, kind: &str| {
+            HashMap::from([
+                ("source_id".to_string(), key.to_string()),
+                ("kind".to_string(), kind.to_string()),
+            ])
+        };
+        let scratch = ScratchDatabase::create();
+        let db = scratch.connect();
+        db.create_dataset(&Dataset {
+            id: ID.into(),
+            name: "spans".into(),
+            columns: Vec::new(),
+            object_id: String::new(),
+            created: 1,
+            partition_keys: Vec::new(),
+        })
+        .unwrap();
+        {
+            let mut connection = db.connection().unwrap();
+            for (seq, key) in [(1i64, "a"), (2, "b")] {
+                let data = serde_json::to_string(&row(key, key)).unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO sekai_dataset_rows (dataset_id, data) VALUES ($1, $2)",
+                        &[&ID, &data],
+                    )
+                    .unwrap();
+                let version_id = format!("copy-{seq}");
+                connection
+                    .execute(
+                        "INSERT INTO sekai_dataset_versions
+                         (dataset_id, version_id, seq, created_at_ms, actor, tenant, reason,
+                          restored_from_version_id, row_count, purged)
+                         VALUES ($1, $2, $3, $3, '', '', '', '', $4, 0)",
+                        &[&ID, &version_id, &seq, &(seq as i32)],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO sekai_dataset_version_rows
+                         (dataset_id, version_id, row_id, data, partition_key)
+                         SELECT dataset_id, $2, id, data, '' FROM sekai_dataset_rows
+                         WHERE dataset_id = $1",
+                        &[&ID, &version_id],
+                    )
+                    .unwrap();
+            }
+        }
+        let land = |rows: &[HashMap<String, String>]| {
+            let mut connection = db.connection().unwrap();
+            let mut tx = connection.transaction().unwrap();
+            land_source_rows_pg(&mut tx, ID, rows).unwrap();
+            tx.commit().unwrap();
+            db.list_dataset_versions(ID).unwrap().pop().unwrap()
+        };
+        let kinds = |version_id: &str| -> Vec<String> {
+            db.load_dataset_version(ID, version_id, 0)
+                .unwrap()
+                .1
+                .into_iter()
+                .map(|row| row["kind"].clone())
+                .collect()
+        };
+        let appended = land(&[row("c", "c")]);
+        // One batch naming b twice lands its last row.
+        let updated = land(&[row("b", "b1"), row("b", "b2")]);
+        assert_eq!(kinds("copy-1"), ["a"]);
+        assert_eq!(kinds("copy-2"), ["a", "b"]);
+        assert_eq!(kinds(&appended.version_id), ["a", "b", "c"]);
+        assert_eq!(kinds(&updated.version_id), ["a", "c", "b2"]);
+        assert_eq!((appended.row_count, updated.row_count), (3, 3));
+        let mut connection = db.connection().unwrap();
+        let shape: Vec<(String, String)> = connection
+            .query(
+                "SELECT kind, layout FROM sekai_dataset_versions
+                 WHERE dataset_id = $1 ORDER BY seq",
+                &[&ID],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let shape: Vec<(&str, &str)> = shape
+            .iter()
+            .map(|(kind, layout)| (kind.as_str(), layout.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("snapshot", "copy"),
+                ("snapshot", "copy"),
+                ("append", "span"),
+                ("update", "span"),
+            ]
+        );
+        let live: Vec<String> = connection
+            .query(
+                "SELECT data FROM sekai_dataset_rows WHERE dataset_id = $1 ORDER BY id",
+                &[&ID],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| {
+                serde_json::from_str::<HashMap<String, String>>(&row.get::<_, String>(0))
+                    .unwrap()["kind"]
+                    .clone()
+            })
+            .collect();
+        assert_eq!(live, kinds(&updated.version_id));
+
+        let restored = db
+            .rollback_dataset(&DatasetRollback {
+                dataset_id: ID.into(),
+                restore_from_version_id: appended.version_id.clone(),
+                reason: "restore".into(),
+                actor: "tester".into(),
+                tenant: String::new(),
+            })
+            .unwrap();
+        assert_eq!(kinds(&restored.version_id), ["a", "b", "c"]);
+        assert_eq!(kinds(&updated.version_id), ["a", "c", "b2"]);
+
+        db.set_dataset_version_retention(ID, 1).unwrap();
+        assert!(db.load_dataset_version(ID, &updated.version_id, 0).is_err());
+        assert_eq!(kinds(&restored.version_id), ["a", "b", "c"]);
+        let closed: i64 = connection
+            .query_one(
+                "SELECT COUNT(*) FROM sekai_dataset_row_spans
+                 WHERE dataset_id = $1 AND to_seq IS NOT NULL",
+                &[&ID],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(closed, 0, "no retained version covers a closed span");
     }
 }

@@ -67,6 +67,38 @@ pub fn version_id(dataset_id: &str, seq: i64, created_at_ms: i64, row_jsons: &[S
     format!("sha256:{:x}", hasher.finalize())
 }
 
+/// The id of a `span` version (ADR 0172 decision 6). It chains to the
+/// previous version id (empty for the first version) and hashes only the rows
+/// this version changed, so its cost follows the change, not the dataset:
+/// `changed` lists every row of a `snapshot`, or the closed row ids and the
+/// added rows of an `append` or `update`, in the order they were applied.
+pub fn span_version_id(
+    dataset_id: &str,
+    seq: i64,
+    created_at_ms: i64,
+    kind: &str,
+    previous_version_id: &str,
+    changed: &[String],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"sekai.dataset-version.span\n");
+    for field in [
+        dataset_id,
+        &seq.to_string(),
+        &created_at_ms.to_string(),
+        kind,
+        previous_version_id,
+    ] {
+        hasher.update(field.as_bytes());
+        hasher.update(b"\n");
+    }
+    for row in changed {
+        hasher.update(row.as_bytes());
+        hasher.update(b"\n");
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 pub fn encode_row_map(row: &HashMap<String, String>) -> Result<String, String> {
     serde_json::to_string(row).map_err(|error| error.to_string())
 }

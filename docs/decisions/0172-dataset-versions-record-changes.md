@@ -98,3 +98,17 @@ versioned datasets use the same model.
 - Release N reads `span` versions that a test writes in the N+1 shape.
 - The 500-record batch loop on the object-path harness stays flat from
   5,000 to 50,000 landed records (release N+1).
+
+## Clarification (2026-11-26): one release, and what a source batch replaces
+
+- The two-release rollout of decision 9 is dropped: no release is cut
+  between the reader and the writer, so both ship together. An upgrade from
+  a release before the reader stops every old process before a new one
+  writes, because an older process reads a `span` version as empty.
+- Only source batch landing writes `append` and `update`. An external id is
+  the row's `source_id`; an `update` removes the replaced row from the live
+  rows as well as closing its span, so the live rows always equal the latest
+  version. A batch that names one id twice lands its last row.
+- Every other writer (rollback, redaction, erasure, transforms, branches,
+  ordinary appends) writes a `span` `snapshot` of the live rows, which costs
+  the dataset's size as a `copy` did. No new `copy` version is written.

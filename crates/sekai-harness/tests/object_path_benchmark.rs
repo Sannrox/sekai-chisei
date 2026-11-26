@@ -340,3 +340,64 @@ fn mixed_get_object_p99_stays_within_2x_idle_during_source_batch() {
     }
     panic!("busy GetObject p99 exceeded 2x idle on every attempt (idle_us, busy_us): {attempts:?}");
 }
+
+/// Bytes the store's files hold, write-ahead log included.
+fn store_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .expect("read store directory")
+        .map(|entry| {
+            entry
+                .expect("store entry")
+                .metadata()
+                .expect("metadata")
+                .len()
+        })
+        .sum()
+}
+
+// #3509, ADR 0172: a landed source batch writes only what it changed, so the
+// store grows linearly with landed records. Before span versions every batch
+// copied the whole dataset, and the last window grew the store over five
+// times as much as the second. Landing rate is printed, not asserted: the
+// object type index still rebuilds its join over every row per batch.
+#[test]
+#[ignore = "wall-clock landing loop; run by hand when dataset versions change"]
+fn source_batch_store_grows_linearly_from_5k_to_50k_records() {
+    const BATCH: usize = 500;
+    const WINDOW: usize = 5_000;
+    const TOTAL: usize = 50_000;
+    let harness = ObjectPathHarness::open(
+        ObjectPathId {
+            kind: ObjectPathKind::ApplySourceBatch,
+            backend: ObjectPathBackend::Sqlite,
+            scale: ObjectPathScale::Batch1000,
+        },
+        64,
+        BATCH,
+    )
+    .expect("open landing harness");
+    let dir = harness
+        .sqlite_dir_path()
+        .expect("sqlite store")
+        .to_path_buf();
+    let mut windows = Vec::new();
+    let mut bytes_before = store_bytes(&dir);
+    for landed in (WINDOW..=TOTAL).step_by(WINDOW) {
+        let started = std::time::Instant::now();
+        for _ in 0..WINDOW / BATCH {
+            harness.apply_source_batch().expect("land batch");
+        }
+        let rate = WINDOW as f64 / started.elapsed().as_secs_f64();
+        let bytes = store_bytes(&dir);
+        let growth = bytes.saturating_sub(bytes_before);
+        bytes_before = bytes;
+        println!("landed {landed}: {rate:.0} records/s, store {bytes} bytes (+{growth})");
+        windows.push(growth);
+    }
+    // The first window pays for creating the dataset; compare from the second.
+    let (second, last) = (windows[1], windows[windows.len() - 1]);
+    assert!(
+        last * 2 <= second * 3,
+        "store growth per window is not linear: {windows:?}"
+    );
+}

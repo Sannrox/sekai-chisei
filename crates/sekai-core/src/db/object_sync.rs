@@ -3551,7 +3551,7 @@ fn land_source_batch_dataset_rows(
 ) -> Result<(), ApplyError> {
     use crate::db::source_batch_dataset;
     use crate::sekai::dataset::{
-        Dataset, add_dataset_columns_tx, append_rows_tx, create_dataset_tx,
+        Dataset, add_dataset_columns_tx, create_dataset_tx, land_source_rows_tx,
     };
 
     let mapper = source_batch_mapper(batch, || {
@@ -3603,7 +3603,8 @@ fn land_source_batch_dataset_rows(
         backfill_source_dataset_from_committed(tx, &mapper, &dataset_id, &kind, &historical_jsons)?;
         let rows = prepared_dataset_rows(&prepared.records, &kind)?;
         if !rows.is_empty() {
-            let (from, to) = append_rows_tx(tx, &dataset_id, &rows).map_err(ApplyError::Storage)?;
+            let (from, to) =
+                land_source_rows_tx(tx, &dataset_id, &rows).map_err(ApplyError::Storage)?;
             if row_from == 0 {
                 row_from = from;
             }
@@ -3745,14 +3746,14 @@ fn backfill_source_dataset_from_committed(
     kind: &str,
     jsons: &[String],
 ) -> Result<(), ApplyError> {
-    use crate::sekai::dataset::{add_dataset_columns_tx, append_rows_tx};
+    use crate::sekai::dataset::{add_dataset_columns_tx, land_source_rows_tx};
 
     let (columns, rows) = committed_source_dataset_backfill(mapper, jsons.iter().cloned(), kind)?;
     if !columns.is_empty() {
         add_dataset_columns_tx(tx, dataset_id, &columns).map_err(ApplyError::Storage)?;
     }
     if !rows.is_empty() {
-        append_rows_tx(tx, dataset_id, &rows).map_err(ApplyError::Storage)?;
+        land_source_rows_tx(tx, dataset_id, &rows).map_err(ApplyError::Storage)?;
     }
     Ok(())
 }
@@ -6630,15 +6631,16 @@ pub mod tests {
             .property_mapping;
         assert_eq!(mapping.get("title").map(String::as_str), Some("title"));
         assert_eq!(mapping.get("body").map(String::as_str), Some("body"));
-        let title_present: i64 = store
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM sekai_dataset_rows
-                 WHERE dataset_id=?1 AND json_extract(data, '$.title') IS NOT NULL",
-                params![dataset_id],
-                |row| row.get(0),
-            )
+        // The second batch replaces the backfilled row of the same record;
+        // the backfill's own version keeps it (ADR 0172).
+        let versions = store.list_dataset_versions(&dataset_id).unwrap();
+        let backfilled = &versions[versions.len() - 2];
+        let (_, rows) = store
+            .load_dataset_version(&dataset_id, &backfilled.version_id, 0)
             .unwrap();
-        assert!(title_present >= 1, "historical title rows backfilled");
+        assert!(
+            rows.iter().any(|row| row.contains_key("title")),
+            "historical title rows backfilled"
+        );
     }
 }
