@@ -1,7 +1,9 @@
 //! `postgres_capture` through the connector runtime against a real
 //! PostgreSQL and a serving plane (ADR 0170): the sandboxed child reads a
 //! resumable snapshot after the slot's position, hands off to the feed, and
-//! what the runtime read passes the ADR 0118 conformance check.
+//! what the runtime read passes the ADR 0118 conformance check. The runtime
+//! creates only a slot the plane records (#3083) and reports the log the
+//! slot retains as a sync note.
 //!
 //! Linux only, ignored: needs `SEKAI_TEST_POSTGRES_URL` for a TLS server with
 //! `wal_level=logical`, `SEKAI_TEST_POSTGRES_CA_CERT` for its CA, and
@@ -19,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use postgres_native_tls::MakeTlsConnector;
 use sekai_chisei::sekai::source::SourceSpec;
+use sekai_chisei::sekai::source::{self, Source};
 use sekai_chisei::sekai::source_type_descriptor::{
     ProposedSourceTypeDescriptor, register_source_type_descriptor,
 };
@@ -33,7 +36,7 @@ use sekai_source_sdk::change_capture::{
 };
 use sekai_source_sdk::{
     ChangeFeedPage, ConfigValue, Connector, ConnectorFailure, GenerationSnapshotPage,
-    POSTGRES_CAPTURE_CONNECTOR, SourceConfig, object_id_for,
+    POSTGRES_CAPTURE_CONNECTOR, PlaneView, SourceConfig, SyncNote, object_id_for,
 };
 
 use crate::connector_runtime_effects::{LEASE, NS, PRINCIPAL, Plane, plane_with};
@@ -169,19 +172,29 @@ enum Read {
 
 type Log = Arc<Mutex<Vec<Read>>>;
 
-/// The real connector, recording its pages; with `snapshot_pages` set,
-/// it fails like a dying runtime once it has read that many.
+/// How a test runtime dies.
+#[derive(Debug, Clone, Copy)]
+enum Dies {
+    Never,
+    /// Before it reads snapshot page `n + 1`.
+    AfterPages(usize),
+    /// After reading its first snapshot page, before the plane commits it.
+    BeforeCommit,
+}
+
+/// The real connector, recording its pages, and dying as `dies` says.
 struct Recording {
     inner: Box<dyn Connector + Send>,
     log: Log,
-    snapshot_pages: Option<usize>,
+    dies: Dies,
 }
 
 impl Connector for Recording {
-    fn read_snapshot_page(
+    fn read_snapshot_page_with_plane(
         &mut self,
         committed_cursor: Option<&str>,
         max_records: usize,
+        plane: &mut dyn PlaneView,
     ) -> Result<GenerationSnapshotPage, ConnectorFailure> {
         let read = self
             .log
@@ -190,42 +203,46 @@ impl Connector for Recording {
             .iter()
             .filter(|read| matches!(read, Read::Snapshot(_)))
             .count();
-        if self.snapshot_pages.is_some_and(|limit| read >= limit) {
+        if matches!(self.dies, Dies::AfterPages(limit) if read >= limit) {
             return Err(ConnectorFailure::Unavailable);
         }
-        let page = self
-            .inner
-            .read_snapshot_page(committed_cursor, max_records)?;
+        let page =
+            self.inner
+                .read_snapshot_page_with_plane(committed_cursor, max_records, plane)?;
+        if matches!(self.dies, Dies::BeforeCommit) {
+            return Err(ConnectorFailure::Unavailable);
+        }
         self.log.lock().unwrap().push(Read::Snapshot(page.clone()));
         Ok(page)
     }
 
-    fn read_changes_from(
+    fn read_changes_with_plane(
         &mut self,
         committed_cursor: &str,
         source_feed_epoch: &str,
         committed_offset: u64,
         max_records: usize,
+        plane: &mut dyn PlaneView,
     ) -> Result<ChangeFeedPage, ConnectorFailure> {
-        let page = self.inner.read_changes_from(
+        let page = self.inner.read_changes_with_plane(
             committed_cursor,
             source_feed_epoch,
             committed_offset,
             max_records,
+            plane,
         )?;
         self.log.lock().unwrap().push(Read::Changes(page.clone()));
         Ok(page)
     }
 }
 
-/// A runtime serving the plane with the real child; `snapshot_pages` as in
-/// [`Recording`].
+/// A runtime serving the plane with the real child, dying as `dies` says.
 async fn runtime(
     server: &Server,
     plane: &Plane,
     id: &str,
     log: &Log,
-    snapshot_pages: Option<usize>,
+    dies: Dies,
     dir: &std::path::Path,
 ) -> Runtime {
     let capture = Capture::new(
@@ -237,7 +254,7 @@ async fn runtime(
         Ok(Box::new(Recording {
             inner: postgres_capture::open(prepared, &capture)?,
             log: log.clone(),
-            snapshot_pages,
+            dies,
         }))
     });
     let password = dir.join(format!("password-{id}"));
@@ -291,6 +308,40 @@ async fn sync(plane: &Plane, runtime: &Runtime, round: i64) -> Result<(), SyncFa
         [Ran::Finished { outcome, .. }] => *outcome,
         other => panic!("one finished sync expected: {other:?}"),
     }
+}
+
+/// The Source as the plane holds it.
+fn source_of(plane: &Plane) -> Source {
+    plane.db.get_source(NS, "orders").unwrap().unwrap()
+}
+
+/// Whether the server has `slot`.
+fn slot_exists(server: &Server, slot: &str) -> bool {
+    server.admin(|client| {
+        client
+            .query_one(
+                "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .unwrap()
+            .get::<_, i64>(0)
+            == 1
+    })
+}
+
+/// The retained log the Source's last finished sync reported for `slot`.
+fn retained_log(source: &Source, slot: &str) -> Option<i64> {
+    source
+        .sync
+        .current_notes()?
+        .notes()
+        .iter()
+        .find_map(|note| match note {
+            SyncNote::RetainedLog {
+                slot: noted, bytes, ..
+            } if noted == slot => Some(*bytes),
+            _ => None,
+        })
 }
 
 /// The plane's live orders as `id` to `name`, for ids up to `up_to`.
@@ -397,7 +448,15 @@ async fn postgres_capture_snapshot_resumes_and_hands_off_to_the_feed() {
     let log = Log::default();
 
     // The first runtime dies after one snapshot page.
-    let first = runtime(&server, &plane, "eu-1", &log, Some(1), dir.path()).await;
+    let first = runtime(
+        &server,
+        &plane,
+        "eu-1",
+        &log,
+        Dies::AfterPages(1),
+        dir.path(),
+    )
+    .await;
     assert_eq!(sync(&plane, &first, 1).await, Err(SyncFailure::Unavailable));
     assert_eq!(plane_rows(&plane, 2000).len(), 500);
     drop(first);
@@ -414,7 +473,7 @@ async fn postgres_capture_snapshot_resumes_and_hands_off_to_the_feed() {
     }
 
     // Another runtime finishes the snapshot and replays every change.
-    let second = runtime(&server, &plane, "eu-2", &log, None, dir.path()).await;
+    let second = runtime(&server, &plane, "eu-2", &log, Dies::Never, dir.path()).await;
     assert_eq!(sync(&plane, &second, 2).await, Ok(()));
     assert_eq!(plane_rows(&plane, 2000), server.rows(&table));
 
@@ -440,8 +499,10 @@ async fn postgres_capture_snapshot_resumes_and_hands_off_to_the_feed() {
     ));
 }
 
-/// An empty table cannot finish a snapshot: the sync fails visibly and
-/// the next one succeeds once a row exists.
+/// An empty table cannot finish a snapshot: the sync fails visibly, the
+/// slot it recorded and created stays, and the next sync uses that slot
+/// once a row exists. Each sync reports the log the slot retains, and a
+/// disabled Source keeps showing the last value.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL, SEKAI_TEST_POSTGRES_CA_CERT and SEKAI_TEST_CAPTURE_CHILD; run through scripts/postgres-conformance.sh"]
 async fn postgres_capture_refuses_an_empty_table_until_a_row_exists() {
@@ -462,17 +523,130 @@ async fn postgres_capture_refuses_an_empty_table_until_a_row_exists() {
     ));
     let plane = serving(&server, &slot, &publication).await;
     let dir = tempfile::tempdir().unwrap();
-    let runtime = runtime(&server, &plane, "eu-1", &Log::default(), None, dir.path()).await;
+    let runtime = runtime(
+        &server,
+        &plane,
+        "eu-1",
+        &Log::default(),
+        Dies::Never,
+        dir.path(),
+    )
+    .await;
 
     assert_eq!(
         sync(&plane, &runtime, 1).await,
         Err(SyncFailure::Unavailable)
     );
+    let failed = source_of(&plane);
+    assert_eq!(failed.sync.created_slots, std::slice::from_ref(&slot));
+    assert!(retained_log(&failed, &slot).is_some_and(|bytes| bytes >= 0));
+    assert!(slot_exists(&server, &slot));
     server.execute(&format!("INSERT INTO {table} VALUES (1, 'v1')"));
     assert_eq!(sync(&plane, &runtime, 2).await, Ok(()));
     assert_eq!(plane_rows(&plane, 1), server.rows(&table));
 
+    let synced = retained_log(&source_of(&plane), &slot);
+    assert!(synced.is_some());
+    let disabled = source::disable(&plane.db, NS, "orders", 2).unwrap();
+    assert_eq!(retained_log(&disabled, &slot), synced);
+
     drop(runtime);
+    server.drop_slot(&slot);
+    server.execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table}"
+    ));
+}
+
+/// A slot that exists before the first sync and that the plane does not
+/// record is refused and left in place: changes before it were never read.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL, SEKAI_TEST_POSTGRES_CA_CERT and SEKAI_TEST_CAPTURE_CHILD; run through scripts/postgres-conformance.sh"]
+async fn postgres_capture_refuses_a_slot_it_did_not_record() {
+    let server = Server::from_env();
+    let (table, publication, slot) = (
+        unique("cc_rt_pre"),
+        unique("cc_rt_pre_pub"),
+        unique("cc_rt_pre_slot"),
+    );
+    server.execute(&format!(
+        "CREATE TABLE {table} (id int PRIMARY KEY, name text); \
+         INSERT INTO {table} VALUES (1, 'v1'); \
+         CREATE PUBLICATION {publication} FOR TABLE {table}"
+    ));
+    // A logical slot cannot be created in a transaction that wrote, and one
+    // batch runs as one transaction.
+    server.execute(&format!(
+        "SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput')"
+    ));
+    let plane = serving(&server, &slot, &publication).await;
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = runtime(
+        &server,
+        &plane,
+        "eu-1",
+        &Log::default(),
+        Dies::Never,
+        dir.path(),
+    )
+    .await;
+
+    assert_eq!(sync(&plane, &runtime, 1).await, Err(SyncFailure::Invalid));
+    assert!(source_of(&plane).sync.created_slots.is_empty());
+    assert!(slot_exists(&server, &slot), "the slot is never dropped");
+    assert!(plane_rows(&plane, 1).is_empty());
+
+    drop(runtime);
+    server.drop_slot(&slot);
+    server.execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table}"
+    ));
+}
+
+/// A runtime that dies after creating the slot and before the plane
+/// commits the first page leaves a recorded slot; another runtime takes
+/// over and snapshots from it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL, SEKAI_TEST_POSTGRES_CA_CERT and SEKAI_TEST_CAPTURE_CHILD; run through scripts/postgres-conformance.sh"]
+async fn postgres_capture_resumes_a_recorded_slot_after_a_crash() {
+    let server = Server::from_env();
+    let (table, publication, slot) = (
+        unique("cc_rt_crash"),
+        unique("cc_rt_crash_pub"),
+        unique("cc_rt_crash_slot"),
+    );
+    server.execute(&format!(
+        "CREATE TABLE {table} (id int PRIMARY KEY, name text); \
+         INSERT INTO {table} VALUES (1, 'v1'), (2, 'v1'); \
+         CREATE PUBLICATION {publication} FOR TABLE {table}"
+    ));
+    let plane = serving(&server, &slot, &publication).await;
+    let dir = tempfile::tempdir().unwrap();
+    let log = Log::default();
+
+    let first = runtime(
+        &server,
+        &plane,
+        "eu-1",
+        &log,
+        Dies::BeforeCommit,
+        dir.path(),
+    )
+    .await;
+    assert_eq!(sync(&plane, &first, 1).await, Err(SyncFailure::Unavailable));
+    assert_eq!(
+        source_of(&plane).sync.created_slots,
+        std::slice::from_ref(&slot)
+    );
+    assert!(slot_exists(&server, &slot));
+    assert!(plane_rows(&plane, 2).is_empty());
+    drop(first);
+
+    server.execute(&format!("UPDATE {table} SET name = 'v2' WHERE id = 2"));
+    let second = runtime(&server, &plane, "eu-2", &log, Dies::Never, dir.path()).await;
+    assert_eq!(sync(&plane, &second, 2).await, Ok(()));
+    assert_eq!(plane_rows(&plane, 2), server.rows(&table));
+
+    drop(second);
     server.drop_slot(&slot);
     server.execute(&format!(
         "DROP PUBLICATION {publication}; DROP TABLE {table}"

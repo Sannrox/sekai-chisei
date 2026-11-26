@@ -401,15 +401,17 @@ macro_rules! columns {
          sync_claim_expires_at_ms, sync_lease_expiries, sync_last_success_at_ms, \
          sync_last_failure_at_ms, sync_last_failure, sync_last_runtime, \
          delivery_last_success_at_ms, delivery_last_failure_at_ms, delivery_last_failure, \
-         delivery_last_runtime, sync_last_notes_json"
+         delivery_last_runtime, sync_last_notes_json, sync_measured_notes_json, \
+         sync_created_slots_json"
     };
 }
 
 const COLUMNS: &str = columns!();
 
 /// The sync and delivery columns, added after the table (ADR 0149 claim
-/// record, ADR 0148 delivery health, ADR 0163 sync notes).
-const ADDED_COLUMNS: [(&str, &str); 18] = [
+/// record, ADR 0148 delivery health, ADR 0163 sync notes, #3083 capture
+/// slots and measured notes).
+const ADDED_COLUMNS: [(&str, &str); 20] = [
     ("sync_every_ms", "INTEGER NOT NULL DEFAULT 0"),
     ("sync_due_bucket", "INTEGER NOT NULL DEFAULT 0"),
     ("sync_claimed_bucket", "INTEGER NOT NULL DEFAULT 0"),
@@ -428,6 +430,8 @@ const ADDED_COLUMNS: [(&str, &str); 18] = [
     ("delivery_last_failure", "TEXT NOT NULL DEFAULT ''"),
     ("delivery_last_runtime", "TEXT NOT NULL DEFAULT ''"),
     ("sync_last_notes_json", "TEXT NOT NULL DEFAULT ''"),
+    ("sync_measured_notes_json", "TEXT NOT NULL DEFAULT ''"),
+    ("sync_created_slots_json", "TEXT NOT NULL DEFAULT ''"),
 ];
 
 /// Writes nothing when the id or the tokens are taken.
@@ -523,8 +527,25 @@ SET sync_due_bucket = $1, sync_claimed_bucket = $2, sync_done_bucket = $3,
     sync_claim_owner = $4, sync_claim_generation = $5, sync_fencing_token = $6,
     sync_claim_expires_at_ms = $7, sync_lease_expiries = $8,
     sync_last_success_at_ms = $9, sync_last_failure_at_ms = $10,
-    sync_last_failure = $11, sync_last_runtime = $12, sync_last_notes_json = $13
-WHERE namespace = $14 AND source_id = $15";
+    sync_last_failure = $11, sync_last_runtime = $12, sync_last_notes_json = $13,
+    sync_measured_notes_json = $14, sync_created_slots_json = $15
+WHERE namespace = $16 AND source_id = $17";
+
+/// The created-slots column: empty for none, else a JSON array of names.
+fn encode_created_slots(slots: &[String]) -> String {
+    if slots.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(slots).unwrap_or_default()
+    }
+}
+
+fn decode_created_slots(column: &str) -> Result<Vec<String>, String> {
+    if column.is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(column).map_err(|error| format!("decode created slots: {error}"))
+}
 
 struct Row {
     namespace: String,
@@ -538,6 +559,8 @@ struct Row {
     record_json: String,
     sync: SyncState,
     sync_notes_json: String,
+    sync_measured_notes_json: String,
+    sync_created_slots_json: String,
     delivery: DeliveryHealth,
 }
 
@@ -555,7 +578,11 @@ impl Row {
             created_at_ms: self.created_at_ms,
             updated_at_ms: self.updated_at_ms,
             sync: SyncState {
-                last_notes: StoredSyncNotes::decode(&self.sync_notes_json)?,
+                last_notes: StoredSyncNotes::decode(
+                    &self.sync_notes_json,
+                    &self.sync_measured_notes_json,
+                )?,
+                created_slots: decode_created_slots(&self.sync_created_slots_json)?,
                 ..self.sync
             },
             delivery: self.delivery,
@@ -590,8 +617,11 @@ fn sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
             last_failure: row.get(19)?,
             last_runtime: row.get(20)?,
             last_notes: StoredSyncNotes::default(),
+            created_slots: Vec::new(),
         },
         sync_notes_json: row.get(25)?,
+        sync_measured_notes_json: row.get(26)?,
+        sync_created_slots_json: row.get(27)?,
         delivery: DeliveryHealth {
             last_success_at_ms: row.get(21)?,
             last_failure_at_ms: row.get(22)?,
@@ -628,8 +658,11 @@ fn postgres_row(row: &postgres::Row) -> Row {
             last_failure: row.get(19),
             last_runtime: row.get(20),
             last_notes: StoredSyncNotes::default(),
+            created_slots: Vec::new(),
         },
         sync_notes_json: row.get(25),
+        sync_measured_notes_json: row.get(26),
+        sync_created_slots_json: row.get(27),
         delivery: DeliveryHealth {
             last_success_at_ms: row.get(21),
             last_failure_at_ms: row.get(22),
@@ -1132,6 +1165,7 @@ impl SekaiDb {
             .decode()?;
         change(&mut source)?;
         let sync = &source.sync;
+        let (notes, measured) = sync.last_notes.encode();
         transaction
             .execute(
                 SYNC_UPDATE_SQL,
@@ -1148,7 +1182,9 @@ impl SekaiDb {
                     sync.last_failure_at_ms,
                     sync.last_failure,
                     sync.last_runtime,
-                    sync.last_notes.encode(),
+                    notes,
+                    measured,
+                    encode_created_slots(&sync.created_slots),
                     namespace,
                     source_id,
                 ],
@@ -1211,6 +1247,7 @@ impl PostgresDb {
             .decode()?;
         change(&mut source)?;
         let sync = &source.sync;
+        let (notes, measured) = sync.last_notes.encode();
         transaction
             .execute(
                 SYNC_UPDATE_SQL,
@@ -1227,7 +1264,9 @@ impl PostgresDb {
                     &sync.last_failure_at_ms,
                     &sync.last_failure,
                     &sync.last_runtime,
-                    &sync.last_notes.encode(),
+                    &notes,
+                    &measured,
+                    &encode_created_slots(&sync.created_slots),
                     &namespace,
                     &source_id,
                 ],

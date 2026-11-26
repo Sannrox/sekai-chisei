@@ -92,6 +92,11 @@ pub struct Settings {
     /// `snapshot`: the most rows one page carries.
     #[serde(default)]
     pub max_rows: u32,
+    /// Whether the plane records the slot as one the runtime may create
+    /// (#3083). Only a recorded slot is created; an unrecorded one that
+    /// exists when a new snapshot starts is refused.
+    #[serde(default)]
+    pub slot_recorded: bool,
 }
 
 /// Why the session stopped, by name.
@@ -208,7 +213,7 @@ pub fn changes(
     let start = settings.resume_lsn;
     match session.slot(settings)? {
         // Nothing committed yet: the stream starts where the new slot does.
-        None if start == 0 => {
+        None if start == 0 && settings.slot_recorded => {
             let consistent_lsn = session.create_slot(settings)?;
             emit(out, &Line::SlotCreated { consistent_lsn })?;
         }
@@ -220,6 +225,7 @@ pub fn changes(
         }
         Some(_) => {}
     }
+    retained_log(session, settings, out)?;
     session.start_replication(settings, start)?;
     session.status(start)?;
     session.stream_timeout(Some(IDLE))?;
@@ -281,7 +287,11 @@ pub fn changes(
 ///
 /// A new snapshot (`snapshot_lsn` 0) makes sure the slot exists and reads
 /// after its confirmed position; a later page refuses a slot that is gone
-/// or confirmed past the snapshot's position. Each page is its own
+/// or confirmed past the snapshot's position. A new snapshot creates only
+/// a slot the plane records (`slot_recorded`): a missing unrecorded slot
+/// ends the page with `slot_missing`, for the runtime to record and run
+/// again, and an existing unrecorded one is refused as
+/// `slot_ahead_of_snapshot`, since changes before it were never read. Each page is its own
 /// read-only transaction, so no session outlives a page. The rows are
 /// whatever the table holds when the page reads them, possibly changed
 /// after the position: every row is a keyed upsert, and the feed replays
@@ -299,16 +309,21 @@ pub fn snapshot(
     }
     check(session, settings)?;
     let lsn = match (session.slot(settings)?, settings.snapshot_lsn) {
+        (None, 0) if !settings.slot_recorded => return emit(out, &Line::SlotMissing),
         (None, 0) => {
             let consistent_lsn = session.create_slot(settings)?;
             emit(out, &Line::SlotCreated { consistent_lsn })?;
             consistent_lsn
+        }
+        (Some(_), 0) if !settings.slot_recorded => {
+            return Err(Refusal("slot_ahead_of_snapshot"));
         }
         (Some(confirmed), 0) => confirmed,
         (None, _) => return Err(Refusal("slot_missing")),
         (Some(confirmed), at) if confirmed > at => return Err(Refusal("slot_ahead")),
         (Some(_), at) => at,
     };
+    retained_log(session, settings, out)?;
     emit(out, &Line::SnapshotAt { lsn })?;
     let table = session.published_table(settings)?;
     let after = settings
@@ -342,6 +357,38 @@ pub fn snapshot(
         emit(out, &Line::Row { key, row })?;
     }
     emit(out, &Line::SnapshotEnd { complete })
+}
+
+/// Writes how much log the server keeps for the slot, from its restart
+/// position to the current position, with its `wal_status`. The measure
+/// is an extra: a server that cannot answer, such as a standby, or a slot
+/// that reserves nothing yet, writes no line and reads on.
+fn retained_log(
+    session: &mut Session,
+    settings: &Settings,
+    out: &mut impl Write,
+) -> Result<(), Refusal> {
+    let rows = session.try_query(&format!(
+        "SELECT (pg_catalog.pg_current_wal_lsn() - restart_lsn)::bigint, wal_status \
+         FROM pg_catalog.pg_replication_slots WHERE slot_name = '{}'",
+        settings.slot
+    ))?;
+    let Ok(rows) = rows else {
+        return Ok(());
+    };
+    match rows.first().map(Vec::as_slice) {
+        Some([Some(bytes), Some(wal_status)]) => {
+            let bytes = bytes.parse().map_err(|_| Refusal("protocol_violation"))?;
+            emit(
+                out,
+                &Line::RetainedLog {
+                    bytes,
+                    wal_status: wal_status.clone(),
+                },
+            )
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The one table of the Source's publication, as a snapshot reads it.
@@ -905,6 +952,7 @@ mod tests {
             snapshot_lsn: 0,
             snapshot_after: None,
             max_rows: 0,
+            slot_recorded: false,
         }
     }
 

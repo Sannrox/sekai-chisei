@@ -8,6 +8,7 @@
 //! {"kind":"truncate","commit_lsn":40,"index":1,"relations":["public.items"]}
 //! {"kind":"commit","commit_lsn":40,"end_lsn":48}
 //! {"kind":"caught_up","wal_end":56}
+//! {"kind":"retained_log","bytes":8192,"wal_status":"reserved"}
 //! {"kind":"snapshot_at","lsn":32}
 //! {"kind":"row","key":{"id":"1"},"row":{"id":"1","name":"a"}}
 //! {"kind":"snapshot_end","complete":false}
@@ -50,10 +51,21 @@ pub enum Line {
         commit_lsn: u64,
         end_lsn: u64,
     },
-    /// `changes` created the Source's missing slot; its stream starts at
-    /// `consistent_lsn`.
+    /// `changes` or `snapshot` created the Source's missing, recorded
+    /// slot; its stream starts at `consistent_lsn`.
     SlotCreated {
         consistent_lsn: u64,
+    },
+    /// `snapshot`: a new snapshot found no slot and the plane does not
+    /// record it, so the child created none. The runtime records the slot
+    /// and runs the page again.
+    SlotMissing,
+    /// The server keeps `bytes` of log for the slot, from its restart
+    /// position to the current position; `wal_status` as the server names
+    /// it: reserved, extended, unreserved or lost.
+    RetainedLog {
+        bytes: i64,
+        wal_status: String,
     },
     /// `changes` ends its page: the stream was idle outside a transaction
     /// with the server at `wal_end`.

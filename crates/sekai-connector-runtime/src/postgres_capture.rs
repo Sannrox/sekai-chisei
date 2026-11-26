@@ -21,6 +21,17 @@
 //! table is refused as `table_empty` and fails the run `unavailable`, so
 //! the next sync tries again.
 //!
+//! The runtime creates only a slot the plane records (#3083, ADR 0170).
+//! A first snapshot, with no committed cursor, runs with the slots the
+//! plane recorded: a missing unrecorded slot comes back `slot_missing`,
+//! the runtime records it under the sync's claim and runs the page again,
+//! and only then does the child create it. A crash in between leaves a
+//! recorded slot the next sync creates. An existing slot the plane does
+//! not record is refused as `slot_ahead_of_snapshot` and never dropped or
+//! re-created. A recovery snapshot has a committed cursor and uses or
+//! creates the slot as before. Every page reports the log the slot
+//! retains as a `retained_log` note, sent with the sync's acknowledgement.
+//!
 //! The feed position lives only in the plane's cursor (ADR 0118):
 //! `pg1/<lsn>` is the end of the last transaction the plane holds whole,
 //! and `pg1/<lsn>/<commit>/<index>` adds that it also holds the changes
@@ -59,9 +70,12 @@ use std::io::{BufRead, Read};
 use std::path::Path;
 use std::time::Duration;
 
+use std::sync::Mutex;
+
 use sekai_source_sdk::{
     ChangeFeedPage, ConfigValue, Connector, ConnectorFailure, Destination, EgressAllowlist,
-    GenerationSnapshotPage, PropertyValue, SourceRecord, column_name_suggests_sensitive,
+    GenerationSnapshotPage, PlaneView, PlaneViewError, PropertyValue, SourceRecord, SyncNote,
+    WalStatus, column_name_suggests_sensitive,
 };
 use serde::{Deserialize, Serialize};
 
@@ -162,6 +176,7 @@ pub fn open(
             snapshot_lsn: 0,
             snapshot_after: None,
             max_rows: 0,
+            slot_recorded: false,
         },
         endpoint,
         egress: prepared.egress.clone(),
@@ -193,6 +208,7 @@ struct Settings {
     snapshot_lsn: u64,
     snapshot_after: Option<Vec<String>>,
     max_rows: u32,
+    slot_recorded: bool,
 }
 
 impl Connector for PostgresCapture {
@@ -205,10 +221,11 @@ impl Connector for PostgresCapture {
         })
     }
 
-    fn read_snapshot_page(
+    fn read_snapshot_page_with_plane(
         &mut self,
         committed_cursor: Option<&str>,
         max_records: usize,
+        plane: &mut dyn PlaneView,
     ) -> Result<GenerationSnapshotPage, ConnectorFailure> {
         // Any other cursor, such as a feed position the plane moved to
         // recovery, starts a new snapshot.
@@ -221,10 +238,18 @@ impl Connector for PostgresCapture {
         if max_records == 0 {
             return Err(ConnectorFailure::Invalid);
         }
-        let settings = Settings {
+        // Only a first snapshot checks the plane's record; a recovery
+        // snapshot uses or creates the slot as before.
+        let slot = &self.settings.slot;
+        let mut settings = Settings {
             snapshot_lsn: from.as_ref().map_or(0, |from| from.lsn),
             snapshot_after: from.as_ref().map(|from| from.after.clone()),
             max_rows: u32::try_from(max_records).unwrap_or(u32::MAX),
+            slot_recorded: committed_cursor.is_some()
+                || plane
+                    .created_slots()
+                    .iter()
+                    .any(|recorded| recorded == slot),
             ..self.settings.clone()
         };
         let reading = SnapshotReading {
@@ -234,8 +259,25 @@ impl Connector for PostgresCapture {
                 record_kind: &self.record_kind,
                 now_ms: now_ms(),
             },
+            retained: Mutex::default(),
         };
-        let page = self.supervised("snapshot", &settings, |out| reading.read(out))?;
+        let read = self.supervised("snapshot", &settings, |out| reading.read(out));
+        let read = match read {
+            Ok(Snapshot::Missing) if !settings.slot_recorded => {
+                plane
+                    .record_created_slot(slot)
+                    .map_err(|error| view_failure(error, &reading.retained, slot, plane))?;
+                settings.slot_recorded = true;
+                self.supervised("snapshot", &settings, |out| reading.read(out))
+            }
+            read => read,
+        };
+        report_retained(&reading.retained, slot, plane);
+        let page = match read? {
+            Snapshot::Page(page) => page,
+            // A recorded slot is created, never reported missing.
+            Snapshot::Missing => return Err(ConnectorFailure::Invalid),
+        };
         let handoff = Cursor {
             lsn: page.lsn,
             within: None,
@@ -256,12 +298,13 @@ impl Connector for PostgresCapture {
         })
     }
 
-    fn read_changes_from(
+    fn read_changes_with_plane(
         &mut self,
         committed_cursor: &str,
         _source_feed_epoch: &str,
         committed_offset: u64,
         max_records: usize,
+        plane: &mut dyn PlaneView,
     ) -> Result<ChangeFeedPage, ConnectorFailure> {
         let from = Cursor::parse(committed_cursor).ok_or(ConnectorFailure::Invalid)?;
         if max_records == 0 {
@@ -281,8 +324,11 @@ impl Connector for PostgresCapture {
                 record_kind: &self.record_kind,
                 now_ms: now_ms(),
             },
+            retained: Mutex::default(),
         };
-        let page = self.supervised("changes", &settings, |out| reading.read(out))?;
+        let page = self.supervised("changes", &settings, |out| reading.read(out));
+        report_retained(&reading.retained, &self.settings.slot, plane);
+        let page = page?;
         Ok(ChangeFeedPage {
             offset_start: committed_offset,
             records: page.records,
@@ -347,6 +393,40 @@ impl PostgresCapture {
 
     fn read_paths(&self) -> Vec<&Path> {
         read_paths(self.child.path())
+    }
+}
+
+/// The log the slot retains, as the child last measured it.
+type Retained = Mutex<Option<(i64, String)>>;
+
+/// Reports the last retained log measured to the plane, as a note. A
+/// status this runtime does not know is left out.
+fn report_retained(retained: &Retained, slot: &str, plane: &mut dyn PlaneView) {
+    let measured = retained.lock().map(|mut measured| measured.take());
+    if let Ok(Some((bytes, status))) = measured
+        && let Some(wal_status) = WalStatus::from_wire_name(&status)
+    {
+        plane.note(SyncNote::RetainedLog {
+            slot: slot.into(),
+            bytes,
+            wal_status,
+        });
+    }
+}
+
+/// A slot the plane could not record as the run's failure, reporting the
+/// log measured so far. A lapsed claim or a plane that cannot answer is
+/// `unavailable`, so the next sync records it.
+fn view_failure(
+    error: PlaneViewError,
+    retained: &Retained,
+    slot: &str,
+    plane: &mut dyn PlaneView,
+) -> ConnectorFailure {
+    report_retained(retained, slot, plane);
+    match error {
+        PlaneViewError::Unkeyed => ConnectorFailure::Invalid,
+        _ => ConnectorFailure::Unavailable,
     }
 }
 
@@ -424,6 +504,11 @@ enum Line {
         end_lsn: u64,
     },
     SlotCreated {},
+    SlotMissing {},
+    RetainedLog {
+        bytes: i64,
+        wal_status: String,
+    },
     SnapshotAt {
         lsn: u64,
     },
@@ -571,6 +656,14 @@ impl SnapshotCursor {
     }
 }
 
+/// What one snapshot run read.
+#[derive(Debug, PartialEq)]
+enum Snapshot {
+    /// A first snapshot found no slot the plane records.
+    Missing,
+    Page(SnapshotPage),
+}
+
 /// One snapshot page as read.
 #[derive(Debug, PartialEq)]
 struct SnapshotPage {
@@ -584,12 +677,14 @@ struct SnapshotReading<'a> {
     from: Option<&'a SnapshotCursor>,
     max_records: usize,
     kind: Kind<'a>,
+    retained: Retained,
 }
 
 impl SnapshotReading<'_> {
     /// Reads the child's lines into one page: the position, then rows in
-    /// key order, or the starting key gone, then the page's end.
-    fn read(&self, out: &mut dyn BufRead) -> Outcome<SnapshotPage> {
+    /// key order, or the starting key gone, then the page's end; or that
+    /// the slot is missing and unrecorded.
+    fn read(&self, out: &mut dyn BufRead) -> Outcome<Snapshot> {
         let mut page: Option<SnapshotPage> = None;
         loop {
             let line = match next_line(out) {
@@ -599,6 +694,14 @@ impl SnapshotReading<'_> {
             };
             match (line, page.as_mut()) {
                 (Line::SlotCreated {}, None) => {}
+                (Line::SlotMissing {}, None) if self.from.is_none() => {
+                    return Outcome::Done(Snapshot::Missing);
+                }
+                (Line::RetainedLog { bytes, wal_status }, None) => {
+                    if let Ok(mut retained) = self.retained.lock() {
+                        *retained = Some((bytes, wal_status));
+                    }
+                }
                 (Line::SnapshotAt { lsn }, None)
                     if lsn > 0 && self.from.is_none_or(|from| from.lsn == lsn) =>
                 {
@@ -640,7 +743,7 @@ impl SnapshotReading<'_> {
                 (other, _) => return other.outcome(),
             }
         }
-        page.map_or(Outcome::Invalid, Outcome::Done)
+        page.map_or(Outcome::Invalid, |page| Outcome::Done(Snapshot::Page(page)))
     }
 }
 
@@ -656,6 +759,7 @@ struct Reading<'a> {
     offset: u64,
     max_records: usize,
     kind: Kind<'a>,
+    retained: Retained,
 }
 
 impl Reading<'_> {
@@ -748,6 +852,11 @@ impl Reading<'_> {
                     page.caught_up = true;
                     return Outcome::Done(page);
                 }
+                Line::RetainedLog { bytes, wal_status } if first => {
+                    if let Ok(mut retained) = self.retained.lock() {
+                        *retained = Some((bytes, wal_status));
+                    }
+                }
                 other => return other.outcome(),
             }
         }
@@ -838,6 +947,7 @@ mod tests {
             offset,
             max_records,
             kind: KIND,
+            retained: Mutex::default(),
         }
     }
 
@@ -899,14 +1009,54 @@ mod tests {
     }
 
     fn snapshot(from: Option<&str>, max_records: usize, lines: &[&str]) -> Outcome<SnapshotPage> {
+        match snapshot_run(from, max_records, lines).0 {
+            Outcome::Done(Snapshot::Page(page)) => Outcome::Done(page),
+            Outcome::Done(Snapshot::Missing) => panic!("the slot is missing"),
+            Outcome::Refused(reason) => Outcome::Refused(reason),
+            Outcome::Unavailable => Outcome::Unavailable,
+            Outcome::Ended(Some(Snapshot::Page(page))) => Outcome::Ended(Some(page)),
+            Outcome::Ended(_) => Outcome::Ended(None),
+            Outcome::Invalid => Outcome::Invalid,
+        }
+    }
+
+    /// What one snapshot run reads, and the retained log it measured.
+    fn snapshot_run(
+        from: Option<&str>,
+        max_records: usize,
+        lines: &[&str],
+    ) -> (Outcome<Snapshot>, Option<(i64, String)>) {
         let from = from.map(|text| SnapshotCursor::parse(text).unwrap());
         let reading = SnapshotReading {
             from: from.as_ref(),
             max_records,
             kind: KIND,
+            retained: Mutex::default(),
         };
         let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
-        reading.read(&mut text.as_bytes())
+        let read = reading.read(&mut text.as_bytes());
+        (read, reading.retained.into_inner().unwrap())
+    }
+
+    /// Only a new snapshot may find its slot missing; the retained log
+    /// comes before the position.
+    #[test]
+    fn a_new_snapshot_reports_a_missing_slot_and_the_retained_log() {
+        let missing = r#"{"kind":"slot_missing"}"#;
+        assert_eq!(
+            snapshot_run(None, 2, &[missing]).0,
+            Outcome::Done(Snapshot::Missing)
+        );
+        assert_eq!(
+            snapshot_run(Some("pg1s/208/a"), 2, &[missing]).0,
+            Outcome::Invalid
+        );
+        let retained = r#"{"kind":"retained_log","bytes":4096,"wal_status":"extended"}"#;
+        let at = r#"{"kind":"snapshot_at","lsn":208}"#;
+        let done = r#"{"kind":"snapshot_end","complete":true}"#;
+        let (read, measured) = snapshot_run(None, 2, &[retained, at, &row("1"), done]);
+        assert!(matches!(read, Outcome::Done(Snapshot::Page(_))));
+        assert_eq!(measured, Some((4096, "extended".into())));
     }
 
     fn row(id: &str) -> String {
@@ -1166,6 +1316,7 @@ case "$start" in *'"resume_lsn":208'*) ;; *) exit 9 ;; esac
 case "$start" in *'"max_commits":10'*) ;; *) exit 9 ;; esac
 runs=$(( $(cat "$here/runs" 2>/dev/null || echo 0) + 1 ))
 echo "$runs" > "$here/runs"
+echo '{"kind":"retained_log","bytes":4096,"wal_status":"extended"}'
 case "$(cat "$here/mode")" in
   dies-once) [ "$runs" = 1 ] && kill -9 $$ ;;
   dies) kill -9 $$ ;;
@@ -1177,11 +1328,79 @@ echo '{"kind":"commit","commit_lsn":300,"end_lsn":308}'
 echo '{"kind":"caught_up","wal_end":308}'
 "#;
 
+    /// A stand-in snapshot child: it reports an unrecorded slot missing,
+    /// and creates and reads a recorded one.
+    const SNAPSHOT_STAND_IN: &str = r#"#!/bin/bash
+here="$(dirname "$0")"
+start="$(cat)"
+runs=$(( $(cat "$here/runs" 2>/dev/null || echo 0) + 1 ))
+echo "$runs" > "$here/runs"
+case "$start" in
+  *'"slot_recorded":false'*) echo '{"kind":"slot_missing"}'; exit 0 ;;
+esac
+echo '{"kind":"slot_created","consistent_lsn":208}'
+echo '{"kind":"snapshot_at","lsn":208}'
+echo '{"kind":"row","key":{"id":"1"},"row":{"id":"1"}}'
+echo '{"kind":"snapshot_end","complete":true}'
+"#;
+
+    /// A plane view with `created_slots`, recording slots into it unless
+    /// `refuse` is set, and keeping the notes it is given.
+    #[derive(Default)]
+    struct Plane {
+        created_slots: Vec<String>,
+        refuse: Option<PlaneViewError>,
+        notes: Vec<SyncNote>,
+    }
+
+    impl PlaneView for Plane {
+        fn record_versions(
+            &mut self,
+            _range: sekai_source_sdk::KeyRange<'_>,
+            _limit: usize,
+        ) -> Result<Vec<sekai_source_sdk::RecordVersion>, PlaneViewError> {
+            Ok(Vec::new())
+        }
+
+        fn created_slots(&self) -> &[String] {
+            &self.created_slots
+        }
+
+        fn record_created_slot(&mut self, slot: &str) -> Result<(), PlaneViewError> {
+            if let Some(error) = self.refuse {
+                return Err(error);
+            }
+            self.created_slots.push(slot.into());
+            Ok(())
+        }
+
+        fn note(&mut self, note: SyncNote) {
+            self.notes.push(note);
+        }
+    }
+
+    fn retained_note() -> SyncNote {
+        SyncNote::RetainedLog {
+            slot: "s".into(),
+            bytes: 4096,
+            wal_status: WalStatus::Extended,
+        }
+    }
+
     /// The stand-in child as a Source's capture, dialing a listener whose
     /// connections queue in its backlog while it lives.
     fn stand_in(directory: &Path, mode: &str) -> (PostgresCapture, std::net::TcpListener) {
+        stand_in_running(directory, mode, STAND_IN)
+    }
+
+    /// [`stand_in`] running `script` as the child.
+    fn stand_in_running(
+        directory: &Path,
+        mode: &str,
+        script: &str,
+    ) -> (PostgresCapture, std::net::TcpListener) {
         let path = directory.join(capture::CAPTURE_CHILD_NAME);
-        std::fs::write(&path, STAND_IN).unwrap();
+        std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(directory.join("mode"), mode).unwrap();
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -1203,6 +1422,7 @@ echo '{"kind":"caught_up","wal_end":308}'
                 snapshot_lsn: 0,
                 snapshot_after: None,
                 max_rows: 0,
+                slot_recorded: false,
             },
             record_kind: "Item".into(),
         };
@@ -1220,7 +1440,12 @@ echo '{"kind":"caught_up","wal_end":308}'
     fn a_child_that_dies_is_restarted_and_one_that_keeps_dying_is_unavailable() {
         let directory = tempfile::tempdir().unwrap();
         let (mut capture, _listener) = stand_in(directory.path(), "dies-once");
-        let page = capture.read_changes_from("pg1/208", "e", 4, 10).unwrap();
+        let mut plane = Plane::default();
+        let page = capture
+            .read_changes_with_plane("pg1/208", "e", 4, 10, &mut plane)
+            .unwrap();
+        // Each run measured it; the page reports the last once.
+        assert_eq!(plane.notes, [retained_note()]);
         assert_eq!(runs(directory.path()), "2");
         assert_eq!(page.offset_start, 4);
         assert_eq!(page.records[0].source_sequence, Some(5));
@@ -1230,7 +1455,7 @@ echo '{"kind":"caught_up","wal_end":308}'
         let directory = tempfile::tempdir().unwrap();
         let (mut capture, _listener) = stand_in(directory.path(), "dies");
         assert_eq!(
-            capture.read_changes_from("pg1/208", "e", 4, 10),
+            capture.read_changes_with_plane("pg1/208", "e", 4, 10, &mut Plane::default()),
             Err(ConnectorFailure::Unavailable)
         );
         assert_eq!(runs(directory.path()), (RESTARTS.len() + 1).to_string());
@@ -1244,12 +1469,52 @@ echo '{"kind":"caught_up","wal_end":308}'
         ] {
             let directory = tempfile::tempdir().unwrap();
             let (mut capture, _listener) = stand_in(directory.path(), mode);
+            let mut plane = Plane::default();
             assert_eq!(
-                capture.read_changes_from("pg1/208", "e", 0, 10),
+                capture.read_changes_with_plane("pg1/208", "e", 0, 10, &mut plane),
                 Err(failure)
             );
             assert_eq!(runs(directory.path()), "1", "{mode}");
+            // A failed page still reports what it measured.
+            assert_eq!(plane.notes, [retained_note()], "{mode}");
         }
+    }
+
+    /// A first snapshot creates only a slot the plane records: an
+    /// unrecorded missing slot is recorded and the page runs again; a slot
+    /// the plane cannot record is never created.
+    #[test]
+    fn a_first_snapshot_records_the_slot_before_the_child_creates_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut capture, _listener) = stand_in_running(directory.path(), "ok", SNAPSHOT_STAND_IN);
+        let mut plane = Plane::default();
+        let page = capture
+            .read_snapshot_page_with_plane(None, 10, &mut plane)
+            .unwrap();
+        assert_eq!(plane.created_slots, ["s"]);
+        assert_eq!(runs(directory.path()), "2");
+        assert!(page.complete);
+        assert_eq!(page.proposed_next_cursor, "pg1/208");
+
+        // Already recorded: one run.
+        let directory = tempfile::tempdir().unwrap();
+        let (mut capture, _listener) = stand_in_running(directory.path(), "ok", SNAPSHOT_STAND_IN);
+        capture
+            .read_snapshot_page_with_plane(None, 10, &mut plane)
+            .unwrap();
+        assert_eq!(runs(directory.path()), "1");
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut capture, _listener) = stand_in_running(directory.path(), "ok", SNAPSHOT_STAND_IN);
+        let mut lapsed = Plane {
+            refuse: Some(PlaneViewError::FenceLost),
+            ..Plane::default()
+        };
+        assert_eq!(
+            capture.read_snapshot_page_with_plane(None, 10, &mut lapsed),
+            Err(ConnectorFailure::Unavailable)
+        );
+        assert_eq!(runs(directory.path()), "1");
     }
 
     #[test]

@@ -12,6 +12,7 @@
 //! the runtime checks against the Source's [`EgressAllowlist`] before it
 //! connects, failing closed.
 
+use crate::SyncNote;
 use crate::contract::{
     SOURCE_GITHUB, contains_secret_like_text, require_bounded_identifier,
     require_registered_record_token, validate_github_repository,
@@ -773,7 +774,7 @@ pub enum PlaneViewError {
 
 /// What the plane holds for the Source a sync reads (ADR 0167). The
 /// connector runtime opens one under the sync's claim and passes it to
-/// [`Connector::read_page_with_plane`].
+/// the `_with_plane` reads of [`Connector`].
 pub trait PlaneView {
     /// At most `limit` live records in `range`, ordered by object key and
     /// then external id in byte order. Fewer than `limit` means the range
@@ -783,6 +784,24 @@ pub trait PlaneView {
         range: KeyRange<'_>,
         limit: usize,
     ) -> Result<Vec<RecordVersion>, PlaneViewError>;
+
+    /// The replication slots the plane records as ones this Source's
+    /// runtime may have created (#3083, ADR 0170).
+    fn created_slots(&self) -> &[String] {
+        &[]
+    }
+
+    /// Records `slot` as one the runtime may create, before it creates
+    /// it, so a crash in between leaves a recorded slot the next sync
+    /// creates rather than an unrecorded one it must refuse.
+    fn record_created_slot(&mut self, _slot: &str) -> Result<(), PlaneViewError> {
+        Err(PlaneViewError::Unavailable)
+    }
+
+    /// Reports a note measured while reading, such as a slot's retained
+    /// log. The runtime sends it with the sync's acknowledgement even
+    /// when the page then fails.
+    fn note(&mut self, _note: SyncNote) {}
 }
 
 /// One connected Source of some connector type. The runtime opens it with
@@ -844,6 +863,19 @@ pub trait Connector {
         Err(ConnectorFailure::Unsupported)
     }
 
+    /// [`Connector::read_snapshot_page`] with a view of what the plane
+    /// holds for the Source, for a type that keeps state at the source,
+    /// such as a replication slot. The runtime calls this one; the default
+    /// ignores the view.
+    fn read_snapshot_page_with_plane(
+        &mut self,
+        committed_cursor: Option<&str>,
+        max_records: usize,
+        _plane: &mut dyn PlaneView,
+    ) -> Result<GenerationSnapshotPage, ConnectorFailure> {
+        self.read_snapshot_page(committed_cursor, max_records)
+    }
+
     fn read_changes(
         &mut self,
         _source_feed_epoch: &str,
@@ -865,6 +897,25 @@ pub trait Connector {
         max_records: usize,
     ) -> Result<ChangeFeedPage, ConnectorFailure> {
         self.read_changes(source_feed_epoch, committed_offset, max_records)
+    }
+
+    /// [`Connector::read_changes_from`] with a view of what the plane
+    /// holds for the Source. The runtime calls this one; the default
+    /// ignores the view.
+    fn read_changes_with_plane(
+        &mut self,
+        committed_cursor: &str,
+        source_feed_epoch: &str,
+        committed_offset: u64,
+        max_records: usize,
+        _plane: &mut dyn PlaneView,
+    ) -> Result<ChangeFeedPage, ConnectorFailure> {
+        self.read_changes_from(
+            committed_cursor,
+            source_feed_epoch,
+            committed_offset,
+            max_records,
+        )
     }
 
     fn deliver(&mut self, _artifact: &ExportArtifact<'_>) -> Result<(), ConnectorFailure> {

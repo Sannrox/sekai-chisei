@@ -84,7 +84,9 @@ pub use sdk::{
     build_source_batch, build_source_batch_v2, serialize_source_batch,
 };
 pub use sekai_types::object_schema::PropertyValue;
-pub use sekai_types::source_sync_note::{MAX_SYNC_NOTES, SkipReason, SyncNote, SyncNotes};
+pub use sekai_types::source_sync_note::{
+    MAX_SYNC_NOTES, SkipReason, SyncNote, SyncNotes, WalStatus,
+};
 pub use snapshot::{
     DEFAULT_MAX_SNAPSHOT_PAGES_PER_RUN, GenerationSnapshotPage, GenerationSnapshotRead,
     GenerationSnapshotSource, SnapshotPage, SnapshotPageSource, SnapshotRead, SnapshotRunError,

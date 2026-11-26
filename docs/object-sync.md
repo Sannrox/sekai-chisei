@@ -393,13 +393,23 @@ is empty without being caught up fails the sync as `invalid` and commits
 nothing. A generation in recovery starts the next generation's snapshot.
 
 The snapshot reads the table after the slot's position `P` (ADR 0170): the
-first page creates the slot when it is missing and takes its confirmed
-position, each page reads the next 500 rows in key order after the last
-committed key, and the last page hands off to the feed at `P`, which replays
-every change committed after it. The plane therefore ends in the source's
-state, though a row can briefly show an older value during the hand-off. An
-empty table fails the sync as `unavailable` (`table_empty`) until a row
-exists.
+first page makes sure the slot exists and takes its confirmed position, each
+page reads the next 500 rows in key order after the last committed key, and
+the last page hands off to the feed at `P`, which replays every change
+committed after it. The plane therefore ends in the source's state, though a
+row can briefly show an older value during the hand-off. An empty table fails
+the sync as `unavailable` (`table_empty`) until a row exists.
+
+The runtime creates only a slot the plane records. Before a first snapshot
+creates a missing slot, the runtime records its name on the Source with
+`RecordSourceCreatedSlot` under the sync's claim; the Source shows the names
+as `sync.created_slots`, which only grows. A slot that already exists at the
+first sync and is not recorded is refused as `invalid`
+(`slot_ahead_of_snapshot`) and left in place: drop it or name another slot.
+A runtime that dies after recording or creating the slot leaves a recorded
+slot that the next sync creates or uses. Every sync reports the log the slot
+retains as a `retained_log` note (`slot`, `bytes`, `wal_status`) with its
+outcome, completed or failed; a disabled Source keeps showing the last value.
 
 Each snapshot or change page runs one sandboxed capture child over a
 connection the runtime dialed after the egress check. A record's `external_id` is its

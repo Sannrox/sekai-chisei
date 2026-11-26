@@ -272,6 +272,7 @@ const DATASET_SERIES_INDEX_SCHEMA: &str = include_str!("postgres/0187_dataset_se
 const DATASET_ROW_SPANS_SCHEMA: &str = include_str!("postgres/0188_dataset_row_spans.sql");
 const INTERACTIVE_AGENT_TURNS_SCHEMA: &str =
     include_str!("postgres/0191_interactive_agent_turns.sql");
+const SOURCE_CAPTURE_SLOTS_SCHEMA: &str = include_str!("postgres/0192_source_capture_slots.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1378,6 +1379,12 @@ const MIGRATIONS: &[Migration] = &[
         191,
         "interactive_agent_turns",
         INTERACTIVE_AGENT_TURNS_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        192,
+        "source_capture_slots",
+        SOURCE_CAPTURE_SLOTS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

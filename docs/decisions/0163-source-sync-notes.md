@@ -29,7 +29,13 @@ record content.
    - `offset_gap {partition, from_offset, to_offset}`: offsets from
      `from_offset` up to, not including, `to_offset` were never read;
    - `skipped_record {partition, offset, reason}`, where `reason` is
-     `not_json` or `missing_id`.
+     `not_json` or `missing_id`;
+   - `retained_log {slot, bytes, wal_status}` (#3083, ADR 0170): the log
+     a replication slot retains, measured on the sync's last page. A sync
+     carries at most one per slot; `wal_status` is `reserved`, `extended`,
+     `unreserved` or `lost`. The plane stores it in
+     `sync_measured_notes_json`, apart from the kinds above, so a plane
+     that predates it still reads the Source.
 2. A sync keeps at most 64 notes. Past that the runtime sends only
    `overflow_count`. Notes name positions and never record content. The
    plane refuses more than 64 notes, a negative position or count, an empty

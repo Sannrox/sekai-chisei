@@ -12,7 +12,7 @@
 use super::*;
 use crate::sekai::source::{self, PutSource, Source, SourceError, SourceSpec, SourceStatus};
 use crate::sekai::source_sync::{
-    self, SkipReason, SyncError, SyncFailure, SyncNote, SyncNotes, SyncOutcome,
+    self, SkipReason, SyncError, SyncFailure, SyncNote, SyncNotes, SyncOutcome, WalStatus,
 };
 use crate::sekai::work_claim::{ClaimError, Fence};
 use sekai_source_sdk::{ConfigValue, SourceConfig};
@@ -130,8 +130,11 @@ pub(super) fn sync_notes_from_proto(notes: Option<SourceSyncNotes>) -> Result<Sy
     let Some(notes) = notes else {
         return Ok(SyncNotes::default());
     };
-    let refuse =
-        || Status::invalid_argument("a source sync note names an offset gap or a skipped record");
+    let refuse = || {
+        Status::invalid_argument(
+            "a source sync note names an offset gap, a skipped record or a retained log",
+        )
+    };
     let parsed = notes
         .notes
         .into_iter()
@@ -148,6 +151,15 @@ pub(super) fn sync_notes_from_proto(notes: Option<SourceSyncNotes>) -> Result<Sy
                     Status::invalid_argument("a skipped record's reason is not_json or missing_id")
                 })?,
             }),
+            source_sync_note::Note::RetainedLog(retained) => Ok(SyncNote::RetainedLog {
+                slot: retained.slot,
+                bytes: retained.bytes,
+                wal_status: WalStatus::from_wire_name(&retained.wal_status).ok_or_else(|| {
+                    Status::invalid_argument(
+                        "a retained log's wal_status is reserved, extended, unreserved or lost",
+                    )
+                })?,
+            }),
         })
         .collect::<Result<Vec<_>, Status>>()?;
     SyncNotes::new(parsed, notes.overflow_count).map_err(Status::invalid_argument)
@@ -159,8 +171,8 @@ pub(super) fn sync_notes_to_proto(notes: &SyncNotes) -> SourceSyncNotes {
             .notes()
             .iter()
             .filter_map(|note| {
-                let note = match *note {
-                    SyncNote::OffsetGap {
+                let note = match note {
+                    &SyncNote::OffsetGap {
                         partition,
                         from_offset,
                         to_offset,
@@ -169,7 +181,7 @@ pub(super) fn sync_notes_to_proto(notes: &SyncNotes) -> SourceSyncNotes {
                         from_offset,
                         to_offset,
                     }),
-                    SyncNote::SkippedRecord {
+                    &SyncNote::SkippedRecord {
                         partition,
                         offset,
                         reason,
@@ -177,6 +189,15 @@ pub(super) fn sync_notes_to_proto(notes: &SyncNotes) -> SourceSyncNotes {
                         partition,
                         offset,
                         reason: reason.wire_name().into(),
+                    }),
+                    SyncNote::RetainedLog {
+                        slot,
+                        bytes,
+                        wal_status,
+                    } => source_sync_note::Note::RetainedLog(source_sync_note::RetainedLog {
+                        slot: slot.clone(),
+                        bytes: *bytes,
+                        wal_status: wal_status.wire_name().into(),
                     }),
                     // A note kind this wire predates has no shape here.
                     _ => return None,
@@ -204,6 +225,7 @@ pub(super) fn source_to_proto(source: Source) -> ConnectorSource {
         claim_expires_at_ms: sync.claim.expires_at_ms,
         due: source.status == SourceStatus::Active && sync.due_bucket > sync.done_bucket,
         last_notes: sync.current_notes().map(sync_notes_to_proto),
+        created_slots: sync.created_slots.clone(),
     };
     ConnectorSource {
         namespace: source.namespace,
@@ -377,6 +399,41 @@ impl SekaiServiceImpl {
                     source_version: record.source_version,
                 })
                 .collect(),
+        }))
+    }
+
+    /// `RecordSourceCreatedSlot`: records a replication slot the runtime
+    /// holding the Source's live sync claim may create (#3083).
+    pub(super) async fn record_source_created_slot_rpc(
+        &self,
+        req: Request<RecordSourceCreatedSlotRequest>,
+    ) -> Result<Response<RecordSourceCreatedSlotResponse>, Status> {
+        let request = req.get_ref();
+        self.source_sync_runtime(&req, &request.namespace)?;
+        let fence = Fence {
+            owner: &request.runtime_id,
+            generation: request.claim_generation,
+            token: &request.fencing_token,
+        };
+        let created_slots = source_sync::record_created_slot(
+            self.db.runtime(),
+            &request.namespace,
+            &request.source_id,
+            fence,
+            &request.slot,
+            now_millis(),
+        )
+        .map_err(|error| match error {
+            SyncError::Claim(ClaimError::FenceLost) => {
+                Status::failed_precondition("claim is not current")
+            }
+            SyncError::InvalidSlot => Status::invalid_argument(error.to_string()),
+            SyncError::SlotLimit => Status::failed_precondition(error.to_string()),
+            SyncError::NotFound => Status::not_found("source not found"),
+            error => sync_status(error),
+        })?;
+        Ok(Response::new(RecordSourceCreatedSlotResponse {
+            created_slots,
         }))
     }
 
