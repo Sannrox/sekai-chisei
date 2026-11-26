@@ -279,6 +279,7 @@ fn object_property(property: &DomainProperty) -> Result<PropertyDef, String> {
         compute_expr: String::new(),
         classification: default_property_classification(),
         struct_fields: Vec::new(),
+        series_dataset: String::new(),
     })
 }
 

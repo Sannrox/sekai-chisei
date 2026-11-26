@@ -96,6 +96,7 @@ pub fn install(db: &RuntimeDb, namespace: &str, actor: &str, now_ms: i64) -> Res
                 compute_expr: String::new(),
                 classification: default_property_classification(),
                 struct_fields: Vec::new(),
+                series_dataset: String::new(),
             })
             .collect(),
         is_builtin: false,

@@ -824,7 +824,7 @@ fn validate_property_value(property_type: &str, value: &str) -> Result<(), Objec
                 ))
             }
         }
-        "string" | "text" | "enum" | "link" | "computed" | "struct" => Ok(()),
+        "string" | "text" | "enum" | "link" | "computed" | "struct" | "series" => Ok(()),
         _ => Err(ObjectSetError::Unsupported(
             "unsupported object-set property type",
         )),

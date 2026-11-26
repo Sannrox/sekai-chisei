@@ -455,6 +455,7 @@ fn apply_domain_schema(db: &RuntimeDb) -> Result<(DomainSchemaPackage, String), 
                     compute_expr: String::new(),
                     classification: "internal".into(),
                     struct_fields: Vec::new(),
+                    series_dataset: String::new(),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;

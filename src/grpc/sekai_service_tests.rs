@@ -4527,6 +4527,7 @@ fn widget_schema_type() -> ObjectType {
                 compute_expr: "".into(),
                 classification: "public".into(),
                 struct_fields: vec![],
+                series_dataset: String::new(),
             },
             PropertyDef {
                 name: "color".into(),
@@ -4538,6 +4539,7 @@ fn widget_schema_type() -> ObjectType {
                 compute_expr: "".into(),
                 classification: "public".into(),
                 struct_fields: vec![],
+                series_dataset: String::new(),
             },
         ],
         is_builtin: false,
@@ -6279,6 +6281,60 @@ async fn record_decision_strips_reserved_attestation_evidence_keys() {
 }
 
 #[tokio::test]
+async fn series_property_round_trips_its_samples_dataset() {
+    let svc = service();
+    grant_schema_admin(&svc);
+    let series = {
+        let mut schema_type = widget_schema_type();
+        schema_type.properties.push(PropertyDef {
+            name: "temperature".into(),
+            r#type: "series".into(),
+            required: false,
+            description: "".into(),
+            enum_values: vec![],
+            link_kind: "".into(),
+            compute_expr: "".into(),
+            classification: "public".into(),
+            struct_fields: vec![],
+            series_dataset: "sensor-samples".into(),
+        });
+        schema_type
+    };
+    svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
+        r#type: Some(series),
+    }))
+    .await
+    .unwrap();
+    let listed = svc
+        .list_schema_types(with_principal(ListSchemaTypesRequest::default()))
+        .await
+        .unwrap()
+        .into_inner();
+    let widget = listed.types.iter().find(|t| t.kind == "widget").unwrap();
+    let property = widget
+        .properties
+        .iter()
+        .find(|property| property.name == "temperature")
+        .unwrap();
+    assert_eq!(property.r#type, "series");
+    assert_eq!(property.series_dataset, "sensor-samples");
+
+    // The value on an object is its series id.
+    svc.create_object(with_principal(CreateObjectRequest {
+        object: Some(widget_object(
+            "widget-series",
+            HashMap::from([
+                ("name".into(), "probe".into()),
+                ("temperature".into(), "probe-7".into()),
+            ]),
+        )),
+        lease_precondition: None,
+    }))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn struct_property_round_trips_through_create_update_and_list() {
     let svc = service();
     grant_schema_admin(&svc);
@@ -6315,6 +6371,7 @@ async fn struct_property_round_trips_through_create_update_and_list() {
                 enum_values: vec![],
             },
         ],
+        series_dataset: String::new(),
     });
     svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
         r#type: Some(schema_type),
@@ -9902,6 +9959,7 @@ async fn computed_property_resolves_from_function_without_persisting() {
                 compute_expr: "count_children".into(),
                 classification: "public".into(),
                 struct_fields: vec![],
+                series_dataset: String::new(),
             }],
             is_builtin: false,
             implements: vec![],
@@ -10368,6 +10426,7 @@ async fn schema_type_rejects_unknown_computed_function() {
                     compute_expr: "missing_function".into(),
                     classification: "public".into(),
                     struct_fields: vec![],
+                    series_dataset: String::new(),
                 }],
                 is_builtin: false,
                 implements: vec![],
@@ -10412,6 +10471,7 @@ async fn unresolved_computed_property_hides_stored_value() {
                 compute_expr: "ambiguous_child_count".into(),
                 classification: "public".into(),
                 struct_fields: vec![],
+                series_dataset: String::new(),
             }],
             is_builtin: false,
             implements: vec![],
@@ -13788,6 +13848,7 @@ async fn schema_type_implements_interface_and_list_filters_by_interface() {
             compute_expr: "".into(),
             classification: "public".into(),
             struct_fields: vec![],
+            series_dataset: String::new(),
         }],
         is_builtin: false,
     };
@@ -13819,6 +13880,7 @@ async fn schema_type_implements_interface_and_list_filters_by_interface() {
         compute_expr: "".into(),
         classification: "public".into(),
         struct_fields: vec![],
+        series_dataset: String::new(),
     });
     let err = svc
         .create_schema_type(with_principal(CreateSchemaTypeRequest {
@@ -13841,6 +13903,7 @@ async fn schema_type_implements_interface_and_list_filters_by_interface() {
         compute_expr: "".into(),
         classification: "public".into(),
         struct_fields: vec![],
+        series_dataset: String::new(),
     });
     svc.create_schema_type(with_principal(CreateSchemaTypeRequest {
         r#type: Some(valid_type),
@@ -16365,6 +16428,7 @@ async fn retrieve_context_enforces_graph_visibility_and_response_redaction() {
         compute_expr: String::new(),
         classification: "sensitive".into(),
         struct_fields: Vec::new(),
+        series_dataset: String::new(),
     });
     svc.create_schema_type(with_named_principal(
         CreateSchemaTypeRequest {
@@ -18352,6 +18416,7 @@ async fn capability_discovery_hides_restricted_schema_and_markings() {
         compute_expr: "".into(),
         classification: "internal".into(),
         struct_fields: vec![],
+        series_dataset: String::new(),
     });
     svc.create_schema_type(with_named_principal(
         CreateSchemaTypeRequest {
@@ -29626,6 +29691,7 @@ async fn apply_streaming_transform_batch_is_fenced_and_idempotent() {
                 compute_expr: String::new(),
                 classification: "public".into(),
                 struct_fields: vec![],
+                series_dataset: String::new(),
             }],
             is_builtin: false,
             implements: vec![],
@@ -29795,6 +29861,7 @@ async fn apply_streaming_transform_batch_stamps_markings_and_refuses_declassify(
                 compute_expr: String::new(),
                 classification: "public".into(),
                 struct_fields: vec![],
+                series_dataset: String::new(),
             }],
             is_builtin: false,
             implements: vec![],
@@ -38815,6 +38882,7 @@ async fn change_wakes_coalesce_and_ignore_hidden_fields() {
         compute_expr: String::new(),
         classification: classification.into(),
         struct_fields: Vec::new(),
+        series_dataset: String::new(),
     };
     db.upsert_object_type(&ObjectType {
         kind: "ticket".into(),
@@ -39773,6 +39841,7 @@ async fn object_change_subscription_refuses_restricted_property_filters() {
         compute_expr: String::new(),
         classification: "sensitive".into(),
         struct_fields: Vec::new(),
+        series_dataset: String::new(),
     });
     svc.create_schema_type(with_named_principal(
         CreateSchemaTypeRequest {
@@ -40128,6 +40197,7 @@ async fn object_source_record_returns_the_retained_payload_under_get_object_rule
         compute_expr: String::new(),
         classification: classification.into(),
         struct_fields: Vec::new(),
+        series_dataset: String::new(),
     };
     svc.create_schema_type(with_named_principal(
         CreateSchemaTypeRequest {

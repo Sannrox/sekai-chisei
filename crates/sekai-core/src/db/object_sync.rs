@@ -5957,6 +5957,7 @@ pub mod tests {
             } else {
                 Vec::new()
             },
+            series_dataset: String::new(),
         }
     }
 

@@ -135,6 +135,8 @@ message PropertyDef {
   string compute_expr = 7;
   string classification = 8;
   repeated StructFieldDef struct_fields = 9;
+  // Samples dataset of a `series` property (ADR 0161); empty for other types.
+  string series_dataset = 10;
 }
 
 message StructFieldDef {

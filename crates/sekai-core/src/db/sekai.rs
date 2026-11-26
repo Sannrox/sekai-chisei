@@ -3254,6 +3254,7 @@ mod tests {
                 compute_expr: String::new(),
                 classification: crate::sekai::schema::default_property_classification(),
                 struct_fields: vec![],
+                series_dataset: String::new(),
             }],
             is_builtin: false,
             implements: vec!["RiskScored".into(), "Governed".into()],

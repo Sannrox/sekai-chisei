@@ -353,7 +353,10 @@ impl ShapeDomain {
                 property.required
                     && matches!(
                         property.prop_type,
-                        PropertyType::Link | PropertyType::Computed | PropertyType::Struct
+                        PropertyType::Link
+                            | PropertyType::Computed
+                            | PropertyType::Struct
+                            | PropertyType::Series
                     )
             }) {
                 return Err(format!(
@@ -509,6 +512,7 @@ mod tests {
             compute_expr: String::new(),
             classification: classification.into(),
             struct_fields: Vec::new(),
+            series_dataset: String::new(),
         }
     }
 

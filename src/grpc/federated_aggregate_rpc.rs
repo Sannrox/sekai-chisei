@@ -1952,6 +1952,7 @@ mod tests {
             compute_expr: String::new(),
             classification: classification.into(),
             struct_fields: vec![],
+            series_dataset: String::new(),
         };
         svc.create_schema_type(as_principal(
             CreateSchemaTypeRequest {

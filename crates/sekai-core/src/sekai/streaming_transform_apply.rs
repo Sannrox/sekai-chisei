@@ -788,6 +788,7 @@ mod tests {
                 compute_expr: String::new(),
                 classification: "public".into(),
                 struct_fields: vec![],
+                series_dataset: String::new(),
             }],
             is_builtin: false,
             implements: vec![],

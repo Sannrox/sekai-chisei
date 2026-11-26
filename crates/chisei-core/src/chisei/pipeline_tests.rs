@@ -45,6 +45,7 @@ fn prop(name: &str, prop_type: PropertyType) -> PropertyDef {
         compute_expr: String::new(),
         classification: crate::chisei::object_schema::default_property_classification(),
         struct_fields: vec![],
+        series_dataset: String::new(),
     }
 }
 
