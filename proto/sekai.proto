@@ -4143,18 +4143,22 @@ message DecideActionInstanceResponse {
 }
 // The predicted effect of a parked Action instance (#3085): what the
 // PreviewObjectAction path predicts its write to the target object would be,
-// for an approver. Applies nothing and records nothing. Needs the same
-// namespace and instance read as GetActionInstance and read on the target.
+// for an approver. An instance whose type creates an object is planned from
+// its parameters instead (#3528). Applies nothing and records nothing. Needs
+// the same namespace and instance read as GetActionInstance and, for an
+// update, read on the target.
 message PreviewActionInstanceEffectRequest {
   string instance_id = 1;
 }
 message PreviewActionInstanceEffectResponse {
   string instance_id = 1;
   string object_id = 2;
-  // The target revision the prediction was made against.
+  // The target revision the prediction was made against; empty for a
+  // create.
   string object_revision = 3;
   // A PreviewObjectAction outcome: valid, invalid, stale, or unavailable
-  // when the target is gone.
+  // when the target is gone. A create is valid or invalid (for example
+  // when its object id is taken).
   string outcome = 4;
   string reason_code = 5;
   string failing_criterion = 6;
