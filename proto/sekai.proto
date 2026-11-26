@@ -5885,6 +5885,72 @@ message ExportNamespacePackageResponse {
   string ontology_digest = 3;
 }
 
+// Installs a signed sekai.namespace-package/v1 manifest into this namespace
+// (#3093, ADR 0169). Every signature, digest and mapping is checked before
+// the first write. The definitions open as a proposal for the namespace's
+// normal review; the datasets are created bound to objects in the namespace.
+// Installing the same package again changes nothing. Experimental.
+message InstallNamespacePackageRequest {
+  string namespace = 1;
+  // Envelope JSON from ExportNamespacePackage.
+  string envelope_json = 2;
+  // One target per dataset entry, keyed by entry id.
+  map<string, NamespacePackageDatasetTarget> datasets = 3;
+}
+
+// Where a dataset entry lands. An output is created as dataset_id, bound to
+// object_id in the namespace. An input names an existing dataset bound in
+// the namespace with the entry's schema, and leaves object_id empty.
+message NamespacePackageDatasetTarget {
+  string dataset_id = 1;
+  string object_id = 2;
+}
+
+message InstallNamespacePackageResponse {
+  NamespacePackageInstallation installation = 1;
+}
+
+message GetNamespacePackageInstallationRequest {
+  string namespace = 1;
+  string package_name = 2;
+}
+
+message GetNamespacePackageInstallationResponse {
+  NamespacePackageInstallation installation = 1;
+}
+
+// A package installed into a namespace, one per package name.
+message NamespacePackageInstallation {
+  string installation_id = 1;
+  string namespace = 2;
+  string package_name = 3;
+  uint32 package_version = 4;
+  string package_digest = 5;
+  string ontology_digest = 6;
+  // pending_definitions until the definitions proposal merges, then
+  // installed when the merged definitions reproduce ontology_digest, or
+  // diverged when they do not.
+  string status = 7;
+  // The definitions proposal; empty when the package carries none.
+  string branch_id = 8;
+  string proposal_id = 9;
+  repeated NamespacePackageInstalledResource resources = 10;
+  string source_namespace = 11;
+  string signer_identity = 12;
+  string installed_by = 13;
+  int64 installed_at_ms = 14;
+}
+
+// A resource the installation created (output) or was mapped to (input).
+message NamespacePackageInstalledResource {
+  string kind = 1;
+  string entry_id = 2;
+  // output or input.
+  string role = 3;
+  // A dataset id, or the definitions proposal id.
+  string resource_id = 4;
+}
+
 message ImportDefinitionPackageRequest {
   string namespace = 1;
   string branch_id = 2;
@@ -6762,6 +6828,8 @@ service SekaiService {
   rpc ExportDefinitionPackage(ExportDefinitionPackageRequest) returns (ExportDefinitionPackageResponse);
   rpc ImportDefinitionPackage(ImportDefinitionPackageRequest) returns (ImportDefinitionPackageResponse);
   rpc ExportNamespacePackage(ExportNamespacePackageRequest) returns (ExportNamespacePackageResponse);
+  rpc InstallNamespacePackage(InstallNamespacePackageRequest) returns (InstallNamespacePackageResponse);
+  rpc GetNamespacePackageInstallation(GetNamespacePackageInstallationRequest) returns (GetNamespacePackageInstallationResponse);
   // Opens a proposal with exactly the definitions a file tree changes (#1618).
   rpc ImportDefinitionTree(ImportDefinitionTreeRequest) returns (ImportDefinitionTreeResponse);
   rpc CompareDefinitionRevisions(CompareDefinitionRevisionsRequest) returns (CompareDefinitionRevisionsResponse);

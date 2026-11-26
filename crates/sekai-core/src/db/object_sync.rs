@@ -925,6 +925,12 @@ impl SekaiDb {
                     json_extract(record_json, '$.package_name')
                 )
                 WHERE json_extract(record_json, '$.superseded_by') = '';
+                CREATE TABLE IF NOT EXISTS sekai_namespace_package_installations (
+                    namespace TEXT NOT NULL,
+                    package_name TEXT NOT NULL,
+                    record_json TEXT NOT NULL,
+                    PRIMARY KEY(namespace, package_name)
+                );
                 CREATE TABLE IF NOT EXISTS sekai_capability_packages (
                     namespace TEXT NOT NULL,
                     certification_id TEXT NOT NULL,

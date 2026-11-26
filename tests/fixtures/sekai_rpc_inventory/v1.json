@@ -416,6 +416,33 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "InstallNamespacePackage",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.datasets",
+        "sekai.definition-branch"
+      ],
+      "evidence": [
+        "src/grpc/namespace_package_rpc.rs",
+        "crates/sekai-core/src/db/namespace_package_store.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetNamespacePackageInstallation",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "src/grpc/namespace_package_rpc.rs",
+        "crates/sekai-core/src/db/namespace_package_store.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.definition-branch"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ImportDefinitionPackage",
       "kind": "persistent",
       "surfaces": [

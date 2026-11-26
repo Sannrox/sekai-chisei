@@ -73,20 +73,44 @@ The maintainer accepted the `sekai.namespace-package/v1` decision on #3093 on
 9. A package never carries credentials, run history, receipts, audit entries
    or rows. `content_included` is false in this layer, and a verifier refuses
    an entry that sets it.
-10. Install (later layer) verifies the package before any write and opens the
+10. Install verifies the package before any write and opens the
     definitions as a proposal in the target namespace. The installation is
     `pending_definitions` until that proposal applies, then `installed` when
     the applied revision's digest equals the ontology digest, or `diverged`
     by name when it does not (amendment B). An approved proposal whose
     definitions no longer match the package digest is refused, not applied
-    partially.
+    partially: a merge publishes exactly the proposal's candidate and is
+    refused as stale once its branch moves.
+11. `InstallNamespacePackage` (experimental) needs write access to the
+    target namespace. Its request maps every dataset entry by id, and an
+    unmapped entry or a mapping with no entry is refused by name:
+    - an output names a new dataset id and an object in the target
+      namespace to bind it to, since a dataset reaches a namespace only
+      through its object. The dataset is created with the entry's name,
+      columns and partition keys under the caller's dataset write grant;
+    - an input names an existing dataset bound in the target namespace that
+      the caller may read in every column; its schema digest must equal the
+      entry's, or it is refused by name.
+    The definitions open as proposal `package/{name}/v{version}`, only into
+    a namespace with no published definitions: merging into one that holds
+    definitions is a non-goal. A package without definitions opens none and
+    is `installed` at once.
+12. One installation is stored per `(namespace, package name)`, with its
+    resources, the package digest, version, source namespace and signer.
+    Its status is derived from the proposal on read, not stored. Install
+    is idempotent per `(package digest, target namespace)`: the same package
+    returns the stored installation, and another version is refused until
+    upgrade (decision 8) ships. Each write is idempotent and the record is
+    written last, so a retry after a crash converges, and the first record
+    stored wins a race.
 
 `ExportNamespacePackage` (experimental) builds and signs the package from the
 published head. It needs read access to the namespace, as a definition export
-does. Delivery is layered: this format and the export first, then install
-with input mapping and installation records, then opt-in dataset content
-(rows the caller's egress may not receive are withheld and counted), then
-upgrade of an existing installation (decision 8).
+does. `GetNamespacePackageInstallation` reads an installation with its status
+under namespace read access. Delivery is layered: this format and the export
+first, then install with input mapping and installation records, then opt-in
+dataset content (rows the caller's egress may not receive are withheld and
+counted), then upgrade of an existing installation (decision 8).
 
 ## Consequences
 
@@ -96,6 +120,13 @@ upgrade of an existing installation (decision 8).
   content layer).
 - An export of a namespace whose definitions are partly unreadable is signed
   and verifiable but partial, and says so through the withheld counts.
+- Installations live in `sekai_namespace_package_installations` (SQLite on
+  open, PostgreSQL migration 186). An older plane ignores the table;
+  rolling back leaves the installed proposal and datasets in place, as
+  ordinary resources.
+- A definitions proposal that is closed instead of merged leaves its
+  installation `pending_definitions`; reinstalling the same package returns
+  that installation. Recovering from it comes with upgrade.
 
 ## Rejected alternatives
 

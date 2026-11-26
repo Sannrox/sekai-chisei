@@ -159,6 +159,92 @@ impl DatasetDocument {
     }
 }
 
+/// Installation status (ADR 0169 decision 10): the definitions proposal has
+/// not merged yet.
+pub const INSTALLATION_PENDING_DEFINITIONS: &str = "pending_definitions";
+/// The merged definitions reproduce the package's ontology digest.
+pub const INSTALLATION_INSTALLED: &str = "installed";
+/// The merged definitions do not reproduce the ontology digest.
+pub const INSTALLATION_DIVERGED: &str = "diverged";
+
+/// A resource an installation created (an output) or was mapped to (an
+/// input), by package entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstalledResource {
+    pub kind: String,
+    pub entry_id: String,
+    pub role: EntryRole,
+    /// The resource in the target namespace: a dataset id, or the
+    /// definitions proposal id.
+    pub resource_id: String,
+}
+
+/// A package installed into a namespace (#3093 decision 8), stored once per
+/// `(namespace, package name)`. Its status is not stored: it follows from the
+/// definitions proposal (see [`installation_status`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespacePackageInstallation {
+    pub installation_id: String,
+    pub namespace: String,
+    pub package_name: String,
+    pub package_version: u32,
+    pub package_digest: String,
+    pub ontology_digest: String,
+    pub source_namespace: String,
+    pub signer_identity: String,
+    /// Empty when the package carries no definitions.
+    pub branch_id: String,
+    pub proposal_id: String,
+    pub resources: Vec<InstalledResource>,
+    pub installed_by: String,
+    pub installed_at_ms: i64,
+}
+
+/// The stable id of the installation of `package_name` in `namespace`; a
+/// later version upgrades the same installation.
+pub fn installation_id(namespace: &str, package_name: &str) -> Result<String, String> {
+    definition_package::contract_digest(
+        NAMESPACE_PACKAGE_CONTRACT,
+        "installation",
+        &(namespace, package_name),
+    )
+}
+
+/// The status of an installation whose definitions proposal is `merged`
+/// (`None` when it carries no definitions) and, once merged, publishes
+/// `published_digest`, the namespace-free digest of the merged members.
+pub fn installation_status(
+    installation: &NamespacePackageInstallation,
+    merged: Option<bool>,
+    published_digest: Option<&str>,
+) -> &'static str {
+    match (merged, published_digest) {
+        (None, _) => INSTALLATION_INSTALLED,
+        (Some(false), _) | (Some(true), None) => INSTALLATION_PENDING_DEFINITIONS,
+        (Some(true), Some(digest)) if digest == installation.ontology_digest => {
+            INSTALLATION_INSTALLED
+        }
+        (Some(true), Some(_)) => INSTALLATION_DIVERGED,
+    }
+}
+
+impl NamespacePackageEnvelope {
+    /// The carried definitions. The envelope is verified, so the entry is
+    /// present and decodes.
+    pub fn definitions(&self) -> Result<DefinitionPackage, String> {
+        let entry = self
+            .package
+            .entries
+            .iter()
+            .find(|entry| entry.kind == KIND_DEFINITION_PACKAGE)
+            .ok_or_else(|| format!("{REFUSAL_INCOMPATIBLE}: package has no definitions"))?;
+        serde_json::from_str(&entry.document_json)
+            .map_err(|error| format!("{REFUSAL_INCOMPATIBLE}: definitions: {error}"))
+    }
+}
+
 /// Refuses a package name outside `[a-z0-9._-]`, an empty or over-long one,
 /// and version 0. Versions order installations, so they are integers.
 pub fn validate_name_and_version(name: &str, version: u32) -> Result<(), String> {

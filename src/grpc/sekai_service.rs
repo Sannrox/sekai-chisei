@@ -302,6 +302,8 @@ impl SekaiService for SekaiServiceImpl {
         append_agent_turn_transcript => append_agent_turn_transcript_rpc(AppendAgentTurnTranscriptRequest) -> AppendAgentTurnTranscriptResponse;
         disable_source => disable_source_rpc(DisableSourceRequest) -> DisableSourceResponse;
         export_namespace_package => export_namespace_package_rpc(ExportNamespacePackageRequest) -> ExportNamespacePackageResponse;
+        install_namespace_package => install_namespace_package_rpc(InstallNamespacePackageRequest) -> InstallNamespacePackageResponse;
+        get_namespace_package_installation => get_namespace_package_installation_rpc(GetNamespacePackageInstallationRequest) -> GetNamespacePackageInstallationResponse;
         list_source_record_versions => list_source_record_versions_rpc(ListSourceRecordVersionsRequest) -> ListSourceRecordVersionsResponse;
         list_claimable_work => list_claimable_work_rpc(ListClaimableWorkRequest) -> ListClaimableWorkResponse;
         claim_work => claim_work_rpc(ClaimWorkRequest) -> ClaimWorkResponse;
