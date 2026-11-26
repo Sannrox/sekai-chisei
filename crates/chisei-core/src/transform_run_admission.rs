@@ -7,7 +7,8 @@ use crate::chisei::budget::PeriodType;
 use crate::chisei::receipt::{OPERATION_RECEIPT_VERSION, OperationReceipt};
 use crate::chisei::tenant_quota::{
     METRIC_COMPUTE_SECONDS, METRIC_CONCURRENCY, METRIC_STORAGE_BYTES, NamespaceQuotaScope,
-    TenantQuotaAdmission, TenantQuotaError, TenantQuotaGate, TenantQuotaLimits, tenant_scope_id,
+    QuotaBreach, QuotaMode, QuotaWould, TenantQuotaAdmission, TenantQuotaError, TenantQuotaGate,
+    TenantQuotaLimits, tenant_scope_id,
 };
 use crate::chisei::usage_ledger::UsageEvent;
 use crate::chisei_store::ChiseiStore;
@@ -113,26 +114,36 @@ pub fn configured_namespace_limits(
 }
 
 /// The tenant and namespace assignments a transform run in `namespace` is
-/// admitted against. The namespace part is `None` when it has no assignment
-/// or is a name no assignment can be stored under.
+/// admitted against, and the tenant's mode. The namespace part is `None`
+/// when it has no assignment or is a name no assignment can be stored under.
 pub fn configured_run_limits(
     db: &RuntimeDb,
     tenant_id: &str,
     namespace: &str,
 ) -> Result<RunQuotaLimits, String> {
     let tenant = configured_limits(db, tenant_id)?;
+    let mode = match tenant {
+        Some(_) => QuotaMode::from_stored(&db.budget_scope_modes(&tenant_scope_id(tenant_id))?),
+        None => QuotaMode::Enforce,
+    };
     let namespace = match NamespaceQuotaScope::new(tenant_id, namespace) {
         Ok(scope) => configured_namespace_limits(db, &scope)?.map(|limits| (scope, limits)),
         Err(_) => None,
     };
-    Ok(RunQuotaLimits { tenant, namespace })
+    Ok(RunQuotaLimits {
+        tenant,
+        namespace,
+        mode,
+    })
 }
 
-/// A transform run's tenant assignment and its namespace's, either absent.
+/// A transform run's tenant assignment and its namespace's, either absent,
+/// and the tenant's mode, which applies to both.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunQuotaLimits {
     pub tenant: Option<TenantQuotaLimits>,
     pub namespace: Option<(NamespaceQuotaScope, TenantQuotaLimits)>,
+    pub mode: QuotaMode,
 }
 
 impl RunQuotaLimits {
@@ -168,6 +179,47 @@ impl RunQuotaLimits {
             .iter()
             .chain(self.namespace.as_ref().map(|(_, limits)| limits))
             .find_map(|limits| refusal_larger_than_budget(limits, compute_seconds))
+    }
+
+    /// [`Self::refusal_larger_than_budget`] as the breach a report-only
+    /// tenant records instead, in the scope whose whole budget is too small:
+    /// the tenant's, else the namespace's.
+    pub fn breach_larger_than_budget(
+        &self,
+        tenant_id: &str,
+        compute_seconds: i32,
+    ) -> Option<QuotaBreach> {
+        let tenant = self
+            .tenant
+            .as_ref()
+            .map(|limits| (tenant_scope_id(tenant_id), limits));
+        let namespace = self
+            .namespace
+            .as_ref()
+            .map(|(scope, limits)| (scope.scope_id().to_string(), limits));
+        tenant
+            .into_iter()
+            .chain(namespace)
+            .find_map(|(scope_id, limits)| {
+                let refusal = refusal_larger_than_budget(limits, compute_seconds)?;
+                Some(QuotaBreach {
+                    scope_id,
+                    metric: refusal.details.get("metric").cloned().unwrap_or_default(),
+                    would: QuotaWould::Refuse,
+                    reason: refusal.code,
+                })
+            })
+    }
+}
+
+/// The breach a report-only tenant records instead of queueing behind an
+/// older held run in `scope_id`.
+pub fn queue_breach(scope_id: &str) -> QuotaBreach {
+    QuotaBreach {
+        scope_id: scope_id.into(),
+        metric: METRIC_CONCURRENCY.into(),
+        would: QuotaWould::Queue,
+        reason: METRIC_CONCURRENCY.into(),
     }
 }
 
@@ -258,9 +310,7 @@ pub fn refusal_larger_than_budget(
     })
 }
 
-/// Refusal code for a run whose tenant or namespace budget is spent (#3044,
-/// ADR 0168): budgets refuse, only concurrency waits.
-pub const REFUSAL_BUDGET_EXHAUSTED: &str = "quota_budget_exhausted";
+pub use crate::chisei::tenant_quota::REFUSAL_BUDGET_EXHAUSTED;
 
 /// The terminal refusal an admission error stands for, with the spent
 /// `metric`. `None` for a full concurrency limit, which frees as runs
@@ -306,15 +356,34 @@ pub fn admit_transform_run(
         .namespace
         .as_ref()
         .map(|(scope, limits)| (scope, without_request(limits)));
-    gate.admit_in_namespace(
+    let namespace = namespace.as_ref().map(|(scope, limits)| (*scope, limits));
+    if limits.mode == QuotaMode::Enforce {
+        return gate.admit_in_namespace(
+            context,
+            &tenant,
+            namespace,
+            1,
+            0,
+            compute_seconds,
+            run_key,
+        );
+    }
+    let (admission, breaches) = gate.admit_in_namespace_reporting(
         context,
         &tenant,
-        namespace.as_ref().map(|(scope, limits)| (*scope, limits)),
+        namespace,
         1,
         0,
         compute_seconds,
         run_key,
-    )
+    )?;
+    // An unrecorded breach would vanish, so a failed audit gives the
+    // admission back and fails the claim, which a later claim retries.
+    if let Err(error) = gate.report_breaches(&admission.tenant_id, run_key, &breaches) {
+        let _ = gate.abandon(&admission);
+        return Err(error);
+    }
+    Ok(admission)
 }
 
 pub fn complete_transform_run(
@@ -445,6 +514,7 @@ mod tests {
         RunQuotaLimits {
             tenant: Some(limits.clone()),
             namespace: None,
+            mode: QuotaMode::Enforce,
         }
     }
 
@@ -617,6 +687,13 @@ mod tests {
         assert_eq!(refusal.details["limit"], "0");
         let dev = configured_run_limits(&db, "tenant-a", "dev").unwrap();
         assert_eq!(dev.refusal_larger_than_budget(0), None);
+        let breach = configured_run_limits(&db, "tenant-a", "ops")
+            .unwrap()
+            .breach_larger_than_budget("tenant-a", 0)
+            .expect("the namespace's whole budget is too small");
+        assert_eq!(breach.scope_id, "tenant:tenant-a/namespace:ops");
+        assert_eq!(breach.reason, REFUSAL_LARGER_THAN_BUDGET);
+        assert_eq!(dev.breach_larger_than_budget("tenant-a", 0), None);
     }
 
     /// What a successor refunds for a crashed claim from its stored hold.
@@ -773,5 +850,174 @@ mod tests {
             "chisei_budget_limits does not exist",
             "chisei_budget_limits"
         ));
+    }
+
+    /// The report-only decisions recorded for `run_key`.
+    fn reports(
+        db: &std::sync::Arc<RuntimeDb>,
+        run_key: &str,
+    ) -> Vec<sekai_core::sekai::audit::Decision> {
+        use crate::chisei_store::ChiseiDecisionStore;
+        let store = ChiseiStore::try_from_shared_runtime(db.clone()).unwrap();
+        store
+            .list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
+                action: Some(crate::chisei::tenant_quota::QUOTA_REPORT_ONLY_ACTION.into()),
+                target_id: Some(run_key.into()),
+                limit: 100,
+                ..Default::default()
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn report_only_admits_a_spent_budget_and_audits_each_breach_once() {
+        let (db, gate) = namespace_gate(Some(requests_and_concurrency(1, 1)), requests_only(5));
+        let first = admit_in(&db, &gate, "ops", "run-1").unwrap();
+        exhausted_on(admit_in(&db, &gate, "ops", "run-2"), METRIC_REQUESTS);
+
+        assert!(
+            gate.configure_mode("tenant-a", QuotaMode::ReportOnly)
+                .unwrap()
+        );
+        let limits = configured_run_limits(&db, "tenant-a", "ops").unwrap();
+        assert_eq!(limits.mode, QuotaMode::ReportOnly);
+        let second = admit_in(&db, &gate, "ops", "run-2").unwrap();
+        assert!(
+            !second.reserved_request && !second.reserved_concurrency,
+            "a would-be refusal or queue reserves nothing: {second:?}"
+        );
+        // A retried claim records nothing twice.
+        let retried = admit_in(&db, &gate, "ops", "run-2").unwrap();
+        let recorded = reports(&db, "run-2");
+        let mut breaches: Vec<_> = recorded
+            .iter()
+            .map(|decision| {
+                (
+                    decision.evidence["scope_id"].as_str(),
+                    decision.evidence["metric"].as_str(),
+                    decision.evidence["would"].as_str(),
+                )
+            })
+            .collect();
+        breaches.sort_unstable();
+        assert_eq!(
+            breaches,
+            [
+                // The tenant's request budget is the one spent, although
+                // the run reserved on its namespace's chain.
+                ("tenant:tenant-a", METRIC_CONCURRENCY, "queue"),
+                ("tenant:tenant-a", METRIC_REQUESTS, "refuse"),
+            ]
+        );
+        assert!(
+            recorded
+                .iter()
+                .all(|decision| decision.outcome == "admitted")
+        );
+
+        // Work that fits reserves as enforcing would and reports nothing.
+        complete_transform_run(&gate, &first).unwrap();
+        complete_transform_run(&gate, &second).unwrap();
+        complete_transform_run(&gate, &retried).unwrap();
+        gate.configure("tenant-a", &requests_and_concurrency(10, 1))
+            .unwrap();
+        let fits = admit_in(&db, &gate, "dev", "run-3").unwrap();
+        assert!(fits.reserved_request && fits.reserved_concurrency);
+        assert!(reports(&db, "run-3").is_empty());
+    }
+
+    #[test]
+    fn report_only_fails_on_a_storage_error_instead_of_reporting_a_breach() {
+        let (db, gate) = namespace_gate(Some(requests_only(5)), requests_only(5));
+        assert!(
+            gate.configure_mode("tenant-a", QuotaMode::ReportOnly)
+                .unwrap()
+        );
+        let RuntimeDb::Sqlite(sqlite) = db.as_ref() else {
+            unreachable!()
+        };
+        sqlite
+            .conn()
+            .execute_batch("DROP TABLE chisei_budget_usage")
+            .unwrap();
+        assert!(matches!(
+            admit_in(&db, &gate, "ops", "run-1"),
+            Err(TenantQuotaError::Storage(_))
+        ));
+        assert!(reports(&db, "run-1").is_empty());
+    }
+
+    #[test]
+    fn a_limit_row_written_without_a_mode_enforces_the_whole_tenant() {
+        let (db, gate) = namespace_gate(Some(requests_only(1)), requests_only(5));
+        assert!(
+            gate.configure_mode("tenant-a", QuotaMode::ReportOnly)
+                .unwrap()
+        );
+        // As an older plane writes a new metric: the row takes the default.
+        gate.configure(
+            "tenant-a",
+            &TenantQuotaLimits {
+                max_concurrency: Some(3),
+                ..requests_only(1)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            configured_run_limits(&db, "tenant-a", "ops").unwrap().mode,
+            QuotaMode::Enforce
+        );
+        // A tenant without an assignment stores no mode.
+        assert!(
+            !gate
+                .configure_mode("tenant-b", QuotaMode::ReportOnly)
+                .unwrap()
+        );
+        assert_eq!(
+            QuotaMode::from_stored(&["report_only".into(), "later".into()]),
+            QuotaMode::Enforce
+        );
+        assert_eq!(QuotaMode::parse("report_only"), Ok(QuotaMode::ReportOnly));
+        assert!(QuotaMode::parse("observe").is_err());
+    }
+
+    #[test]
+    fn a_limit_table_without_a_mode_gains_it_and_older_assignments_enforce() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("before-quota-mode.sqlite");
+        let open = || {
+            let db = std::sync::Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
+                SekaiDb::new(path.to_str().unwrap()).unwrap(),
+            )));
+            let gate = quota_gate(db.clone()).unwrap();
+            (db, gate)
+        };
+        let (db, _) = open();
+        let RuntimeDb::Sqlite(sqlite) = db.as_ref() else {
+            unreachable!()
+        };
+        sqlite
+            .conn()
+            .execute_batch(
+                "ALTER TABLE chisei_budget_limits DROP COLUMN mode;
+                 INSERT INTO chisei_budget_limits
+                    (scope_id, metric, parent_scope_id, max_amount, period_type)
+                 VALUES ('tenant:tenant-a', 'requests', '', 1, 'daily');",
+            )
+            .unwrap();
+        drop(db);
+
+        let (db, gate) = open();
+        let limits = configured_run_limits(&db, "tenant-a", "ops").unwrap();
+        assert_eq!(limits.mode, QuotaMode::Enforce);
+        assert_eq!(limits.tenant.unwrap().max_requests_per_period, Some(1));
+        assert!(
+            gate.configure_mode("tenant-a", QuotaMode::ReportOnly)
+                .unwrap()
+        );
+        assert_eq!(
+            configured_run_limits(&db, "tenant-a", "ops").unwrap().mode,
+            QuotaMode::ReportOnly
+        );
     }
 }

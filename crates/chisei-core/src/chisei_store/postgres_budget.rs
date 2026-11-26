@@ -51,6 +51,8 @@ pub trait BudgetPostgresDbExt {
         &self,
         scope_id: &str,
     ) -> Result<Vec<(String, String, i64, String)>, String>;
+    fn budget_set_scope_mode(&self, scope_id: &str, mode: &str) -> Result<usize, String>;
+    fn budget_scope_modes(&self, scope_id: &str) -> Result<Vec<String>, String>;
     fn budget_set_limit(
         &self,
         scope_id: &str,
@@ -274,6 +276,30 @@ impl BudgetPostgresDbExt for PostgresDb {
             }
         }
         Ok(limits)
+    }
+
+    fn budget_set_scope_mode(&self, scope_id: &str, mode: &str) -> Result<usize, String> {
+        let updated = self
+            .connection()?
+            .execute(
+                "UPDATE chisei_budget_limits SET mode = $1 WHERE scope_id = $2",
+                &[&mode, &scope_id],
+            )
+            .map_err(|error| error.to_string())?;
+        usize::try_from(updated).map_err(|error| error.to_string())
+    }
+
+    fn budget_scope_modes(&self, scope_id: &str) -> Result<Vec<String>, String> {
+        let rows = self
+            .connection()?
+            .query(
+                "SELECT DISTINCT mode FROM chisei_budget_limits WHERE scope_id = $1",
+                &[&scope_id],
+            )
+            .map_err(|error| {
+                sekai_core::db::postgres::missing_relation_or(error, "chisei_budget_limits")
+            })?;
+        Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
     }
 
     fn budget_set_limit(
@@ -545,7 +571,8 @@ impl BudgetPostgresDbExt for PostgresDb {
                 .unwrap_or(0);
             if used + amount > max_amount {
                 return Err(format!(
-                    "budget exceeded at {scope}: used {used} + {amount} > {max_amount}"
+                    "{}{scope}: used {used} + {amount} > {max_amount}",
+                    crate::chisei::budget::BUDGET_EXCEEDED_PREFIX
                 ));
             }
         }
@@ -627,7 +654,8 @@ impl BudgetPostgresDbExt for PostgresDb {
                 .unwrap_or(0);
             if used + amount > max_amount {
                 return Err(format!(
-                    "budget exceeded at {scope}: used {used} + {amount} > {max_amount}"
+                    "{}{scope}: used {used} + {amount} > {max_amount}",
+                    crate::chisei::budget::BUDGET_EXCEEDED_PREFIX
                 ));
             }
         }
@@ -1364,6 +1392,34 @@ mod tests {
             error.contains("chisei_budget_limits") && error.contains("does not exist"),
             "{error}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated PostgreSQL database"]
+    fn postgres_limit_table_without_a_mode_gains_it_and_older_rows_enforce() {
+        let scratch = sekai_core::db::postgres::ScratchDatabase::create();
+        let db = crate::chisei_store::postgres_with_chisei_schema(scratch.connect());
+        let execute = |sql: &str| db.connection().unwrap().batch_execute(sql).unwrap();
+        execute("ALTER TABLE chisei_budget_limits DROP COLUMN mode");
+        // As an older plane writes its assignment.
+        db.budget_set_limit("tenant:a", "requests", 1, "daily")
+            .unwrap();
+        execute(include_str!("postgres/0189_chisei_budget_limit_mode.sql"));
+        assert_eq!(db.budget_scope_modes("tenant:a").unwrap(), ["enforce"]);
+        assert_eq!(
+            db.budget_set_scope_mode("tenant:a", "report_only").unwrap(),
+            1
+        );
+        assert_eq!(db.budget_scope_modes("tenant:a").unwrap(), ["report_only"]);
+        assert_eq!(
+            db.budget_set_scope_mode("tenant:b", "report_only").unwrap(),
+            0
+        );
+        db.budget_set_limit("tenant:a", "concurrency", 2, "monthly")
+            .unwrap();
+        let mut modes = db.budget_scope_modes("tenant:a").unwrap();
+        modes.sort();
+        assert_eq!(modes, ["enforce", "report_only"]);
     }
 
     fn pinned_scope() -> String {

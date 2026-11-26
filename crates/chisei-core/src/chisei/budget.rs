@@ -702,6 +702,19 @@ impl BudgetTracker {
 
 /// A reservation only adds usage; a negative amount would lower recorded usage
 /// past every limit check.
+/// How every budget store begins the error of a reservation that does not
+/// fit. Any other reservation error is a storage failure.
+pub const BUDGET_EXCEEDED_PREFIX: &str = "budget exceeded at ";
+
+/// The scope on the budget chain whose limit a reservation error says is
+/// spent, or `None` when the error is a storage failure instead.
+pub fn budget_exceeded_scope(error: &str) -> Option<&str> {
+    let rest = error.strip_prefix(BUDGET_EXCEEDED_PREFIX)?;
+    // The tail is numbers only, so split at the last separator: a scope part
+    // may itself contain one.
+    rest.rsplit_once(": used ").map(|(scope, _)| scope)
+}
+
 fn refuse_negative_reservation(estimated: i32) -> Result<(), String> {
     if estimated < 0 {
         return Err("budget reservation amount must not be negative".into());

@@ -182,6 +182,12 @@ pub const CHISEI_PLANE_SQL: &[PlaneSql] = &[
         include_str!("postgres/0177_chisei_usage_attribution.sql"),
         None,
     ),
+    plane(
+        189,
+        "chisei_budget_limit_mode",
+        include_str!("postgres/0189_chisei_budget_limit_mode.sql"),
+        None,
+    ),
 ];
 
 pub fn apply_chisei_postgres_schema(db: &PostgresDb) -> Result<(), String> {

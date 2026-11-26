@@ -56,8 +56,13 @@ The maintainer accepted the shape on 2026-11-24:
      neither. The unused-reservation hold records the scope so a refund
      after a crash reaches the namespace too. A hold an older plane wrote
      records no scope and refunds only the tenant.
-   - **1c:** report-only. The gate evaluates without reserving. Each would-be
-     refusal or queue is recorded on the audit and on the run.
+   - **1c:** report-only. The gate evaluates every metric. A metric that
+     would refuse or queue reserves nothing; what fits is reserved as
+     enforcing would, so usage keeps counting and later breaches show. Each
+     would-be refusal or queue, including a run larger than its whole budget
+     and one behind an older held run, is one idempotent audit decision, and
+     the run is admitted. Recording it on the run itself needs a stored
+     field and a `proto/` field and is not part of 1c.
    - **2a:** budgets refuse. A claim that finds a request or token budget
      of the run's tenant or namespace spent marks the run `refused` with
      the code `quota_budget_exhausted` and the detail `metric`, through the
@@ -79,8 +84,11 @@ The maintainer accepted the shape on 2026-11-24:
      it, so release is FIFO by `(created_at, run id)` within the scope.
      A run read while held carries `queue { reason: "concurrency",
      position }`, its 1-based place in that scope.
-4. How `mode` is stored is pending a maintainer decision: a dedicated
-   column, or a reserved row in the budget limit table. 1c depends on it.
+4. `mode` is a dedicated column on the assignment's rows in
+   `chisei_budget_limits`, `enforce` by default (maintainer decision,
+   2026-11-26). A tenant reports only while all its rows say `report_only`;
+   a row written without the mode, by an older plane or for a new metric,
+   enforces the tenant. The mode is per tenant and covers its namespaces.
 
 ## Alternatives considered
 
@@ -117,6 +125,9 @@ The maintainer accepted the shape on 2026-11-24:
   does not claim, cancel or count a held run: it can enqueue a second run
   of a transform whose run is held, and its cancel reports a held run as
   finished.
+- 1c adds the `mode` column (SQLite on open, PostgreSQL migration 189). An
+  older plane ignores it and enforces a report-only tenant, which refuses or
+  queues what this version would admit. Rollback leaves the column unread.
 - Rollback leaves namespace rows that nothing reads, and refused runs stay
   refused. Held runs wait until a plane of this version claims them again;
   raise the concurrency limit and let the queue drain before rolling back.
@@ -149,3 +160,10 @@ The maintainer accepted the shape on 2026-11-24:
   cancelled held run leaves the queue.
 - A work table without `queue_scope` gains it, and its pending work stays
   claimable.
+- A report-only tenant admits a run past a spent budget and a full
+  concurrency limit, reserves nothing for either, and records each once; a
+  run that fits reserves and records nothing.
+- Over gRPC, a report-only tenant's run larger than its whole budget is
+  claimed, and the would-be refusal and queue are audited.
+- A limit table without `mode` gains it on SQLite and PostgreSQL, older
+  rows read as `enforce`, and a row written later enforces the tenant.

@@ -57,6 +57,8 @@ widens a stricter project limit.
 `chisei::tenant_quota::TenantQuotaGate`:
 
 - `configure(tenant_id, TenantQuotaLimits)` — operator assignment
+- `configure_mode(tenant_id, QuotaMode)` — `enforce` or `report_only`;
+  false when the tenant has no assignment
 - `configure_namespace(NamespaceQuotaScope, TenantQuotaLimits)` — namespace
   assignment (`DomainAdminSurface::configure_namespace_quotas` checks the
   role, refuses negative limits and narrows by entitlement)
@@ -105,6 +107,33 @@ when the run is claimed again; the new claim reserves its own. A crash
 between taking the reservation and storing the hold keeps the seconds
 charged until the period resets, as a request already is.
 
+## Report-only mode
+
+A tenant's assignment has a mode, `enforce` (the default) or `report_only`
+(#3044, ADR 0168 part 1c). It covers the tenant and all its namespaces. Set
+it with `TenantQuotaGate::configure_mode` or, for tenant administrators,
+`DomainAdminSurface::configure_quota_mode`, after the tenant's limits are
+configured; a tenant without an assignment has no mode to set.
+
+The mode is the `mode` column of the tenant's rows in `chisei_budget_limits`.
+The tenant reports only while every one of its rows says `report_only`. A row
+written later, by this plane or an older one, starts as `enforce` and puts the
+whole tenant back to enforcing, so set the mode again after adding a metric.
+An older plane never reads the column and enforces.
+
+In report-only, admission still evaluates each metric. What fits is reserved
+as enforcing would, so usage keeps counting. A metric that would refuse or
+queue reserves nothing, and the run is admitted anyway. A run larger than its
+whole budget, or one behind an older held run, is admitted too. Each would-be
+refusal or queue is one audit decision with the action
+`tenant_quota_report_only`, the run's quota key as its target, the outcome
+`admitted` and the evidence `tenant_id`, `scope_id`, `metric`, `would`
+(`refuse` or `queue`), `reason` (the refusal code, or `concurrency`) and
+`mode`. The decision id is derived from the run key, scope, metric and reason,
+so a retried or reclaimed claim records each breach once. When the decision
+cannot be written, the claim gives its admission back and fails, and a later
+claim retries it.
+
 Receipt-safe summary: `TenantQuotaReceiptNote` (own tenant id, assignment
 version, admitted metrics only).
 
@@ -116,6 +145,7 @@ version, admitted metrics only).
 | Exhausting A does not deny B | Isolation unit tests |
 | No capacity leak on complete | Concurrency release test |
 | Receipt without foreign usage | `TenantQuotaReceiptNote` |
+| Report-only admits and records each breach | Report-only admission and audit tests |
 
 ## Non-goals
 

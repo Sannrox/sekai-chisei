@@ -1365,6 +1365,7 @@ const MIGRATIONS: &[Migration] = &[
         DATASET_ROW_SPANS_SCHEMA,
         MigrationOwner::Sekai,
     ),
+    mig(189, "chisei_budget_limit_mode", "", MigrationOwner::Chisei),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;
