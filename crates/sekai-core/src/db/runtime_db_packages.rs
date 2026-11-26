@@ -29,6 +29,19 @@ impl RuntimeDb {
         }
     }
 
+    pub fn replace_namespace_package_installation(
+        &self,
+        previous: &crate::sekai::namespace_package::NamespacePackageInstallation,
+        next: &crate::sekai::namespace_package::NamespacePackageInstallation,
+    ) -> Result<crate::sekai::namespace_package::NamespacePackageInstallation, String> {
+        match self {
+            Self::Sqlite(db) => db.replace_namespace_package_installation(previous, next),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.replace_namespace_package_installation(previous, next)
+            }),
+        }
+    }
+
     pub fn get_client_package(
         &self,
         namespace: &str,

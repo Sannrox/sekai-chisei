@@ -61,6 +61,30 @@ impl SekaiDb {
         )?
         .ok_or_else(|| "package installation unavailable".to_string())
     }
+    /// Replaces `previous` with `next`, an upgrade of the same installation,
+    /// only while the stored record still equals `previous`, and returns the
+    /// stored one: of two racing upgrades the first wins, and the other finds
+    /// the record moved.
+    pub fn replace_namespace_package_installation(
+        &self,
+        previous: &NamespacePackageInstallation,
+        next: &NamespacePackageInstallation,
+    ) -> Result<NamespacePackageInstallation, String> {
+        self.conn()
+            .execute(
+                "UPDATE sekai_namespace_package_installations SET record_json = ?4
+                 WHERE namespace = ?1 AND package_name = ?2 AND record_json = ?3",
+                params![
+                    previous.namespace,
+                    previous.package_name,
+                    encode(previous)?,
+                    encode(next)?
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        self.get_namespace_package_installation(&previous.namespace, &previous.package_name)?
+            .ok_or_else(|| "package installation unavailable".to_string())
+    }
 }
 
 impl PostgresDb {
@@ -104,6 +128,27 @@ impl PostgresDb {
         )?
         .ok_or_else(|| "package installation unavailable".to_string())
     }
+    /// As the SQLite store: replaced only while the record equals `previous`.
+    pub fn replace_namespace_package_installation(
+        &self,
+        previous: &NamespacePackageInstallation,
+        next: &NamespacePackageInstallation,
+    ) -> Result<NamespacePackageInstallation, String> {
+        self.connection()?
+            .execute(
+                "UPDATE sekai_namespace_package_installations SET record_json = $4
+                 WHERE namespace = $1 AND package_name = $2 AND record_json = $3",
+                &[
+                    &previous.namespace,
+                    &previous.package_name,
+                    &encode(previous)?,
+                    &encode(next)?,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        self.get_namespace_package_installation(&previous.namespace, &previous.package_name)?
+            .ok_or_else(|| "package installation unavailable".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -128,7 +173,10 @@ mod tests {
                 entry_id: "tickets".into(),
                 role: EntryRole::Output,
                 resource_id: "desk-tickets".into(),
+                schema_digest: "sha256:schema".into(),
+                rows_digest: String::new(),
             }],
+            retained: Vec::new(),
             installed_by: "root".into(),
             installed_at_ms: 1,
         }
@@ -148,12 +196,43 @@ mod tests {
         assert_eq!(get("other", "desk").unwrap(), None);
     }
 
+    /// An upgrade replaces the record it read; one that read a record since
+    /// replaced leaves the winner in place.
+    fn upgrade_replaces_only_the_record_it_read(
+        put: impl Fn(&NamespacePackageInstallation) -> Result<NamespacePackageInstallation, String>,
+        replace: impl Fn(
+            &NamespacePackageInstallation,
+            &NamespacePackageInstallation,
+        ) -> Result<NamespacePackageInstallation, String>,
+    ) {
+        let first = put(&installation("sha256:first")).unwrap();
+        let second = NamespacePackageInstallation {
+            package_version: 2,
+            ..installation("sha256:second")
+        };
+        assert_eq!(replace(&first, &second).unwrap(), second);
+        let third = NamespacePackageInstallation {
+            package_version: 3,
+            ..installation("sha256:third")
+        };
+        assert_eq!(replace(&first, &third).unwrap(), second);
+    }
+
     #[test]
     fn sqlite_keeps_the_first_installation_of_a_package() {
         let db = SekaiDb::new(":memory:").unwrap();
         first_install_wins(
             |installation| db.put_namespace_package_installation(installation),
             |namespace, name| db.get_namespace_package_installation(namespace, name),
+        );
+    }
+
+    #[test]
+    fn sqlite_replaces_only_the_installation_an_upgrade_read() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        upgrade_replaces_only_the_record_it_read(
+            |installation| db.put_namespace_package_installation(installation),
+            |previous, next| db.replace_namespace_package_installation(previous, next),
         );
     }
 
@@ -165,6 +244,17 @@ mod tests {
         first_install_wins(
             |installation| db.put_namespace_package_installation(installation),
             |namespace, name| db.get_namespace_package_installation(namespace, name),
+        );
+    }
+
+    #[test]
+    #[ignore = "requires SEKAI_TEST_POSTGRES_URL for an isolated TLS PostgreSQL database"]
+    fn postgres_replaces_only_the_installation_an_upgrade_read() {
+        let scratch = crate::db::postgres::ScratchDatabase::create();
+        let db = scratch.connect();
+        upgrade_replaces_only_the_record_it_read(
+            |installation| db.put_namespace_package_installation(installation),
+            |previous, next| db.replace_namespace_package_installation(previous, next),
         );
     }
 }

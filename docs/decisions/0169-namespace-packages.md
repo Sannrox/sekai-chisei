@@ -100,10 +100,10 @@ amendments D, E and F (dataset content) on 2026-11-26.
     resources, the package digest, version, source namespace and signer.
     Its status is derived from the proposal on read, not stored. Install
     is idempotent per `(package digest, target namespace)`: the same package
-    returns the stored installation, and another version is refused until
-    upgrade (decision 8) ships. Each write is idempotent and the record is
-    written last, so a retry after a crash converges, and the first record
-    stored wins a race.
+    returns the stored installation, and a later version upgrades it
+    (decision 14). Each write is idempotent and the record is written last,
+    so a retry after a crash converges, and the first record stored wins a
+    race.
 
 13. Dataset content (amendments D, E and F). The export request names, of the
     selected datasets, those whose rows the package carries.
@@ -132,7 +132,33 @@ amendments D, E and F (dataset content) on 2026-11-26.
       dataset)`: a retry appends only to a dataset without versions, and a
       dataset whose latest version holds other rows is refused as changed
       outside the installation. Upgrade appends only when the content digest
-      changed (decision 8, its own layer).
+      changed (decision 14).
+
+14. Upgrade (#3093 decision 8). Installing a later version of an installed
+    package upgrades its installation; an earlier version is refused by name.
+    - Definitions open as proposal `package/{name}/v{version}` against the
+      published head, only while that head reproduces the installed ontology
+      digest; otherwise they changed outside the installation and are refused.
+      Unchanged definitions open nothing and keep the merged proposal. An
+      installed proposal still open is refused until it merges or closes, so
+      two versions are never under review at once; a closed one installs as
+      into an empty namespace. The definitions are one resource: a member the
+      new version drops is removed through that proposal's review.
+    - A dataset an earlier version installed keeps its id and binding; the
+      request may leave it unmapped and may not move it. The installation
+      records each dataset's schema digest and, for carried rows, a digest
+      of what its latest version held, ignoring row order. A changed
+      definition updates the dataset under the dataset write grant only
+      while its schema still has the recorded digest.
+    - A dataset version holds every row appended so far, so carried rows are
+      appended as one new version holding the rows the latest version lacks,
+      only while that version still has the recorded digest. A version that
+      drops rows is refused: a dataset only takes appended rows.
+    - New entries install as in decision 11. Resources the new version no
+      longer carries stay in place and are listed as retained.
+    - The record is replaced last, only while it still equals the record the
+      upgrade read, so of two racing upgrades the first wins and a retry
+      converges.
 
 `ExportNamespacePackage` (experimental) builds and signs the package from the
 published head. It needs read access to the namespace, as a definition export
@@ -140,7 +166,7 @@ does. `GetNamespacePackageInstallation` reads an installation with its status
 under namespace read access. Delivery is layered: this format and the export
 first, then install with input mapping and installation records, then opt-in
 dataset content (decision 13), then upgrade of an existing installation
-(decision 8).
+(decision 14).
 
 ## Consequences
 
@@ -157,7 +183,12 @@ dataset content (decision 13), then upgrade of an existing installation
   ordinary resources.
 - A definitions proposal that is closed instead of merged leaves its
   installation `pending_definitions`; reinstalling the same package returns
-  that installation. Recovering from it comes with upgrade.
+  that installation, and a later version installs as into an empty
+  namespace.
+- An installation record written before upgrade records no digests, so an
+  upgrade of it refuses a changed dataset definition, or new rows over
+  existing ones, as changed outside the installation. No release shipped
+  such records.
 
 ## Rejected alternatives
 
