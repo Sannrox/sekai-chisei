@@ -1781,6 +1781,9 @@ message ListClaimableAgentTurnsRequest {
   int32 limit = 2;
   // When false, parked turns that would resume with a continuation are omitted.
   bool accepts_continuation = 3;
+  // Experimental (ADR 0173). Also list interactive turns, after site-agent
+  // turns. An older worker leaves this false and never sees one.
+  bool accepts_interactive = 4;
 }
 message ListClaimableAgentTurnsResponse {
   repeated AgentTurn turns = 1;
@@ -1812,6 +1815,10 @@ message ClaimAgentTurnRequest {
   // Claimers that do not set this are refused a parked turn: continuation is
   // the only resume signal, and re-planning a parked turn as new duplicates work.
   bool accepts_continuation = 5;
+  // Experimental (ADR 0173). An empty turn_id also claims interactive turns
+  // when no site-agent turn is due; an interactive turn_id requires it. The
+  // runtime token then acts as the turn's member, with no act.
+  bool accepts_interactive = 6;
 }
 message ClaimAgentTurnResponse {
   AgentTurn turn = 1;
@@ -1978,6 +1985,8 @@ message AgentTurnWorkOptions {
   // When false, parked turns that would resume with a continuation are
   // neither listed nor claimed.
   bool accepts_continuation = 1;
+  // Experimental (ADR 0173). Also list and claim interactive turns.
+  bool accepts_interactive = 2;
 }
 // A connector type by name and version (ADR 0148).
 message ConnectorTypeRef {
@@ -4115,6 +4124,18 @@ message ActionInstance {
   // Digest of the stored parameters after erase. Distinguishes a legitimate
   // erase from other edits of the stored parameters.
   string erased_request_digest = 30;
+  // Experimental. The agent turn whose runtime token submitted the Action;
+  // unset otherwise.
+  ActionAgentTurn agent_turn = 31;
+}
+// The agent turn an Action was submitted under. An interactive turn
+// (ADR 0173) also names its definition revision, agent member and trace id;
+// the instance's principal is the member.
+message ActionAgentTurn {
+  string turn_id = 1;
+  string definition_revision_digest = 2;
+  string agent_member = 3;
+  string trace_id = 4;
 }
 // What required approval for a parked ActionInstance, as admission saw it.
 message ActionApprovalRequirement {

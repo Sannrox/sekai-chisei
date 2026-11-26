@@ -95,6 +95,7 @@ impl SekaiServiceImpl {
                     namespace: inner.namespace,
                     limit: inner.limit,
                     accepts_continuation: turn.is_some_and(|turn| turn.accepts_continuation),
+                    accepts_interactive: turn.is_some_and(|turn| turn.accepts_interactive),
                 };
                 self.list_claimable_agent_turns_rpc(Request::from_parts(metadata, extensions, body))
                     .await?
@@ -225,6 +226,7 @@ impl SekaiServiceImpl {
                     turn_id: inner.work_id,
                     ttl_ms: inner.ttl_ms,
                     accepts_continuation: turn.is_some_and(|turn| turn.accepts_continuation),
+                    accepts_interactive: turn.is_some_and(|turn| turn.accepts_interactive),
                 };
                 claim_work_response::Payload::AgentTurn(
                     self.claim_agent_turn_rpc(Request::from_parts(metadata, extensions, body))

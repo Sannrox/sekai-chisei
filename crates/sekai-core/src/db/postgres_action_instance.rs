@@ -1027,12 +1027,20 @@ pub(crate) fn postgres_turn_fence_refusal<C: postgres::GenericClient>(
     let Some(turn_id) = turn_id.filter(|_| write_committed != Some(true)) else {
         return Ok(None);
     };
+    // Interactive turns live in their own table (ADR 0173).
+    let table = if crate::sekai::interactive_agent_turn::is_interactive_turn_id(&turn_id) {
+        "sekai_interactive_agent_turn"
+    } else {
+        "sekai_agent_turn"
+    };
     let live = client
         .query_opt(
-            "SELECT 1 FROM sekai_agent_turn
+            &format!(
+                "SELECT 1 FROM {table}
              WHERE turn_id = $1 AND status = 'claimed' AND claim_generation = $2
                AND claim_expires_at_ms > $3
-             FOR SHARE",
+             FOR SHARE"
+            ),
             &[
                 &turn_id,
                 &turn_generation.unwrap_or(-1),

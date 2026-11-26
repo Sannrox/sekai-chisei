@@ -89,6 +89,104 @@ fn interactive_to_proto(turn: interactive_agent_turn::InteractiveAgentTurn) -> A
     }
 }
 
+/// A turn a worker call or turn token names: a site-agent turn, or an
+/// interactive turn, routed by its `iturn-` id (ADR 0173).
+enum AnyTurn {
+    Site(agent_turn::AgentTurn),
+    Interactive(interactive_agent_turn::InteractiveAgentTurn),
+}
+
+impl AnyTurn {
+    fn load(db: &RuntimeDb, turn_id: &str) -> Result<Option<Self>, Status> {
+        Ok(if interactive_agent_turn::is_interactive_turn_id(turn_id) {
+            interactive_agent_turn::get(db, turn_id)
+                .map_err(turn_status)?
+                .map(Self::Interactive)
+        } else {
+            agent_turn::get(db, turn_id)
+                .map_err(turn_status)?
+                .map(Self::Site)
+        })
+    }
+
+    fn require(db: &RuntimeDb, turn_id: &str) -> Result<Self, Status> {
+        Self::load(db, turn_id)?.ok_or_else(|| turn_status(TurnError::NotFound))
+    }
+
+    fn namespace(&self) -> &str {
+        match self {
+            Self::Site(turn) => &turn.namespace,
+            Self::Interactive(turn) => &turn.namespace,
+        }
+    }
+
+    fn turn_id(&self) -> &str {
+        match self {
+            Self::Site(turn) => &turn.turn_id,
+            Self::Interactive(turn) => &turn.turn_id,
+        }
+    }
+
+    /// Whom the turn acts as: its instance principal, or its member.
+    fn principal_id(&self) -> &str {
+        match self {
+            Self::Site(turn) => &turn.principal_id,
+            Self::Interactive(turn) => &turn.member_id,
+        }
+    }
+
+    /// The person a token for the turn names as `act`. An interactive turn
+    /// acts as its member, so it has none.
+    fn requester(&self) -> Option<&str> {
+        match self {
+            Self::Site(turn) => turn.requester(),
+            Self::Interactive(_) => None,
+        }
+    }
+
+    fn claim_owner(&self) -> &str {
+        match self {
+            Self::Site(turn) => &turn.claim_owner,
+            Self::Interactive(turn) => &turn.claim_owner,
+        }
+    }
+
+    fn claim_generation(&self) -> i64 {
+        match self {
+            Self::Site(turn) => turn.claim_generation,
+            Self::Interactive(turn) => turn.claim_generation,
+        }
+    }
+
+    fn claim_expires_at_ms(&self) -> i64 {
+        match self {
+            Self::Site(turn) => turn.claim_expires_at_ms,
+            Self::Interactive(turn) => turn.claim_expires_at_ms,
+        }
+    }
+
+    fn is_live_claim(&self, now_ms: i64) -> bool {
+        match self {
+            Self::Site(turn) => turn.is_live_claim(now_ms),
+            Self::Interactive(turn) => turn.is_live_claim(now_ms),
+        }
+    }
+
+    fn is_acknowledged(&self) -> bool {
+        match self {
+            Self::Site(turn) => turn.is_acknowledged(),
+            Self::Interactive(turn) => turn.is_finished(),
+        }
+    }
+
+    fn into_proto(self) -> AgentTurn {
+        match self {
+            Self::Site(turn) => to_proto(turn),
+            Self::Interactive(turn) => interactive_to_proto(turn),
+        }
+    }
+}
+
 /// Whether `principals` are cleared for a transcript prompt `marking` under
 /// the namespace's lattice (ADR 0157). An unknown marking is not cleared.
 fn prompt_marking_cleared(
@@ -288,10 +386,8 @@ impl SekaiServiceImpl {
                     ));
                 }
             };
-            let turn = agent_turn::get(self.db.runtime(), turn_id)
-                .map_err(turn_status)?
-                .ok_or_else(|| turn_status(TurnError::NotFound))?;
-            refuse_instance_as_worker(claims.worker.as_deref().unwrap_or(""), &turn.principal_id)?;
+            let turn = AnyTurn::require(self.db.runtime(), turn_id)?;
+            refuse_instance_as_worker(claims.worker.as_deref().unwrap_or(""), turn.principal_id())?;
             // The store replays the same fence and outcome, or refuses.
             if acked && turn.is_acknowledged() {
                 return self.authorize_acked_turn_token(req, claims, &turn);
@@ -313,11 +409,9 @@ impl SekaiServiceImpl {
         let namespace = match scope {
             Scope::Namespace(namespace) => namespace.to_string(),
             Scope::Turn(turn_id) | Scope::AckedTurn(turn_id) => {
-                let turn = agent_turn::get(self.db.runtime(), turn_id)
-                    .map_err(turn_status)?
-                    .ok_or_else(|| turn_status(TurnError::NotFound))?;
-                refuse_instance_as_worker(&calling_worker_subject(req), &turn.principal_id)?;
-                turn.namespace
+                let turn = AnyTurn::require(self.db.runtime(), turn_id)?;
+                refuse_instance_as_worker(&calling_worker_subject(req), turn.principal_id())?;
+                turn.namespace().to_string()
             }
         };
         check_team_namespace(self.db.runtime(), &principals, &namespace, true)?;
@@ -333,15 +427,15 @@ impl SekaiServiceImpl {
         &self,
         req: &Request<T>,
         claims: &RuntimeTokenClaims,
-        turn: &agent_turn::AgentTurn,
+        turn: &AnyTurn,
     ) -> Result<(), Status> {
         let live = turn.is_live_claim(now_millis())
-            && u64::try_from(turn.claim_generation).ok() == Some(claims.claim_generation)
-            && turn.principal_id == claims.subject
+            && u64::try_from(turn.claim_generation()).ok() == Some(claims.claim_generation)
+            && turn.principal_id() == claims.subject
             && claims.covers_turn(
-                &turn.namespace,
-                &turn.turn_id,
-                &turn.claim_owner,
+                turn.namespace(),
+                turn.turn_id(),
+                turn.claim_owner(),
                 claims.claim_generation,
             );
         if !live {
@@ -352,9 +446,37 @@ impl SekaiServiceImpl {
         enforce_namespace_tenant_context(
             self.db.runtime(),
             request_tenant_context(self.db.runtime(), req)?.as_ref(),
-            &turn.namespace,
+            turn.namespace(),
             true,
-        )
+        )?;
+        if let AnyTurn::Interactive(turn) = turn {
+            self.require_member_access(turn)?;
+        }
+        Ok(())
+    }
+
+    /// An interactive turn acts with its member's access as it stands now
+    /// (ADR 0173 decision 3). A member who lost write access to the
+    /// namespace fails the turn with the refusal as its reason.
+    fn require_member_access(
+        &self,
+        turn: &interactive_agent_turn::InteractiveAgentTurn,
+    ) -> Result<(), Status> {
+        let member = [turn.member_id.clone()];
+        let Err(refused) = check_team_namespace(self.db.runtime(), &member, &turn.namespace, true)
+        else {
+            return Ok(());
+        };
+        if refused.code() == tonic::Code::PermissionDenied {
+            interactive_agent_turn::fail_unfinished(
+                self.db.runtime(),
+                &turn.turn_id,
+                &format!("member access revoked: {}", refused.message()),
+                now_millis(),
+            )
+            .map_err(turn_status)?;
+        }
+        Err(refused)
     }
 
     /// A turn token retrying the ack of a turn it acknowledged: the turn was
@@ -363,14 +485,14 @@ impl SekaiServiceImpl {
         &self,
         req: &Request<T>,
         claims: &RuntimeTokenClaims,
-        turn: &agent_turn::AgentTurn,
+        turn: &AnyTurn,
     ) -> Result<(), Status> {
-        let covered = u64::try_from(turn.claim_generation).ok() == Some(claims.claim_generation)
-            && turn.principal_id == claims.subject
+        let covered = u64::try_from(turn.claim_generation()).ok() == Some(claims.claim_generation)
+            && turn.principal_id() == claims.subject
             && claims.covers_turn(
-                &turn.namespace,
-                &turn.turn_id,
-                &turn.claim_owner,
+                turn.namespace(),
+                turn.turn_id(),
+                turn.claim_owner(),
                 claims.claim_generation,
             );
         if !covered {
@@ -381,32 +503,56 @@ impl SekaiServiceImpl {
         enforce_namespace_tenant_context(
             self.db.runtime(),
             request_tenant_context(self.db.runtime(), req)?.as_ref(),
-            &turn.namespace,
+            turn.namespace(),
             true,
         )
     }
 
     /// An Action submitted with a turn token is the turn's: the turn must
-    /// still be claimed by the token, in the namespace the Action names.
+    /// still be claimed by the token, in the namespace the Action names. An
+    /// interactive turn submits only the Action types its agent member
+    /// allows (ADR 0173 decision 4). Returns the claim the admission commits
+    /// under, `None` without a turn token.
     pub(crate) fn authorize_turn_submission<T: 'static>(
         &self,
         req: &Request<T>,
         namespace: &str,
-    ) -> Result<(), Status> {
+        type_id: &str,
+    ) -> Result<Option<crate::sekai::action_instance::AgentTurnFence>, Status> {
         let Some(claims) = req.extensions().get::<RuntimeTokenClaims>() else {
-            return Ok(());
+            return Ok(None);
         };
         if !claims.is_turn() || claims.namespace != namespace {
             return Err(Status::permission_denied(
                 "runtime token does not cover this submission",
             ));
         }
-        let turn = agent_turn::get(self.db.runtime(), &claims.turn_id)
-            .map_err(turn_status)?
-            .ok_or_else(|| {
-                Status::permission_denied("runtime token does not cover this submission")
-            })?;
+        let turn = AnyTurn::load(self.db.runtime(), &claims.turn_id)?.ok_or_else(|| {
+            Status::permission_denied("runtime token does not cover this submission")
+        })?;
         self.authorize_turn_token(req, claims, &turn)?;
+        let mut fence = crate::sekai::action_instance::AgentTurnFence {
+            turn_id: claims.turn_id.clone(),
+            claim_generation: claims.claim_generation,
+            interactive: None,
+        };
+        let turn = match turn {
+            AnyTurn::Interactive(turn) => {
+                interactive_agent_turn::require_allowed_action_type(
+                    self.db.runtime(),
+                    &turn,
+                    type_id,
+                )
+                .map_err(Status::permission_denied)?;
+                fence.interactive = Some(crate::sekai::action_instance::InteractiveTurnReceipt {
+                    definition_revision_digest: turn.definition_revision_digest,
+                    agent_member: turn.agent_member,
+                    trace_id: turn.trace_id,
+                });
+                return Ok(Some(fence));
+            }
+            AnyTurn::Site(turn) => turn,
+        };
         // A frozen instance's turn submits nothing, here as at admission.
         if crate::sekai::site_agent_instance::frozen_instance_for(
             self.db.runtime(),
@@ -418,7 +564,7 @@ impl SekaiServiceImpl {
         {
             return Err(Status::failed_precondition("site agent instance is frozen"));
         }
-        Ok(())
+        Ok(Some(fence))
     }
 
     /// The turn token for `turn` as claimed by `req`'s caller, or empty
@@ -427,7 +573,7 @@ impl SekaiServiceImpl {
     fn turn_token_for<T: 'static>(
         &self,
         req: &Request<T>,
-        turn: &agent_turn::AgentTurn,
+        turn: &AnyTurn,
         now_ms: i64,
     ) -> Result<(String, i64), Status> {
         let tenant_context = request_tenant_context(self.db.runtime(), req)?;
@@ -437,17 +583,17 @@ impl SekaiServiceImpl {
         ) else {
             return Ok((String::new(), 0));
         };
-        let Ok(claim_generation) = u64::try_from(turn.claim_generation) else {
+        let Ok(claim_generation) = u64::try_from(turn.claim_generation()) else {
             return Ok((String::new(), 0));
         };
         let binding = crate::runtime_token::TurnBinding {
-            namespace: &turn.namespace,
-            turn_id: &turn.turn_id,
-            principal: &turn.principal_id,
+            namespace: turn.namespace(),
+            turn_id: turn.turn_id(),
+            principal: turn.principal_id(),
             requester: turn.requester(),
-            runtime_id: &turn.claim_owner,
+            runtime_id: turn.claim_owner(),
             claim_generation,
-            claim_expires_at_ms: turn.claim_expires_at_ms,
+            claim_expires_at_ms: turn.claim_expires_at_ms(),
         };
         let Some(claims) = RuntimeTokenClaims::for_turn(authority, context, binding, now_ms) else {
             return Ok((String::new(), 0));
@@ -462,7 +608,7 @@ impl SekaiServiceImpl {
     fn refresh_turn_token(
         &self,
         claims: &RuntimeTokenClaims,
-        turn: &agent_turn::AgentTurn,
+        turn: &AnyTurn,
         now_ms: i64,
     ) -> Result<(String, i64), Status> {
         let Some(authority) = self.runtime_token_authority.as_deref() else {
@@ -470,7 +616,7 @@ impl SekaiServiceImpl {
         };
         let mut renewed = claims.clone();
         renewed.expires_at_ms = turn
-            .claim_expires_at_ms
+            .claim_expires_at_ms()
             .min(now_ms.saturating_add(crate::runtime_token::RUNTIME_TOKEN_MAX_LIFETIME_MS))
             .min(claims.authority_expires_at_ms);
         renewed.jti = uuid::Uuid::new_v4().to_string();
@@ -721,17 +867,38 @@ impl SekaiServiceImpl {
     ) -> Result<Response<ListClaimableAgentTurnsResponse>, Status> {
         self.authorize_turn_worker(&req, Scope::Namespace(&req.get_ref().namespace))?;
         let inner = req.into_inner();
-        let turns = agent_turn::list_claimable_maybe_resuming(
+        let now = now_millis();
+        let limit = i64::from(inner.limit);
+        let mut turns: Vec<AgentTurn> = agent_turn::list_claimable_maybe_resuming(
             self.db.runtime(),
             &inner.namespace,
-            now_millis(),
-            i64::from(inner.limit),
+            now,
+            limit,
             inner.accepts_continuation,
         )
-        .map_err(turn_status)?;
-        Ok(Response::new(ListClaimableAgentTurnsResponse {
-            turns: turns.into_iter().map(to_proto).collect(),
-        }))
+        .map_err(turn_status)?
+        .into_iter()
+        .map(to_proto)
+        .collect();
+        // Interactive turns fill what the site-agent turns leave of the page.
+        if inner.accepts_interactive {
+            let cap = usize::try_from(if limit <= 0 { 50 } else { limit.min(500) }).unwrap_or(0);
+            let room = i64::try_from(cap.saturating_sub(turns.len())).unwrap_or(0);
+            if room > 0 {
+                turns.extend(
+                    interactive_agent_turn::list_claimable(
+                        self.db.runtime(),
+                        &inner.namespace,
+                        now,
+                        room,
+                    )
+                    .map_err(turn_status)?
+                    .into_iter()
+                    .map(interactive_to_proto),
+                );
+            }
+        }
+        Ok(Response::new(ListClaimableAgentTurnsResponse { turns }))
     }
 
     pub(super) async fn claim_agent_turn_rpc(
@@ -742,8 +909,32 @@ impl SekaiServiceImpl {
         let now = now_millis();
         let worker = calling_worker_subject(&req);
         let inner = req.get_ref();
-        let turn = if inner.turn_id.trim().is_empty() {
-            agent_turn::claim_next_for_worker(
+        let interactive_id = interactive_agent_turn::is_interactive_turn_id(&inner.turn_id);
+        if interactive_id && !inner.accepts_interactive {
+            return Err(Status::failed_precondition(
+                "claiming an interactive turn requires accepts_interactive",
+            ));
+        }
+        let turn = if interactive_id {
+            // The member's own credential never runs its turn (ADR 0173).
+            if let Some(turn) = interactive_agent_turn::get(self.db.runtime(), &inner.turn_id)
+                .map_err(turn_status)?
+                .filter(|turn| turn.namespace == inner.namespace)
+            {
+                refuse_member_as_worker(&worker, &turn.member_id)?;
+            }
+            interactive_agent_turn::claim(
+                self.db.runtime(),
+                &inner.namespace,
+                &inner.runtime_id,
+                &inner.turn_id,
+                &worker,
+                inner.ttl_ms,
+                now,
+            )
+            .map(AnyTurn::Interactive)
+        } else if inner.turn_id.trim().is_empty() {
+            let site = agent_turn::claim_next_for_worker(
                 self.db.runtime(),
                 &inner.namespace,
                 &inner.runtime_id,
@@ -751,7 +942,22 @@ impl SekaiServiceImpl {
                 inner.ttl_ms,
                 now,
                 inner.accepts_continuation,
-            )
+            );
+            match site {
+                // Site-agent turns first; an interactive one when none is due.
+                Err(TurnError::NotFound) if inner.accepts_interactive => {
+                    interactive_agent_turn::claim_next(
+                        self.db.runtime(),
+                        &inner.namespace,
+                        &inner.runtime_id,
+                        &worker,
+                        inner.ttl_ms,
+                        now,
+                    )
+                    .map(AnyTurn::Interactive)
+                }
+                other => other.map(AnyTurn::Site),
+            }
         } else {
             if let Some(turn) = agent_turn::get(self.db.runtime(), &inner.turn_id)
                 .map_err(turn_status)?
@@ -768,12 +974,16 @@ impl SekaiServiceImpl {
                 now,
                 inner.accepts_continuation,
             )
+            .map(AnyTurn::Site)
         }
         .map_err(turn_status)?;
         let (runtime_token, runtime_token_expires_at_ms) = self.turn_token_for(&req, &turn, now)?;
-        let continuation = continuation_for(self.db.runtime(), &turn)?;
+        let continuation = match &turn {
+            AnyTurn::Site(turn) => continuation_for(self.db.runtime(), turn)?,
+            AnyTurn::Interactive(_) => None,
+        };
         Ok(Response::new(ClaimAgentTurnResponse {
-            turn: Some(to_proto(turn)),
+            turn: Some(turn.into_proto()),
             runtime_token,
             runtime_token_expires_at_ms,
             continuation,
@@ -787,15 +997,29 @@ impl SekaiServiceImpl {
         self.authorize_turn_worker(&req, Scope::Turn(&req.get_ref().turn_id))?;
         let now = now_millis();
         let inner = req.get_ref();
-        let turn = agent_turn::heartbeat(
-            self.db.runtime(),
-            &inner.turn_id,
-            &inner.runtime_id,
-            inner.claim_generation,
-            &inner.fencing_token,
-            inner.ttl_ms,
-            now,
-        )
+        let turn = if interactive_agent_turn::is_interactive_turn_id(&inner.turn_id) {
+            interactive_agent_turn::heartbeat(
+                self.db.runtime(),
+                &inner.turn_id,
+                &inner.runtime_id,
+                inner.claim_generation,
+                &inner.fencing_token,
+                inner.ttl_ms,
+                now,
+            )
+            .map(AnyTurn::Interactive)
+        } else {
+            agent_turn::heartbeat(
+                self.db.runtime(),
+                &inner.turn_id,
+                &inner.runtime_id,
+                inner.claim_generation,
+                &inner.fencing_token,
+                inner.ttl_ms,
+                now,
+            )
+            .map(AnyTurn::Site)
+        }
         .map_err(turn_status)?;
         // A heartbeat with a turn token refreshes it as the token's own
         // claim: the same principal, requester and worker (ADR 0143).
@@ -805,7 +1029,7 @@ impl SekaiServiceImpl {
                 None => self.turn_token_for(&req, &turn, now)?,
             };
         Ok(Response::new(HeartbeatAgentTurnClaimResponse {
-            turn: Some(to_proto(turn)),
+            turn: Some(turn.into_proto()),
             runtime_token,
             runtime_token_expires_at_ms,
         }))
@@ -818,6 +1042,38 @@ impl SekaiServiceImpl {
         self.authorize_turn_worker(&req, Scope::AckedTurn(&req.get_ref().turn_id))?;
         let inner = req.into_inner();
         let now = now_millis();
+        if interactive_agent_turn::is_interactive_turn_id(&inner.turn_id) {
+            // Parking an interactive turn is not yet supported: it fails
+            // closed rather than leaving a turn nothing resumes.
+            let outcome = match inner.outcome.as_str() {
+                "completed" => Outcome::Completed,
+                "failed" => Outcome::Failed,
+                "parked" => {
+                    return Err(Status::failed_precondition(
+                        "an interactive turn cannot park yet",
+                    ));
+                }
+                _ => {
+                    return Err(Status::invalid_argument(
+                        "outcome must be completed, failed or parked",
+                    ));
+                }
+            };
+            let turn = interactive_agent_turn::acknowledge(
+                self.db.runtime(),
+                &inner.turn_id,
+                &inner.runtime_id,
+                inner.claim_generation,
+                &inner.fencing_token,
+                outcome,
+                &inner.reason,
+                now,
+            )
+            .map_err(turn_status)?;
+            return Ok(Response::new(AckAgentTurnResponse {
+                turn: Some(interactive_to_proto(turn)),
+            }));
+        }
         let turn = match inner.outcome.as_str() {
             "completed" | "failed" => agent_turn::acknowledge(
                 self.db.runtime(),
@@ -1056,6 +1312,15 @@ fn refuse_instance_as_worker(worker: &str, principal_id: &str) -> Result<(), Sta
     let principal_id = principal_id.trim();
     if !worker.is_empty() && worker == principal_id {
         return Err(Status::permission_denied(INSTANCE_AS_WORKER));
+    }
+    Ok(())
+}
+
+fn refuse_member_as_worker(worker: &str, member_id: &str) -> Result<(), Status> {
+    if !worker.trim().is_empty() && worker.trim() == member_id {
+        return Err(Status::permission_denied(
+            "turn worker must not be the turn's member",
+        ));
     }
     Ok(())
 }

@@ -222,8 +222,23 @@ credentials, runtime tokens and delegated callers are refused, and the
 member needs write access to the namespace. The turn has cause
 `interactive`, no `instance_id`, the member as `principal_id`, and an id
 starting with `iturn-`. Interactive turns are stored apart from instance
-turns and are not claimable yet: the claim slice adds the
-`accepts_interactive` opt-in.
+turns.
+
+A worker sets `accepts_interactive` on `ListClaimableAgentTurns` and
+`ClaimAgentTurn` (or on `AgentTurnWorkOptions` of the work calls) to receive
+interactive turns; without it, they are never listed, an empty `turn_id`
+never claims one, and naming an `iturn-` id is refused. Listing appends them
+after instance turns, and claiming the next turn takes one only when no
+instance turn is due, never one whose member is the worker. The claim's
+runtime token has the member as subject, the worker as `worker`, and no
+`act`. Every call with it checks the member's write access to the namespace
+as it stands; a member who lost it fails the turn with `member access
+revoked` as its reason. The token submits only the Action types in the agent
+member's `allowed_action_types` at the turn's revision, and the admitted
+instance's `agent_turn` names the turn, revision, agent member and trace id.
+Interactive turns ack `completed` or `failed`; `parked` is refused until
+parking is supported, and transcript and working-memory calls do not cover
+them yet.
 
 A turn whose Action parks for approval acks `parked` with that Action's id
 (ADR 0142, #2007): the Action must have been submitted under the same claim

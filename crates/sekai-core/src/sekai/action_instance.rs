@@ -184,6 +184,20 @@ pub enum CommitCheck {
 pub struct AgentTurnFence {
     pub turn_id: String,
     pub claim_generation: u64,
+    /// Set when the turn is interactive: what its receipts name (ADR 0173
+    /// decision 6). Absent on site-agent turns and on rows older binaries
+    /// wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive: Option<InteractiveTurnReceipt>,
+}
+
+/// The revision, agent member and trace an interactive turn's Action ran
+/// under. The member is the instance's principal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractiveTurnReceipt {
+    pub definition_revision_digest: String,
+    pub agent_member: String,
+    pub trace_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1607,11 +1621,19 @@ pub(crate) fn sqlite_turn_fence_refusal(
     let Some(turn_id) = turn_id.filter(|_| write_committed != Some(true)) else {
         return Ok(None);
     };
+    // Interactive turns live in their own table (ADR 0173).
+    let table = if crate::sekai::interactive_agent_turn::is_interactive_turn_id(&turn_id) {
+        "sekai_interactive_agent_turn"
+    } else {
+        "sekai_agent_turn"
+    };
     let live: Option<i64> = tx
         .query_row(
-            "SELECT 1 FROM sekai_agent_turn
+            &format!(
+                "SELECT 1 FROM {table}
              WHERE turn_id = ?1 AND status = 'claimed' AND claim_generation = ?2
-               AND claim_expires_at_ms > ?3",
+               AND claim_expires_at_ms > ?3"
+            ),
             params![turn_id, turn_generation.unwrap_or(-1), lease_clock_ms()],
             |row| row.get(0),
         )
@@ -2557,6 +2579,7 @@ mod tests {
             instance.agent_turn = Some(AgentTurnFence {
                 turn_id: turn.turn_id.clone(),
                 claim_generation: u64::try_from(generation).unwrap(),
+                interactive: None,
             });
             db.put_action_instance(&instance).unwrap();
             lease
@@ -2687,6 +2710,7 @@ mod tests {
         instance.agent_turn = Some(AgentTurnFence {
             turn_id: turn.turn_id.clone(),
             claim_generation: u64::try_from(held.claim_generation).unwrap(),
+            interactive: None,
         });
         db.put_action_instance(&instance).unwrap();
         let after_write = sekai_domain::receipt::OperationReceipt {
