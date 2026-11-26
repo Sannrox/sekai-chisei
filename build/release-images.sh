@@ -33,6 +33,8 @@ if [[ -z "${GIT_VERSION}" || "${GIT_VERSION}" == *dirty* ]]; then
 fi
 IMAGE_NAME="${IMAGE_NAME:-sekai-chisei}"
 IMAGE_TAG="${IMAGE_NAME}:${GIT_VERSION}"
+GATEWAY_IMAGE_NAME="${GATEWAY_IMAGE_NAME:-chisei-gateway}"
+GATEWAY_IMAGE_TAG="${GATEWAY_IMAGE_NAME}:${GIT_VERSION}"
 
 mkdir -p _output/cargo-target _output/linux-bins
 
@@ -55,6 +57,14 @@ docker build \
   -t "${IMAGE_TAG}" \
   _output/linux-bins
 
+docker build \
+  -f build/gateway-image/Dockerfile \
+  --build-arg VCS_REF="${GIT_COMMIT}" \
+  -t "${GATEWAY_IMAGE_TAG}" \
+  _output/linux-bins
+
 printf '%s\n' "${IMAGE_TAG}" > _output/image-tag
+printf '%s\n' "${GATEWAY_IMAGE_TAG}" > _output/gateway-image-tag
 printf 'GIT_VERSION=%s\n' "${GIT_VERSION}" > _output/compose.env
 echo "Built ${IMAGE_TAG}"
+echo "Built ${GATEWAY_IMAGE_TAG}"

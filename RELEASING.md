@@ -162,8 +162,9 @@ runs **main's** `release.yml`, never the copy at the tagged commit.
   commit, and creates the release with `gh release create <tag> --verify-tag`
 - drafts the GitHub Release from the matching CHANGELOG section, uploads the
   `sekai` binary matrix and `compatibility.json` once the Tenkai products
-  provide its contracts, pushes the GHCR image by
-  version only (no `latest` tag), records its digest, and writes an SBOM
+  provide its contracts, pushes the GHCR server image and
+  `${DOCKER_REGISTRY}/chisei-gateway` by version only (no `latest` tag),
+  records their digests, and writes an SBOM
 - after the last change to `SHA256SUMS` and the family manifest, attests
   provenance for `SHA256SUMS`, the SBOM, and the manifest, and the SBOM for
   `SHA256SUMS`; then checks the draft's copies against their checksums and

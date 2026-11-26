@@ -253,3 +253,4 @@ jobs:
           fetch-depth: 0
       - run: bash build/release-images.sh
       - run: docker run --rm "$(cat _output/image-tag)" sekaictl --help
+      - run: docker run --rm "$(cat _output/gateway-image-tag)" chisei-gateway --version

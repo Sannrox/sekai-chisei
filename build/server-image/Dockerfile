@@ -13,7 +13,7 @@ RUN apt-get update \
     && useradd --system --uid 999 --gid 999 --create-home sekai \
     && mkdir /data && chown sekai:sekai /data
 
-COPY sekai-chisei chisei-gateway sekaictl /usr/local/bin/
+COPY sekai-chisei sekaictl /usr/local/bin/
 
 ENV SEKAI_DATA_DIR=/data \
     SEKAI_SOCKET=/data/sekai.sock

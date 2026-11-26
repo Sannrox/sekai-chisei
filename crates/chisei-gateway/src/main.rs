@@ -18,8 +18,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         return run_refresh(args).await;
     }
+    if args.len() == 1 && (args[0] == "--version" || args[0] == "-V") {
+        println!(
+            "chisei-gateway {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            chisei_gateway::obs::build_info::GIT_VERSION
+        );
+        return Ok(());
+    }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!("Usage: chisei-gateway [refresh ...]");
+        println!("Usage: chisei-gateway [--version] [refresh ...]");
         println!("       chisei-gateway refresh --help");
         return Ok(());
     }

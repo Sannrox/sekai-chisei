@@ -65,3 +65,7 @@ while between releases its proto revision described no shipped package.
 Tests check that generation projects the proto revision and contract and
 round-trips through `write_matrix`; the release workflow publishes the
 artifact.
+
+Amended by #2702: the matrix also projects `packages.chisei-gateway` and
+`minimum_compatible_gateway`. `sekaictl launch` refuses an installed gateway
+crate version outside that inclusive range.

@@ -24,6 +24,19 @@ fn stderr(output: &Output) -> String {
 
 #[test]
 fn early_exit_paths_keep_their_codes_and_messages() {
+    let version = gateway(&["--version"]);
+    assert!(version.status.success(), "{version:?}");
+    assert!(
+        stdout(&version).starts_with("chisei-gateway "),
+        "{}",
+        stdout(&version)
+    );
+    assert!(
+        stdout(&version).contains(env!("CARGO_PKG_VERSION")),
+        "{}",
+        stdout(&version)
+    );
+
     let refresh = gateway(&["refresh", "--help"]);
     assert!(refresh.status.success(), "{refresh:?}");
     assert!(
