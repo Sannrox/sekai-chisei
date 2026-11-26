@@ -9,11 +9,10 @@ posture, and decide inputs. Mixing them is unsupported.
 | Native governed-surface catalog | `DiscoverCapabilities` contract `1.0` | Native gRPC runtimes and SDKs | Namespace-visible object queries, retrieval, and governed actions | Authenticated principal + canonical namespace + schema ACL + `product_tier` | No. Visibility is descriptive; invocation rechecks live controls. |
 | Provider-profile matrix | `chisei.provider-capabilities/v1` | Compatible HTTP gateway clients | Provider protocol features (streaming, tools, Responses, …) the **current gateway** can route | Authenticated gateway identity; profiles limited to configured, routable, non-experimental providers | No. `grant_semantics` is always `false`. |
 
-`ChiseiService.DecideGatewayExecution.capability_requirements_json` accepts only
-the provider-profile **requirements** shape derived from a request body
-(`CapabilityRequirements` in `chisei.provider-capabilities/v1`). A native
-`DiscoverCapabilities` response or the HTTP matrix document in that field is a
-catalog mix and fails closed as `capability_unsupported`, not `policy_denied`.
+Gateway admission parses provider-profile **requirements** from the request
+body (`CapabilityRequirements` in `chisei.provider-capabilities/v1`) against
+the gateway's own policy. A native `DiscoverCapabilities` document is not a
+gateway input.
 
 There is no OpenAPI description of the HTTP matrix. The versioned JSON document
 and the `x-chisei-capability-catalog` response header are the contract.
@@ -306,7 +305,7 @@ and a route the family enables elsewhere is refused with
 namespaces require namespace administration; the empty namespace requires
 credential admin (`root` / `local`). Route admission (#1494) default-denies
 any model that is not `enabled` for the namespace, identity, and residency
-region at native planning and execution, gateway decide, and hosted routes.
+region at native planning and execution, gateway policy admission, and hosted routes.
 `sekaictl admin model-review` is the operator CLI.
 
 ### Model-release evidence (#1396)

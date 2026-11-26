@@ -86,9 +86,9 @@ wait_for_gateway_response() {
   local gateway_log="$3"
   local status
 
-  # A listening gateway can still be waiting for its control-plane decision
-  # path. Exercise the same request that the smoke test asserts, retrying only
-  # the documented transient unavailable response rather than accepting it.
+  # A listening gateway can still be loading policy. Exercise the same request
+  # the smoke test asserts, retrying only the documented transient unavailable
+  # response rather than accepting it.
   for _ in $(seq 1 120); do
     status="$(curl -sS -o "$response_path" -w '%{http_code}' "$url" \
       -H "authorization: Bearer sk-chisei-codex-app" \
@@ -316,6 +316,44 @@ export SEKAI_DATA_DIR="$TMPDIR/data"
 export CHISEI_GATEWAY_USAGE_RECOVERY_PATH="$SEKAI_DATA_DIR/chisei-gateway-usage-recovery.json"
 export CHISEI_GATEWAY_RECOVERY_SPOOL_PATH="$SEKAI_DATA_DIR/chisei-gateway-recovery-spool.jsonl"
 mkdir -p "$SEKAI_DATA_DIR"
+POLICY_PATH="$TMPDIR/chisei-gateway-policy.json"
+python3 - "$POLICY_PATH" <<'PY'
+import hashlib
+import json
+import sys
+
+def key_sha(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+routes = [
+    {"provider": "openai", "models": ["*"]},
+    {"provider": "anthropic", "models": ["*"]},
+]
+policy = {
+    "format": "chisei.gateway-policy/v1",
+    "generation": 1,
+    "principals": [
+        {
+            "name": "codex-app",
+            "project": "sekai-chisei",
+            "key_sha256": [key_sha("sk-chisei-codex-app")],
+            "routes": routes,
+        },
+        {
+            "name": "claude-code",
+            "project": "default",
+            "key_sha256": [key_sha("sk-chisei-claude-code")],
+            "routes": routes,
+        },
+    ],
+    "egress": [
+        {"provider": "openai", "data_classes": ["unknown", "public", "internal"]},
+        {"provider": "anthropic", "data_classes": ["unknown", "public", "internal"]},
+    ],
+}
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    json.dump(policy, f)
+PY
 SEKAI_INSECURE=1 \
 GRPC_PORT=0 \
 OPS_PORT="" \
@@ -375,6 +413,7 @@ for attempt in $(seq 1 10); do
   gateway_log="$TMPDIR/gateway-$attempt.log"
   SEKAI_SOCKET="$SOCKET" \
   GATEWAY_BIND="127.0.0.1:$candidate_port" \
+  CHISEI_GATEWAY_POLICY_PATH="$POLICY_PATH" \
   CHISEI_OPENAI_BASE_URL="http://127.0.0.1:$PROVIDER_PORT/v1" \
   CHISEI_ANTHROPIC_BASE_URL="http://127.0.0.1:$PROVIDER_PORT/v1" \
   CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH=1 \
@@ -466,34 +505,11 @@ if live_client_enabled codex; then
   fi
 fi
 
-SEKAI_SOCKET="$SOCKET" "$CHISEI_GATEWAY_BIN" \
-  report --by agent --since 24h >"$TMPDIR/report.txt"
-
-SEKAI_SOCKET="$SOCKET" "$CHISEI_GATEWAY_BIN" \
-  report --since 24h --html "$TMPDIR/dashboard.html" >"$TMPDIR/dashboard-command.txt"
-
-# RecordDecision is stable, so a control plane without experimental RPCs
-# keeps the gateway's audit decisions (#2568).
-if grep -h "audit decision record failed" "$TMPDIR"/gateway*.log; then
-  echo "gateway dropped audit decisions" >&2
-  exit 1
-fi
-python3 - "$SEKAI_DB_PATH" <<'PY'
-import sqlite3
-import sys
-
-conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-(count,) = conn.execute(
-    "SELECT count(*) FROM sekai_decisions WHERE target_id = 'llm_calls'"
-).fetchone()
-assert count > 0, "no gateway audit decisions recorded"
-PY
-
-python3 - "$PROVIDER_REQUESTS" "$TMPDIR/report.txt" "$TMPDIR/dashboard.html" "$TMPDIR/openai-stream.sse" "$TMPDIR/anthropic-stream.sse" <<'PY'
+python3 - "$PROVIDER_REQUESTS" "$TMPDIR/openai-stream.sse" "$TMPDIR/anthropic-stream.sse" <<'PY'
 import json
 import sys
 
-requests_path, report_path, dashboard_path, openai_stream_path, anthropic_stream_path = sys.argv[1:6]
+requests_path, openai_stream_path, anthropic_stream_path = sys.argv[1:4]
 with open(requests_path, encoding="utf-8") as f:
     requests = [json.loads(line) for line in f if line.strip()]
 
@@ -516,27 +532,6 @@ assert '"total_tokens":24' in openai_stream, openai_stream
 anthropic_stream = open(anthropic_stream_path, encoding="utf-8").read()
 assert "event: message_delta" in anthropic_stream, anthropic_stream
 assert '"output_tokens":7' in anthropic_stream, anthropic_stream
-
-report = open(report_path, encoding="utf-8").read()
-assert "codex-app" in report, report
-assert "claude-code" in report, report
-assert "est_cost_usd" in report, report
-# Cache reporting: the Anthropic call reported 40 cache-read tokens priced at
-# a discounted rate (3 -> 0.3 usd/1M), saving 40 * 2.7 usd/1M = $0.000108.
-for column in ("cold_write", "warm_read", "misses", "hit_rate", "cached_share"):
-    assert column in report, report
-assert "cache_saved_usd" in report, report
-assert "0.000108" in report, report
-
-dashboard = open(dashboard_path, encoding="utf-8").read()
-assert "Chisei Gateway Usage" in dashboard, dashboard
-assert "By Agent" in dashboard, dashboard
-assert "Estimated cost" in dashboard, dashboard
-assert "codex-app" in dashboard, dashboard
-assert "claude-code" in dashboard, dashboard
-assert "Cache reads" in dashboard, dashboard
-assert "Cache savings" in dashboard, dashboard
-assert "0.000108" in dashboard, dashboard
 PY
 
 if live_client_enabled claude; then

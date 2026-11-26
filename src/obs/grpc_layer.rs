@@ -353,11 +353,7 @@ mod tests {
 
     #[test]
     fn recognizes_operation_receipt_rpc_paths() {
-        for method in [
-            "ReportOperationEvent",
-            "GetOperationReceipt",
-            "ClaimGatewayDispatch",
-        ] {
+        for method in ["ReportOperationEvent", "GetOperationReceipt"] {
             assert_eq!(
                 parse_grpc_path(&format!("/chisei.ChiseiService/{method}")),
                 ("chisei.ChiseiService".into(), method.into())

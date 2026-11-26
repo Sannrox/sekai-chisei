@@ -983,7 +983,6 @@ impl PostgresDb {
         )
     }
 
-    #[cfg(any(test, feature = "gateway-test-support"))]
     pub fn purge_object_changes_for_test(&self) -> Result<(), String> {
         self.connection()?
             .execute("DELETE FROM sekai_object_changes", &[])
@@ -991,7 +990,6 @@ impl PostgresDb {
             .map_err(|error| error.to_string())
     }
 
-    #[cfg(any(test, feature = "gateway-test-support"))]
     pub fn purge_object_changes_for_object_for_test(&self, object_id: &str) -> Result<(), String> {
         self.connection()?
             .execute(

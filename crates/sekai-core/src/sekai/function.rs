@@ -124,7 +124,6 @@ pub struct FunctionBudget {
 /// The default caps with a time budget wall time never reaches, for tests
 /// that are not about time: under a loaded parallel test run a 50 ms budget
 /// trips first and fails them (#1772).
-#[cfg(any(test, feature = "gateway-test-support"))]
 impl FunctionBudget {
     pub fn for_tests() -> Self {
         Self {

@@ -469,6 +469,14 @@ impl PolicyStore {
         });
     }
 
+    /// True when the active policy names this principal.
+    pub(super) fn has_principal(&self, name: &str) -> bool {
+        self.read()
+            .active
+            .as_ref()
+            .is_some_and(|policy| policy.principal(name).is_some())
+    }
+
     /// Resolves a presented key to its principal.
     pub(super) fn identify(
         &self,

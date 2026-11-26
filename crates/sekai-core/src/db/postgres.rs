@@ -2294,7 +2294,6 @@ fn secure_config(database_url: &str) -> Result<PostgresConfig, String> {
 
 /// A throwaway database on the conformance server named by
 /// `SEKAI_TEST_POSTGRES_URL`, dropped when the guard goes out of scope.
-#[cfg(any(test, feature = "gateway-test-support"))]
 pub struct ScratchDatabase {
     admin_url: String,
     ca_certificate: Option<Vec<u8>>,
@@ -2302,7 +2301,6 @@ pub struct ScratchDatabase {
     url: String,
 }
 
-#[cfg(any(test, feature = "gateway-test-support"))]
 impl ScratchDatabase {
     pub fn create() -> Self {
         let admin_url = std::env::var("SEKAI_TEST_POSTGRES_URL")
@@ -2374,7 +2372,6 @@ impl ScratchDatabase {
     }
 }
 
-#[cfg(any(test, feature = "gateway-test-support"))]
 impl Drop for ScratchDatabase {
     fn drop(&mut self) {
         self.admin(&format!(

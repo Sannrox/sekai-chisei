@@ -8,118 +8,44 @@ pub(super) async fn resolve_identity(
     let Some(key) = client_key(headers) else {
         return Err(IdentityError::MissingKey);
     };
-    if let Some(policy) = &state.runtime.policy {
-        return policy
-            .identify(key, &config.default_project)
-            .map(|identity| IdentityContext::machine(identity, UpstreamAuthMode::GatewayKey));
-    }
-    if config.allow_auth_passthrough
-        && let Some(identity) = passthrough_identity(headers, &config.default_project)
-    {
-        return Ok(IdentityContext::machine(
-            identity,
-            UpstreamAuthMode::Passthrough,
-        ));
-    }
-
-    if let Some(identity) = config.gateway_keys.get(key) {
-        return Ok(IdentityContext::machine(
-            identity.clone(),
-            UpstreamAuthMode::GatewayKey,
-        ));
-    }
-    if !config.gateway_keys.is_empty() {
-        return Err(IdentityError::UnknownKey);
-    }
-
-    if let Some(identity) = resolve_identity_from_key_store(state, key).await? {
-        return Ok(IdentityContext::machine(
-            identity,
-            UpstreamAuthMode::GatewayKey,
-        ));
-    }
-
-    Ok(IdentityContext::machine(
-        derive_identity_from_key(key, &config.default_project),
-        UpstreamAuthMode::GatewayKey,
-    ))
-}
-pub(super) async fn resolve_identity_from_key_store(
-    state: &GatewayState,
-    key: &str,
-) -> Result<Option<GatewayIdentity>, IdentityError> {
-    let config = &state.config;
-    let Some(target) = &config.chisei_grpc_target else {
-        return Ok(None);
+    let Some(policy) = &state.runtime.policy else {
+        return Err(IdentityError::NoValidPolicy);
     };
     let key_hash = hash_gateway_key(key);
-    if let Some(entry) = cached_gateway_key_identity(state, &key_hash).await {
-        return entry.identity.ok_or(IdentityError::UnknownKey).map(Some);
-    }
-    let channel = connect_governance(&state.runtime, target)
-        .await
-        .map_err(|_| IdentityError::KeyStoreUnavailable)?;
-    let mut sekai = SekaiServiceClient::new(channel);
-    let resp = match sekai
-        .find_by_property(gateway_request(FindByPropertyRequest {
-            kind: "gateway_key".to_string(),
-            key: "key_hash".to_string(),
-            value: key_hash.clone(),
-        }))
-        .await
+    if let Some(entry) = cached_gateway_key_identity(state, &key_hash).await
+        && let Some(identity) = entry.identity
     {
-        Ok(resp) => {
-            record_control_plane_success(&state.runtime).await;
-            resp.into_inner()
+        return Ok(IdentityContext::machine(
+            identity,
+            UpstreamAuthMode::GatewayKey,
+        ));
+    }
+    match policy.identify(key, &config.default_project) {
+        Ok(identity) => {
+            cache_gateway_key_identity(state, key_hash, Some(identity.clone())).await;
+            Ok(IdentityContext::machine(
+                identity,
+                UpstreamAuthMode::GatewayKey,
+            ))
+        }
+        Err(IdentityError::UnknownKey)
+            if config.allow_auth_passthrough
+                && config.bind_addr.ip().is_loopback()
+                && let Some(identity) = passthrough_identity(headers, &config.default_project)
+                && policy.has_principal(&identity.agent) =>
+        {
+            Ok(IdentityContext::machine(
+                identity,
+                UpstreamAuthMode::Passthrough,
+            ))
         }
         Err(error) => {
-            if is_transient_governance_status(&error) {
-                record_control_plane_failure(&state.runtime, &error).await;
-            } else {
-                record_control_plane_success(&state.runtime).await;
+            if matches!(error, IdentityError::UnknownKey) {
+                cache_gateway_key_identity(state, key_hash, None).await;
             }
-            return Err(IdentityError::KeyStoreUnavailable);
+            Err(error)
         }
-    };
-    let object = resp.objects.into_iter().find(|object| {
-        object
-            .properties
-            .get("status")
-            .map(|status| status == "active")
-            .unwrap_or(true)
-    });
-    let Some(object) = object else {
-        cache_gateway_key_identity(state, key_hash, None).await;
-        return Err(IdentityError::UnknownKey);
-    };
-    let Some(agent) = object
-        .properties
-        .get("agent")
-        .filter(|value| !value.is_empty())
-    else {
-        cache_gateway_key_identity(state, key_hash, None).await;
-        return Err(IdentityError::UnknownKey);
-    };
-    let project = object
-        .properties
-        .get("project")
-        .filter(|value| !value.is_empty())
-        .cloned()
-        .unwrap_or_else(|| config.default_project.clone());
-    let identity = GatewayIdentity {
-        agent: agent.clone(),
-        project,
-        user_id: format!("agent:{agent}"),
-        key_id: object.name.clone(),
-        tier: object
-            .properties
-            .get("tier")
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| DEFAULT_GATEWAY_TIER.to_string()),
-    };
-    cache_gateway_key_identity(state, key_hash, Some(identity.clone())).await;
-    Ok(Some(identity))
+    }
 }
 pub(super) async fn cached_gateway_key_identity(
     state: &GatewayState,
@@ -244,21 +170,6 @@ pub(super) fn header_str<'a>(headers: &'a HeaderMap, name: &HeaderName) -> Optio
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-}
-pub(super) fn derive_identity_from_key(key: &str, default_project: &str) -> GatewayIdentity {
-    let agent = key
-        .strip_prefix("sk-chisei-")
-        .unwrap_or("unknown")
-        .to_string();
-    GatewayIdentity {
-        user_id: format!("agent:{agent}"),
-        key_id: agent.clone(),
-        agent,
-        project: default_project.to_string(),
-        // This compatibility path has no operator-managed registration from
-        // which to derive a trusted failure posture.
-        tier: "untrusted".to_string(),
-    }
 }
 pub(super) fn parse_gateway_keys(
     spec: &str,

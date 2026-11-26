@@ -6226,27 +6226,6 @@ fn evidence_eval_run(
     }
 }
 
-fn run_test_gateway_pipeline(
-    svc: &ChiseiServiceImpl,
-    request_id: &str,
-    namespace: &str,
-    spec: &str,
-    task_class: &str,
-) -> GatewayPipelineDecision {
-    svc.gateway_pipeline_decision(GatewayPipelineInput {
-        actor: "local",
-        delegated_principal: None,
-        request_id,
-        namespace,
-        spec,
-        model: "native-default",
-        runtime: "native",
-        task_class,
-        action_impact: &Default::default(),
-    })
-    .unwrap()
-}
-
 #[tokio::test]
 async fn budget_usage_reads_are_authorized_like_set_budget_limit() {
     let svc = memory_service();
@@ -6550,13 +6529,8 @@ fn team_execution_uses_authenticated_namespace_and_budget_scope() {
             .code(),
         tonic::Code::PermissionDenied
     );
-    require_execution_namespace_access(
-        svc.sekai_facts.reader(),
-        &svc.config,
-        "chisei-gateway",
-        "unmanaged",
-    )
-    .unwrap();
+    require_execution_namespace_access(svc.sekai_facts.reader(), &svc.config, "local", "unmanaged")
+        .unwrap();
     assert_eq!(
         require_execution_namespace_access(
             svc.sekai_facts.reader(),
@@ -6888,190 +6862,6 @@ fn project_test_evidence_from_source(
 }
 
 #[tokio::test]
-async fn internal_gateway_pipeline_audits_and_applies_the_context_expansion_gate() {
-    let svc = memory_service();
-    svc.db
-        .runtime()
-        .create_object(&Object {
-            id: "ticker-aapl".into(),
-            kind: "ticker".into(),
-            name: "AAPL".into(),
-            namespace: "acme".into(),
-            external_id: "ticker:AAPL".into(),
-            properties: HashMap::from([
-                ("score".into(), "0.82".into()),
-                (
-                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
-                    "score".into(),
-                ),
-            ]),
-            created: 1,
-            updated: 1,
-        })
-        .unwrap();
-    svc.db
-        .runtime()
-        .create_object(&Object {
-            id: "analysis-aapl".into(),
-            kind: "analysis".into(),
-            name: "AAPL analysis".into(),
-            namespace: "acme".into(),
-            external_id: "analysis:AAPL".into(),
-            properties: HashMap::from([
-                ("verdict".into(), "validate the filing date".into()),
-                (
-                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
-                    "verdict".into(),
-                ),
-            ]),
-            created: 1,
-            updated: 1,
-        })
-        .unwrap();
-    svc.db
-        .runtime()
-        .create_link(&crate::domain::Link {
-            id: "analysis-touches-aapl".into(),
-            from_id: "analysis-aapl".into(),
-            to_id: "ticker-aapl".into(),
-            relation: crate::domain::REL_TOUCHES.into(),
-            created: 1,
-        })
-        .unwrap();
-    let evidence_submission_id = project_test_evidence(&svc);
-
-    let denied = run_test_gateway_pipeline(&svc, "before-eval", "acme", "inspect ticker:AAPL", "");
-    assert!(denied.run.prepared_spec.contains("score: 0.82"));
-    assert!(
-        !denied
-            .run
-            .prepared_spec
-            .contains("validate the filing date")
-    );
-    assert!(denied.run.evidence_references.is_empty());
-
-    create_suite(&svc, "acme");
-    let profile = pipeline_context_expansion_profile_key("acme");
-    for (id, score, timestamp) in [("context-base", 90, 1), ("context-pass", 95, 2)] {
-        seed_eval_run(
-            &svc,
-            eval_run(id, "suite-1", score, timestamp),
-            &profile,
-            format!("hash-{id}"),
-        );
-    }
-    let allowed = run_test_gateway_pipeline(&svc, "after-eval", "acme", "inspect ticker:AAPL", "");
-    assert!(
-        allowed
-            .run
-            .prepared_spec
-            .contains("validate the filing date")
-    );
-    assert!(allowed.run.evidence_references.is_empty());
-    assert!(!allowed.run.prepared_spec.contains("result=passed"));
-
-    let class_profile =
-        evidence_context_profile_key("acme", "verification_system", "verification.result");
-    for (id, with_evidence, score, timestamp) in [
-        ("evidence-base", false, 90, 3),
-        ("evidence-pass", true, 95, 4),
-    ] {
-        seed_eval_run(
-            &svc,
-            evidence_eval_run(
-                id,
-                "suite-1",
-                "verification_system",
-                "verification.result",
-                with_evidence,
-                score,
-                timestamp,
-            ),
-            &class_profile,
-            format!("hash-{id}"),
-        );
-    }
-    let class_gate =
-        svc.evidence_context_gate("acme", "verification_system", "verification.result", true);
-    assert!(class_gate.effective_allowed);
-    assert_eq!(class_gate.gate.verdict, "pass");
-    assert_eq!(class_gate.gate.profile_key, class_profile);
-
-    let invalid_profile =
-        evidence_context_profile_key("acme", "verification_system", "operations.health_snapshot");
-    for (id, score, timestamp) in [("invalid-base", 90, 5), ("invalid-pass", 95, 6)] {
-        seed_eval_run(
-            &svc,
-            eval_run(id, "suite-1", score, timestamp),
-            &invalid_profile,
-            format!("hash-{id}"),
-        );
-    }
-    let invalid_gate = svc.evidence_context_gate(
-        "acme",
-        "verification_system",
-        "operations.health_snapshot",
-        true,
-    );
-    assert!(!invalid_gate.effective_allowed);
-    assert_eq!(invalid_gate.gate.verdict, "invalid_comparison");
-
-    let evidence_allowed = run_test_gateway_pipeline(
-        &svc,
-        "after-evidence-eval",
-        "acme",
-        "inspect ticker:AAPL",
-        "",
-    );
-    assert!(evidence_allowed.run.prepared_spec.contains("result=passed"));
-    assert_eq!(evidence_allowed.run.evidence_references.len(), 1);
-    assert_eq!(
-        evidence_allowed.run.evidence_references[0].submission_id,
-        evidence_submission_id
-    );
-
-    let decisions = svc
-        .db
-        .list_decisions(&crate::sekai::audit::DecisionFilter {
-            action: Some("chisei.context_expansion".into()),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(decisions.len(), 3);
-    assert!(decisions.iter().any(|decision| {
-        decision.evidence["request_id"] == "before-eval"
-            && decision.evidence["verdict"] == "missing"
-            && decision.evidence["allowed"] == "false"
-    }));
-    let evidence_decisions = svc
-        .db
-        .list_decisions(&crate::sekai::audit::DecisionFilter {
-            action: Some("chisei.evidence_context_admission".into()),
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(evidence_decisions.len(), 3);
-    assert!(evidence_decisions.iter().any(|decision| {
-        decision.evidence["request_id"] == "after-eval"
-            && decision.evidence["verdict"] == "missing"
-            && decision.evidence["allowed"] == "false"
-            && decision.evidence["used_evidence_count"] == "0"
-    }));
-    assert!(evidence_decisions.iter().any(|decision| {
-        decision.evidence["request_id"] == "after-evidence-eval"
-            && decision.evidence["verdict"] == "pass"
-            && decision.evidence["allowed"] == "true"
-            && decision.evidence["used_evidence_count"] == "1"
-    }));
-    assert!(decisions.iter().any(|decision| {
-        decision.evidence["request_id"] == "after-eval"
-            && decision.evidence["verdict"] == "pass"
-            && decision.evidence["allowed"] == "true"
-            && decision.evidence["expanded_context_items"] != "0"
-    }));
-}
-
-#[tokio::test]
 async fn evidence_context_gate_rejects_duplicate_case_results() {
     let svc = memory_service();
     create_suite(&svc, "acme");
@@ -7121,6 +6911,34 @@ fn evidence_context_keys_do_not_alias_delimited_source_classes() {
         evidence_context_profile_key("x", "a:evidence:1:b", "c"),
         evidence_context_profile_key("x:evidence:14:a", "b", "c")
     );
+}
+
+async fn plan_test_execution(
+    svc: &ChiseiServiceImpl,
+    request_id: &str,
+    namespace: &str,
+    spec: &str,
+    task_class: &str,
+) -> ExecutionPlan {
+    svc.plan_execution(Request::new(PlanExecutionRequest {
+        routing_profile_id: String::new(),
+        input: Some(ExecutionInput {
+            request_id: request_id.into(),
+            namespace: namespace.into(),
+            spec: spec.into(),
+            preferred_model: "native-default".into(),
+            preferred_runtime: "native".into(),
+            task_class: task_class.into(),
+            max_tokens: 16,
+            ..Default::default()
+        }),
+        gunshi_allocation: None,
+    }))
+    .await
+    .unwrap()
+    .into_inner()
+    .plan
+    .unwrap()
 }
 
 #[tokio::test]
@@ -7182,28 +7000,27 @@ async fn native_harness_evidence_requires_its_own_baseline_comparison() {
         );
     }
 
-    let before_native_comparison = run_test_gateway_pipeline(
+    let before_native_comparison = plan_test_execution(
         &svc,
         "before-native-comparison",
         "acme",
         "inspect ticker:AAPL",
         "analysis",
-    );
+    )
+    .await;
     assert!(
         before_native_comparison
-            .run
             .evidence_references
             .iter()
             .any(|reference| reference.submission_id == verification_id)
     );
     assert!(
         !before_native_comparison
-            .run
             .evidence_references
             .iter()
             .any(|reference| reference.submission_id == native_id)
     );
-    assert!(before_native_comparison.run.memory_references.is_empty());
+    assert!(before_native_comparison.memory_references.is_empty());
     assert!(svc.portfolio.points("acme", "analysis").unwrap().is_empty());
 
     let native_profile =
@@ -7226,21 +7043,21 @@ async fn native_harness_evidence_requires_its_own_baseline_comparison() {
             format!("hash-{id}"),
         );
     }
-    let after_native_comparison = run_test_gateway_pipeline(
+    let after_native_comparison = plan_test_execution(
         &svc,
         "after-native-comparison",
         "acme",
         "inspect ticker:AAPL",
         "analysis",
-    );
+    )
+    .await;
     assert!(
         after_native_comparison
-            .run
             .evidence_references
             .iter()
             .any(|reference| reference.submission_id == native_id)
     );
-    assert!(after_native_comparison.run.memory_references.is_empty());
+    assert!(after_native_comparison.memory_references.is_empty());
     assert!(svc.portfolio.points("acme", "analysis").unwrap().is_empty());
 }
 
@@ -7970,23 +7787,47 @@ async fn namespace_policy_reloads_from_sekai_object_store() {
     let _ = fs::remove_file(path);
 }
 
+fn impact_route_instance(db: Arc<RuntimeDb>, path: &str) -> ChiseiServiceImpl {
+    let mut cfg = config(path);
+    cfg.gateway_provided_providers = vec!["openai".into()];
+    let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(db);
+    ChiseiServiceImpl::new(chisei.clone(), cfg)
+        .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
+            shared_sekai_store(&chisei),
+        ))
+        .unwrap()
+}
+
+async fn planned_model(svc: &ChiseiServiceImpl, request_id: &str) -> Result<String, tonic::Status> {
+    let mut request = Request::new(PlanExecutionRequest {
+        routing_profile_id: String::new(),
+        input: Some(ExecutionInput {
+            request_id: request_id.into(),
+            namespace: "team-a".into(),
+            spec: "hello".into(),
+            preferred_model: "gpt-5.5".into(),
+            preferred_runtime: "openai".into(),
+            ..Default::default()
+        }),
+        gunshi_allocation: None,
+    });
+    request
+        .metadata_mut()
+        .insert("x-principal", "local".parse().unwrap());
+    Ok(svc
+        .plan_execution(request)
+        .await?
+        .into_inner()
+        .plan
+        .unwrap()
+        .resolved_model)
+}
+
 /// #1861: the impact route rule lives only in the stored namespace policy.
 /// Two instances on one store: a rule set on A binds B's next decision, an
 /// unrelated policy update on B keeps it, an invalid rule is rejected,
 /// clearing it on A frees B, and a stored rule that no longer parses refuses
 /// calls instead of routing without it.
-async fn decided_model(svc: &ChiseiServiceImpl, operation: &str) -> String {
-    let decision = svc
-        .decide_gateway_execution(decide_request(operation, ""))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(decision.admitted, "{decision:?}");
-    decision.resolved_model
-}
-
-/// Returns both instances so a PostgreSQL caller can drop them off the
-/// async runtime.
 async fn exercise_impact_route_rule_across_instances(
     open: impl Fn() -> ChiseiServiceImpl,
 ) -> [ChiseiServiceImpl; 2] {
@@ -8011,20 +7852,24 @@ async fn exercise_impact_route_rule_across_instances(
         })
     };
     let (a, b) = (open(), open());
-    // Start from no rule: a PostgreSQL database outlives a run.
     a.set_namespace_policy(set("null")).await.unwrap();
     b.set_namespace_policy(set("")).await.unwrap();
-    assert_eq!(decided_model(&b, "op-before").await, "gpt-5.5");
+    assert_eq!(planned_model(&b, "op-before").await.unwrap(), "gpt-5.5");
 
     a.set_namespace_policy(set(&rule)).await.unwrap();
     assert!(
-        decided_model(&b, "op-ruled")
+        planned_model(&b, "op-ruled")
             .await
+            .unwrap()
             .ends_with("gpt-5.5-mini")
     );
-    // B's own update with an empty field keeps the rule as stored.
     b.set_namespace_policy(set("")).await.unwrap();
-    assert!(decided_model(&a, "op-kept").await.ends_with("gpt-5.5-mini"));
+    assert!(
+        planned_model(&a, "op-kept")
+            .await
+            .unwrap()
+            .ends_with("gpt-5.5-mini")
+    );
     let invalid = b
         .set_namespace_policy(set(
             r#"{"contract_version":"chisei.impact-route/v1","routes":{}}"#,
@@ -8033,13 +7878,14 @@ async fn exercise_impact_route_rule_across_instances(
         .unwrap_err();
     assert_eq!(invalid.code(), tonic::Code::InvalidArgument);
     assert!(
-        decided_model(&b, "op-still")
+        planned_model(&b, "op-still")
             .await
+            .unwrap()
             .ends_with("gpt-5.5-mini")
     );
 
     a.set_namespace_policy(set("null")).await.unwrap();
-    assert_eq!(decided_model(&b, "op-cleared").await, "gpt-5.5");
+    assert_eq!(planned_model(&b, "op-cleared").await.unwrap(), "gpt-5.5");
 
     let mut object =
         a.db.runtime()
@@ -8050,38 +7896,14 @@ async fn exercise_impact_route_rule_across_instances(
         .properties
         .insert("impact_route_policy_json".into(), "{not json".into());
     a.db.runtime().update_object(&object).unwrap();
-    let corrupt = b
-        .decide_gateway_execution(decide_request("op-corrupt", ""))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!corrupt.admitted, "{corrupt:?}");
-    assert_eq!(corrupt.deny_reason, "policy_denied");
-    assert!(
-        crate::chisei::impact_route::is_refusal(&corrupt.deny_message),
-        "{corrupt:?}"
-    );
-    // The denial is in the ledger with its correlation id and reason.
-    let record =
-        b.db.list_decisions(&crate::sekai::audit::DecisionFilter {
-            action: Some("gateway.decide".into()),
-            ..Default::default()
-        })
-        .unwrap()
-        .into_iter()
-        .find(|decision| decision.target_id == "op-corrupt")
-        .expect("gateway decision record");
-    assert_eq!(record.outcome, "denied");
-    assert!(record.reason.contains("unreadable"), "{record:?}");
-    assert_eq!(record.evidence["impact_route_decision"], "refused");
-
-    // Planning refuses on the same rule and records why.
     let mut plan = Request::new(PlanExecutionRequest {
         routing_profile_id: String::new(),
         input: Some(ExecutionInput {
             request_id: "plan-corrupt".into(),
             namespace: "team-a".into(),
             spec: "hello".into(),
+            preferred_model: "gpt-5.5".into(),
+            preferred_runtime: "openai".into(),
             ..Default::default()
         }),
         gunshi_allocation: None,
@@ -8106,17 +7928,6 @@ async fn exercise_impact_route_rule_across_instances(
     assert_eq!(record.evidence["impact_route_decision"], "refused");
     a.set_namespace_policy(set("null")).await.unwrap();
     [a, b]
-}
-
-fn impact_route_instance(db: Arc<RuntimeDb>, path: &str) -> ChiseiServiceImpl {
-    let mut cfg = config(path);
-    cfg.gateway_provided_providers = vec!["openai".into()];
-    let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(db);
-    ChiseiServiceImpl::new(chisei.clone(), cfg)
-        .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
-            shared_sekai_store(&chisei),
-        ))
-        .unwrap()
 }
 
 #[tokio::test]
@@ -8179,113 +7990,6 @@ fn impact_route_rule_is_shared_by_instances_on_one_postgres_store() {
         );
     });
     drop(runtime);
-}
-
-#[tokio::test]
-async fn json_null_context_admission_is_not_restored_by_legacy_namespace_policy() {
-    let path = std::env::temp_dir()
-        .join(format!("sekai-policy-null-{}.db", uuid::Uuid::new_v4()))
-        .to_string_lossy()
-        .to_string();
-    let include_json = serde_json::json!({
-        "contract_version": crate::chisei::policy::CONTEXT_ADMISSION_POLICY_VERSION,
-        "default_action": "include",
-        "unknown_action": "hold_out",
-        "rules": []
-    })
-    .to_string();
-    {
-        let mut cfg = config(&path);
-        cfg.gateway_provided_providers = vec!["openai".into()];
-        let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(Arc::new(
-            RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(&path).unwrap())),
-        ));
-        let svc = ChiseiServiceImpl::new(chisei.clone(), cfg)
-            .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
-                shared_sekai_store(&chisei),
-            ))
-            .unwrap();
-        svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
-            namespace: "team-a".into(),
-            allowed_runtimes: vec!["openai".into()],
-            allowed_models: vec!["gpt-5.5".into()],
-            default_runtime: "openai".into(),
-            default_model: "gpt-5.5".into(),
-            data_class: "internal".into(),
-            context_admission_policy_json: include_json.clone(),
-            impact_route_policy_json: String::new(),
-        }))
-        .await
-        .unwrap();
-        svc.db
-            .runtime()
-            .create_object(&crate::domain::Object {
-                id: "legacy-ns-policy-team-a".into(),
-                kind: "namespace_policy".into(),
-                name: "team-a".into(),
-                namespace: "team-a".into(),
-                external_id: "namespace_policy:team-a".into(),
-                properties: std::collections::HashMap::from([
-                    ("allowed_runtimes".into(), "openai".into()),
-                    ("allowed_models".into(), "gpt-5.5".into()),
-                    ("default_runtime".into(), "openai".into()),
-                    ("default_model".into(), "gpt-5.5".into()),
-                    ("data_class".into(), "internal".into()),
-                    ("context_admission_policy_json".into(), include_json),
-                ]),
-                created: 1,
-                updated: 1,
-            })
-            .unwrap();
-        svc.set_namespace_policy(Request::new(SetNamespacePolicyRequest {
-            namespace: "team-a".into(),
-            allowed_runtimes: vec!["openai".into()],
-            allowed_models: vec!["gpt-5.5".into()],
-            default_runtime: "openai".into(),
-            default_model: "gpt-5.5".into(),
-            data_class: "internal".into(),
-            context_admission_policy_json: "null".into(),
-            impact_route_policy_json: String::new(),
-        }))
-        .await
-        .unwrap();
-        assert!(
-            svc.policy
-                .context_admission_policy("team-a")
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    let mut cfg = config(&path);
-    cfg.gateway_provided_providers = vec!["openai".into()];
-    let chisei = crate::chisei_store::ChiseiStore::from_shared_runtime(Arc::new(
-        RuntimeDb::Sqlite(std::sync::Arc::new(SekaiDb::new(&path).unwrap())),
-    ));
-    let svc = ChiseiServiceImpl::new(chisei.clone(), cfg)
-        .with_sekai_facts(crate::chisei::sekai_facts::SekaiFacts::in_process(
-            shared_sekai_store(&chisei),
-        ))
-        .unwrap();
-    assert!(
-        svc.policy
-            .context_admission_policy("team-a")
-            .unwrap()
-            .is_none(),
-        "legacy namespace_policy must not restore a JSON-null context-admission clear"
-    );
-    let denied = svc
-        .decide_gateway_execution(decide_request("op-json-null-reload", "summarize team-a"))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!denied.admitted, "{denied:?}");
-    assert_eq!(denied.deny_reason, "policy_denied");
-    assert_eq!(
-        denied.context_admission_reasons,
-        vec!["context_admission:missing"]
-    );
-    let _ = fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -8740,168 +8444,6 @@ async fn sqlite_reload_restores_iterations_and_regression_gate() {
     }));
 
     let _ = fs::remove_file(&path);
-}
-
-#[tokio::test]
-async fn configured_gateway_principal_can_claim_one_dispatch() {
-    let mut svc = memory_service();
-    svc.config.gateway_receipt_principals = vec!["Gateway-Prod".into()];
-    let claim = ClaimGatewayDispatchRequest {
-        caller_scope: "gateway:prod".into(),
-        request_alias: "attempt-1".into(),
-        request_id: "request-1".into(),
-        operation_id: "operation-1".into(),
-        dispatch_token: "dispatch-1".into(),
-    };
-    let mut configured = Request::new(claim.clone());
-    configured
-        .metadata_mut()
-        .insert("x-principal", "Gateway-Prod".parse().unwrap());
-    configured
-        .metadata_mut()
-        .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
-    assert!(
-        svc.claim_gateway_dispatch(configured)
-            .await
-            .unwrap()
-            .into_inner()
-            .claimed
-    );
-
-    let mut replay = Request::new(ClaimGatewayDispatchRequest {
-        dispatch_token: "dispatch-2".into(),
-        ..claim.clone()
-    });
-    replay
-        .metadata_mut()
-        .insert("x-principal", "Gateway-Prod".parse().unwrap());
-    replay
-        .metadata_mut()
-        .insert(AUTH_SOURCE_HEADER, "token".parse().unwrap());
-    assert!(
-        !svc.claim_gateway_dispatch(replay)
-            .await
-            .unwrap()
-            .into_inner()
-            .claimed
-    );
-
-    let mut intruder = Request::new(ClaimGatewayDispatchRequest {
-        request_alias: "attempt-2".into(),
-        request_id: "request-2".into(),
-        ..claim
-    });
-    intruder
-        .metadata_mut()
-        .insert("x-principal", "agent:intruder".parse().unwrap());
-    assert_eq!(
-        svc.claim_gateway_dispatch(intruder)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::PermissionDenied
-    );
-}
-
-#[tokio::test]
-async fn internal_gateway_pipeline_honors_delegated_membership() {
-    let mut svc = memory_service();
-    svc.config.gateway_receipt_principals = vec!["Gateway-Prod".into()];
-    svc.db
-        .runtime()
-        .ensure_team_namespace(
-            "acme",
-            "alice",
-            crate::sekai::security::Role::Viewer,
-            "local",
-        )
-        .unwrap();
-    svc.db
-        .runtime()
-        .create_object(&Object {
-            id: "delegated-context".into(),
-            kind: "asset".into(),
-            name: "Delegated context".into(),
-            namespace: "acme".into(),
-            external_id: "asset:DELEGATED".into(),
-            properties: HashMap::from([
-                ("verdict".into(), "delegated context value".into()),
-                (
-                    crate::chisei::egress::EXTERNAL_PROPERTIES_KEY.into(),
-                    "verdict".into(),
-                ),
-            ]),
-            created: 1,
-            updated: 1,
-        })
-        .unwrap();
-    svc.db
-        .runtime()
-        .create_grant(&crate::sekai::security::Grant {
-            id: "delegated-context-alice".into(),
-            object_id: "delegated-context".into(),
-            principal: "alice".into(),
-            role: crate::sekai::security::Role::Viewer,
-            created: 1,
-            ..Default::default()
-        })
-        .unwrap();
-    assert_eq!(
-        execution_context_actor(
-            svc.db.runtime(),
-            svc.sekai_facts.reader(),
-            &svc.config,
-            "Gateway-Prod",
-            Some("alice"),
-            "acme",
-        )
-        .unwrap_err()
-        .code(),
-        tonic::Code::PermissionDenied
-    );
-    assert_eq!(
-        execution_context_actor(
-            svc.db.runtime(),
-            svc.sekai_facts.reader(),
-            &svc.config,
-            "local",
-            Some("alice"),
-            "acme",
-        )
-        .unwrap(),
-        "alice"
-    );
-    assert_eq!(
-        execution_context_actor(
-            svc.db.runtime(),
-            svc.sekai_facts.reader(),
-            &svc.config,
-            "root",
-            Some("alice"),
-            "acme",
-        )
-        .unwrap(),
-        "alice"
-    );
-    let response = svc
-        .gateway_pipeline_decision(GatewayPipelineInput {
-            actor: "chisei-gateway",
-            delegated_principal: Some("alice"),
-            request_id: "gateway-observation",
-            namespace: "acme",
-            spec: "inspect asset:DELEGATED",
-            model: "native-default",
-            runtime: "native",
-            task_class: "",
-            action_impact: &Default::default(),
-        })
-        .unwrap();
-    assert!(
-        response
-            .run
-            .prepared_spec
-            .contains("delegated context value")
-    );
 }
 
 #[test]
@@ -11473,795 +11015,6 @@ fn cache_plan_keeps_inserted_plan_when_timestamps_tie() {
     assert!(plans.contains_key(&inserted.plan_id));
 }
 
-/// #1861: the gateway decide path applies the namespace impact route rule
-/// to the class of the claim the request cites, and the decision record
-/// carries the class and decision.
-#[tokio::test]
-async fn decide_gateway_execution_applies_the_impact_route_rule() {
-    use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
-
-    let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-        SekaiDb::new(":memory:").unwrap(),
-    )));
-    let mut cfg = config(":memory:");
-    cfg.gateway_provided_providers = vec!["openai".into()];
-    let mut svc = ChiseiServiceImpl::new(
-        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
-        cfg,
-    );
-    svc.sekai_facts =
-        crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&svc.db));
-    svc.policy.set_namespace_policy(
-        "team-a",
-        crate::chisei::policy::Policy {
-            allowed_runtimes: vec!["openai".into()],
-            allowed_models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()],
-            default_runtime: "openai".into(),
-            default_model: "gpt-5.5-mini".into(),
-            data_class: "internal".into(),
-        },
-    );
-    svc.policy
-        .set_context_admission_policy(
-            "team-a",
-            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
-        )
-        .unwrap();
-    store_impact_rule(
-        &svc,
-        "team-a",
-        serde_json::from_value(serde_json::json!({
-            "contract_version": crate::chisei::impact_route::IMPACT_ROUTE_POLICY_VERSION,
-            "routes": {
-                "unclassified": {"allowed_models": ["gpt-5.5-mini"]},
-                "high_impact": {"allowed_families": ["openai"]},
-            },
-        }))
-        .unwrap(),
-    );
-    let claimed = seed_claimed_action(svc.db.runtime(), "team-a", "local");
-    let decide = |operation: &str, route_override: &str, claim: Option<ActionClaimRef>| {
-        let mut request = Request::new(DecideGatewayExecutionRequest {
-            contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-            namespace: "team-a".into(),
-            requested_model: "gpt-5.5".into(),
-            operation_class: "chat".into(),
-            correlation_operation_id: operation.into(),
-            correlation_attempt: 1,
-            estimated_tokens: 10,
-            task_class: "interactive".into(),
-            preferred_runtime: "openai".into(),
-            project: "team-a".into(),
-            agent: "local".into(),
-            user_id: "local".into(),
-            route_override: route_override.into(),
-            expected_calls: 1,
-            action_claim: claim,
-            ..Default::default()
-        });
-        request
-            .metadata_mut()
-            .insert("x-principal", "local".parse().unwrap());
-        let svc = &svc;
-        let operation = operation.to_string();
-        async move {
-            let response = svc
-                .decide_gateway_execution(request)
-                .await
-                .unwrap()
-                .into_inner();
-            let record = svc
-                .db
-                .list_decisions(&crate::sekai::audit::DecisionFilter {
-                    action: Some("gateway.decide".into()),
-                    ..Default::default()
-                })
-                .unwrap()
-                .into_iter()
-                .find(|decision| decision.target_id == operation)
-                .expect("decision record");
-            (response, record.evidence)
-        }
-    };
-
-    let (routine, evidence) = decide("op-unclassified", "", None).await;
-    assert!(routine.admitted, "{routine:?}");
-    assert!(
-        routine.resolved_model.ends_with("gpt-5.5-mini"),
-        "{routine:?}"
-    );
-    assert!(
-        routine
-            .fallback_models
-            .iter()
-            .all(|model| model.ends_with("gpt-5.5-mini")),
-        "{routine:?}"
-    );
-    assert_eq!(evidence["impact_route_class"], "unclassified");
-    assert_eq!(evidence["impact_route_decision"], "substituted");
-    // The narrowed route still reports the stored policy's version.
-    assert_eq!(
-        routine.policy_version,
-        svc.policy.effective_policy("team-a").unwrap().version()
-    );
-
-    let (high, evidence) = decide(
-        "op-high",
-        "",
-        cite_claim(&claimed, claimed.claim_generation),
-    )
-    .await;
-    assert!(high.admitted, "{high:?}");
-    assert_eq!(high.resolved_model, "gpt-5.5");
-    assert_eq!(evidence["impact_route_class"], "high_impact");
-    assert_eq!(evidence["impact_route_decision"], "allowed");
-    assert_eq!(evidence["action_claim_resolution"], "live");
-
-    let (overridden, evidence) = decide("op-override", "openai/gpt-5.5", None).await;
-    assert!(!overridden.admitted, "{overridden:?}");
-    assert_eq!(overridden.deny_reason, "policy_denied");
-    assert!(
-        crate::chisei::impact_route::is_refusal(&overridden.deny_message),
-        "{overridden:?}"
-    );
-    assert_eq!(evidence["impact_route_decision"], "refused");
-}
-
-#[tokio::test]
-async fn decide_gateway_execution_admits_and_denies_closed() {
-    use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
-
-    let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-        SekaiDb::new(":memory:").unwrap(),
-    )));
-    let mut cfg = config(":memory:");
-    cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(
-        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
-        cfg,
-    );
-    svc.policy.set_namespace_policy(
-        "team-a",
-        crate::chisei::policy::Policy {
-            allowed_runtimes: vec!["openai".into()],
-            allowed_models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()],
-            default_runtime: "openai".into(),
-            default_model: "gpt-5.5".into(),
-            data_class: "internal".into(),
-        },
-    );
-    svc.policy
-        .set_context_admission_policy(
-            "team-a",
-            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
-        )
-        .unwrap();
-
-    let mut admit = Request::new(DecideGatewayExecutionRequest {
-        contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-        namespace: "team-a".into(),
-        requested_model: "gpt-5.5".into(),
-        operation_class: "chat".into(),
-        estimated_cost_usd_micros: 0,
-        correlation_operation_id: "op-decide-1".into(),
-        correlation_attempt: 1,
-        estimated_tokens: 10,
-        task_class: "interactive".into(),
-        preferred_runtime: "openai".into(),
-        project: "team-a".into(),
-        agent: "local".into(),
-        key_id: String::new(),
-        work_unit: String::new(),
-        local_free_available: false,
-        user_id: "local".into(),
-        route_override: String::new(),
-        capability_requirements_json: Vec::new(),
-        expected_calls: 1,
-        pipeline_spec: "summarize team-a".into(),
-        action_claim: None,
-    });
-    admit
-        .metadata_mut()
-        .insert("x-principal", "local".parse().unwrap());
-    let admitted = svc
-        .decide_gateway_execution(admit)
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(admitted.admitted, "{admitted:?}");
-    assert_eq!(admitted.resolved_model, "gpt-5.5");
-    assert_eq!(admitted.resolved_runtime, "openai");
-    assert_eq!(admitted.policy_scope, "team-a");
-    assert_eq!(admitted.data_class, "unclassified");
-    assert_eq!(
-        admitted.fallback_models,
-        vec!["openai/gpt-5.5", "openai/gpt-5.5-mini"]
-    );
-    assert!(!admitted.eval_regressed);
-    assert!(admitted.deny_reason.is_empty());
-    assert!(!admitted.budget_grant_id.is_empty());
-    assert!(admitted.sampling_evaluated);
-    assert!(!admitted.prepared_spec.is_empty());
-    assert_eq!(admitted.context_admission_decision, "include");
-
-    svc.policy
-        .set_context_admission_policy(
-            "team-a",
-            crate::chisei::policy::ContextAdmissionPolicy {
-                contract_version: crate::chisei::policy::CONTEXT_ADMISSION_POLICY_VERSION.into(),
-                default_action: ContextAdmissionAction::Include,
-                unknown_action: ContextAdmissionAction::HoldOut,
-                rules: vec![crate::chisei::policy::ContextAdmissionRule {
-                    action: ContextAdmissionAction::RequireReview,
-                    origin_classes: vec![],
-                    evidence_statuses: vec![],
-                    lifecycle_statuses: vec![],
-                    applicability: None,
-                    confidence_basis: None,
-                    min_confidence_bps: None,
-                    max_confidence_bps: None,
-                    operation_risk: Some(crate::chisei::policy::OperationRisk::High),
-                }],
-            },
-        )
-        .unwrap();
-    let mut context_denied = Request::new(DecideGatewayExecutionRequest {
-        contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-        namespace: "team-a".into(),
-        requested_model: "gpt-5.5".into(),
-        operation_class: "write".into(),
-        estimated_cost_usd_micros: 0,
-        correlation_operation_id: "op-decide-context-review".into(),
-        correlation_attempt: 1,
-        estimated_tokens: 10,
-        task_class: "interactive".into(),
-        preferred_runtime: "openai".into(),
-        project: "team-a".into(),
-        agent: "local".into(),
-        key_id: String::new(),
-        work_unit: String::new(),
-        local_free_available: false,
-        user_id: "local".into(),
-        route_override: String::new(),
-        capability_requirements_json: Vec::new(),
-        expected_calls: 1,
-        pipeline_spec: String::new(),
-        action_claim: None,
-    });
-    context_denied
-        .metadata_mut()
-        .insert("x-principal", "local".parse().unwrap());
-    let context_denied = svc
-        .decide_gateway_execution(context_denied)
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!context_denied.admitted);
-    assert_eq!(context_denied.context_admission_decision, "require_review");
-    assert_eq!(
-        context_denied.context_admission_reasons,
-        vec!["context_admission:require_review"]
-    );
-    assert_eq!(
-        context_denied.deny_message,
-        "context admission policy requires review or verification"
-    );
-    svc.policy
-        .set_context_admission_policy(
-            "team-a",
-            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
-        )
-        .unwrap();
-
-    svc.budget
-        .set_limit_with_metric(
-            "project:team-a",
-            crate::db::chisei_budget::METRIC_REQUESTS,
-            1,
-            crate::chisei::budget::PeriodType::Daily,
-        )
-        .unwrap();
-    let mut request_budget_denied = Request::new(DecideGatewayExecutionRequest {
-        contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-        namespace: "team-a".into(),
-        requested_model: "gpt-5.5".into(),
-        operation_class: "chat".into(),
-        estimated_cost_usd_micros: 0,
-        correlation_operation_id: "op-decide-request-budget".into(),
-        correlation_attempt: 1,
-        estimated_tokens: 10,
-        task_class: "interactive".into(),
-        preferred_runtime: "openai".into(),
-        project: "team-a".into(),
-        agent: "local".into(),
-        key_id: String::new(),
-        work_unit: String::new(),
-        local_free_available: true,
-        user_id: "local".into(),
-        route_override: String::new(),
-        capability_requirements_json: Vec::new(),
-        expected_calls: 2,
-        pipeline_spec: String::new(),
-        action_claim: None,
-    });
-    request_budget_denied
-        .metadata_mut()
-        .insert("x-principal", "local".parse().unwrap());
-    let request_budget_denied = svc
-        .decide_gateway_execution(request_budget_denied)
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!request_budget_denied.admitted);
-    assert_eq!(request_budget_denied.deny_reason, "budget_denied");
-    assert_eq!(request_budget_denied.budget_scope, "project:team-a");
-
-    // Non-bootstrap principal without a grant fails closed (unauthorized).
-    let mut denied = Request::new(DecideGatewayExecutionRequest {
-        contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-        namespace: "team-a".into(),
-        requested_model: "gpt-5.5".into(),
-        operation_class: "chat".into(),
-        estimated_cost_usd_micros: 0,
-        correlation_operation_id: "op-decide-2".into(),
-        correlation_attempt: 1,
-        estimated_tokens: 10,
-        task_class: "interactive".into(),
-        preferred_runtime: "openai".into(),
-        project: "team-a".into(),
-        agent: "mallory".into(),
-        key_id: String::new(),
-        work_unit: String::new(),
-        local_free_available: false,
-        user_id: "mallory".into(),
-        route_override: String::new(),
-        capability_requirements_json: Vec::new(),
-        expected_calls: 1,
-        pipeline_spec: String::new(),
-        action_claim: None,
-    });
-    denied
-        .metadata_mut()
-        .insert("x-principal", "mallory".parse().unwrap());
-    let denied = svc
-        .decide_gateway_execution(denied)
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!denied.admitted, "{denied:?}");
-    assert_eq!(denied.deny_reason, "unauthorized");
-}
-
-fn openai_team_a_service() -> ChiseiServiceImpl {
-    let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-        SekaiDb::new(":memory:").unwrap(),
-    )));
-    let mut cfg = config(":memory:");
-    cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(
-        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
-        cfg,
-    );
-    svc.policy.set_namespace_policy(
-        "team-a",
-        crate::chisei::policy::Policy {
-            allowed_runtimes: vec!["openai".into()],
-            allowed_models: vec!["gpt-5.5".into()],
-            default_runtime: "openai".into(),
-            default_model: "gpt-5.5".into(),
-            data_class: "internal".into(),
-        },
-    );
-    svc
-}
-
-fn decide_request(
-    correlation: &str,
-    pipeline_spec: &str,
-) -> Request<DecideGatewayExecutionRequest> {
-    use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
-    let mut request = Request::new(DecideGatewayExecutionRequest {
-        contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-        namespace: "team-a".into(),
-        requested_model: "gpt-5.5".into(),
-        operation_class: "chat".into(),
-        estimated_cost_usd_micros: 0,
-        correlation_operation_id: correlation.into(),
-        correlation_attempt: 1,
-        estimated_tokens: 10,
-        task_class: "interactive".into(),
-        preferred_runtime: "openai".into(),
-        project: "team-a".into(),
-        agent: "local".into(),
-        key_id: String::new(),
-        work_unit: String::new(),
-        local_free_available: false,
-        user_id: "local".into(),
-        route_override: String::new(),
-        capability_requirements_json: Vec::new(),
-        expected_calls: 1,
-        pipeline_spec: pipeline_spec.into(),
-        action_claim: None,
-    });
-    request
-        .metadata_mut()
-        .insert("x-principal", "local".parse().unwrap());
-    request
-}
-
-/// #1910: the gateway decision record carries the class resolved from a
-/// cited claim; another principal's claim resolves unclassified.
-#[tokio::test]
-async fn decide_gateway_execution_records_the_cited_claim_impact() {
-    let mut svc = openai_team_a_service();
-    svc.sekai_facts =
-        crate::chisei::sekai_facts::SekaiFacts::in_process(shared_sekai_store(&svc.db));
-    svc.policy
-        .set_context_admission_policy(
-            "team-a",
-            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
-        )
-        .unwrap();
-    let claimed = seed_claimed_action(svc.db.runtime(), "team-a", "local");
-    let decide = |correlation: &str, caller: &str| {
-        let mut request = decide_request(correlation, "");
-        request.get_mut().action_claim = cite_claim(&claimed, claimed.claim_generation);
-        request
-            .metadata_mut()
-            .insert("x-principal", caller.parse().unwrap());
-        svc.decide_gateway_execution(request)
-    };
-
-    decide("op-impact-holder", "local").await.unwrap();
-    let record = svc
-        .db
-        .get_decision("gateway-decide:team-a:op-impact-holder:1")
-        .unwrap()
-        .unwrap();
-    assert_eq!(record.evidence["impact_class"], "high_impact");
-    assert_eq!(record.evidence["action_claim_resolution"], "live");
-    assert_eq!(record.evidence["action_claim_effect_id"], claimed.effect_id);
-
-    decide("op-impact-foreign", "root").await.unwrap();
-    let record = svc
-        .db
-        .get_decision("gateway-decide:team-a:op-impact-foreign:1")
-        .unwrap()
-        .unwrap();
-    assert_eq!(record.evidence["impact_class"], "");
-    assert_eq!(record.evidence["action_claim_resolution"], "foreign");
-}
-
-/// #2608: no gateway decision leaves without its audit row, and a replay of an
-/// attempt whose row already exists still answers.
-#[tokio::test]
-async fn decide_gateway_execution_refuses_when_its_audit_write_fails() {
-    let svc = openai_team_a_service();
-    svc.policy
-        .set_context_admission_policy(
-            "team-a",
-            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
-        )
-        .unwrap();
-    let admitted = svc
-        .decide_gateway_execution(decide_request("op-audit-1", ""))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(admitted.admitted, "{admitted:?}");
-
-    svc.db
-        .runtime()
-        .conn()
-        .execute_batch(
-            "CREATE TRIGGER audit_down BEFORE INSERT ON sekai_decisions
-             BEGIN SELECT RAISE(ABORT, 'audit store down'); END;",
-        )
-        .unwrap();
-
-    let replay = svc
-        .decide_gateway_execution(decide_request("op-audit-1", ""))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(replay.admitted, admitted.admitted);
-
-    // Another principal reusing the attempt is not covered by the first row.
-    let mut foreign = decide_request("op-audit-1", "");
-    foreign
-        .metadata_mut()
-        .insert("x-principal", "root".parse().unwrap());
-    let foreign = svc.decide_gateway_execution(foreign).await.unwrap_err();
-    assert_eq!(foreign.code(), tonic::Code::FailedPrecondition);
-
-    let refused = svc
-        .decide_gateway_execution(decide_request("op-audit-2", ""))
-        .await
-        .unwrap_err();
-    assert_eq!(refused.code(), tonic::Code::Unavailable);
-    assert!(
-        svc.db
-            .get_decision("gateway-decide:team-a:op-audit-2:1")
-            .unwrap()
-            .is_none()
-    );
-
-    // The same attempt replayed after the policy changed would answer
-    // differently than its recorded row. Retrying it cannot succeed, so the
-    // refusal is a precondition failure rather than an outage.
-    svc.policy.set_namespace_policy(
-        "team-a",
-        crate::chisei::policy::Policy {
-            allowed_runtimes: vec!["openai".into()],
-            allowed_models: vec!["gpt-5.5-mini".into()],
-            default_runtime: "openai".into(),
-            default_model: "gpt-5.5-mini".into(),
-            data_class: "internal".into(),
-        },
-    );
-    let changed = svc
-        .decide_gateway_execution(decide_request("op-audit-1", ""))
-        .await
-        .unwrap_err();
-    assert_eq!(changed.code(), tonic::Code::FailedPrecondition);
-
-    // Evidence the ledger refuses is a bad request, not an outage.
-    let unauditable = svc
-        .decide_gateway_execution(decide_request("sk-looks-like-a-key", ""))
-        .await
-        .unwrap_err();
-    assert_eq!(unauditable.code(), tonic::Code::InvalidArgument);
-}
-
-#[tokio::test]
-async fn decide_gateway_execution_denies_missing_context_admission_policy() {
-    let svc = openai_team_a_service();
-    let denied = svc
-        .decide_gateway_execution(decide_request("op-missing-context-policy", ""))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!denied.admitted, "{denied:?}");
-    assert_eq!(denied.deny_reason, "policy_denied");
-    assert_eq!(denied.deny_message, "context admission policy is required");
-    assert_ne!(denied.context_admission_decision, "include");
-    assert_eq!(
-        denied.context_admission_reasons,
-        vec!["context_admission:missing"]
-    );
-}
-
-#[tokio::test]
-async fn decide_gateway_execution_denies_corrupt_context_admission_policy() {
-    let svc = openai_team_a_service();
-    svc.policy
-        .set_context_admission_error("team-a", "corrupt context admission policy");
-    let denied = svc
-        .decide_gateway_execution(decide_request("op-corrupt-context-policy", ""))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!denied.admitted, "{denied:?}");
-    assert_eq!(denied.deny_reason, "policy_denied");
-    assert_eq!(denied.deny_message, "context admission policy unavailable");
-    assert_ne!(denied.context_admission_decision, "include");
-    assert_eq!(
-        denied.context_admission_reasons,
-        vec!["context_admission:unavailable"]
-    );
-}
-
-#[tokio::test]
-async fn decide_gateway_execution_denies_when_fallback_action_blocks_provider() {
-    let svc = openai_team_a_service();
-    svc.policy
-        .set_context_admission_policy(
-            "team-a",
-            crate::chisei::policy::ContextAdmissionPolicy {
-                contract_version: crate::chisei::policy::CONTEXT_ADMISSION_POLICY_VERSION.into(),
-                default_action: ContextAdmissionAction::RequireReview,
-                unknown_action: ContextAdmissionAction::HoldOut,
-                rules: vec![],
-            },
-        )
-        .unwrap();
-    let denied = svc
-        .decide_gateway_execution(decide_request("op-fallback-blocks", ""))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!denied.admitted, "{denied:?}");
-    assert_eq!(denied.deny_reason, "policy_denied");
-    assert_eq!(denied.context_admission_decision, "require_review");
-    assert_eq!(
-        denied.context_admission_reasons,
-        vec!["context_admission:require_review"]
-    );
-}
-
-#[tokio::test]
-async fn decide_gateway_execution_denies_pipeline_error_after_admit() {
-    let mut svc = openai_team_a_service();
-    svc.policy
-        .set_context_admission_policy(
-            "team-a",
-            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
-        )
-        .unwrap();
-    svc.pipeline = pipe::Pipeline::new(vec![]);
-    let denied = svc
-        .decide_gateway_execution(decide_request("op-pipeline-error", "summarize team-a"))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!denied.admitted, "{denied:?}");
-    assert_eq!(denied.deny_reason, "policy_denied");
-    assert!(
-        denied
-            .deny_message
-            .contains("gateway pipeline decision unavailable"),
-        "{denied:?}"
-    );
-    assert!(!denied.sampling_evaluated);
-    assert!(denied.prepared_spec.is_empty());
-    assert!(denied.resolved_model.is_empty());
-}
-
-#[tokio::test]
-async fn decide_rejects_mixed_capability_catalogs_as_unsupported() {
-    use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
-    use crate::provider_profile::{
-        CAPABILITY_MATRIX_VERSION, CapabilityMatrix, CapabilityRequirements,
-        NATIVE_CAPABILITY_CATALOG_CONTRACT,
-    };
-
-    let db = Arc::new(RuntimeDb::Sqlite(std::sync::Arc::new(
-        SekaiDb::new(":memory:").unwrap(),
-    )));
-    let mut cfg = config(":memory:");
-    cfg.gateway_provided_providers = vec!["openai".into()];
-    let svc = ChiseiServiceImpl::new(
-        crate::chisei_store::ChiseiStore::from_shared_runtime(db),
-        cfg,
-    );
-    svc.policy.set_namespace_policy(
-        "team-a",
-        crate::chisei::policy::Policy {
-            allowed_runtimes: vec!["openai".into()],
-            allowed_models: vec!["gpt-5.5".into()],
-            default_runtime: "openai".into(),
-            default_model: "gpt-5.5".into(),
-            data_class: "internal".into(),
-        },
-    );
-    svc.policy
-        .set_context_admission_policy(
-            "team-a",
-            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
-        )
-        .unwrap();
-
-    let decide = |capability_requirements_json: Vec<u8>, correlation: &str| {
-        let mut request = Request::new(DecideGatewayExecutionRequest {
-            contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-            namespace: "team-a".into(),
-            requested_model: "gpt-5.5".into(),
-            operation_class: "chat".into(),
-            estimated_cost_usd_micros: 0,
-            correlation_operation_id: correlation.into(),
-            correlation_attempt: 1,
-            estimated_tokens: 10,
-            task_class: "interactive".into(),
-            preferred_runtime: "openai".into(),
-            project: "team-a".into(),
-            agent: "local".into(),
-            key_id: String::new(),
-            work_unit: String::new(),
-            local_free_available: false,
-            user_id: "local".into(),
-            route_override: String::new(),
-            capability_requirements_json,
-            expected_calls: 1,
-            pipeline_spec: String::new(),
-            action_claim: None,
-        });
-        request
-            .metadata_mut()
-            .insert("x-principal", "local".parse().unwrap());
-        request
-    };
-
-    let native = serde_json::json!({
-        "capabilities": [{
-            "name": "sekai.semantic.expand_relations",
-            "product_tier": "core"
-        }],
-        "contract_version": NATIVE_CAPABILITY_CATALOG_CONTRACT,
-        "catalog_version": "sha256:deadbeef",
-        "cache_scope": "authorization_context"
-    });
-    let native_denied = svc
-        .decide_gateway_execution(decide(
-            serde_json::to_vec(&native).unwrap(),
-            "op-mix-native",
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!native_denied.admitted, "{native_denied:?}");
-    assert_eq!(native_denied.deny_reason, "capability_unsupported");
-    assert!(
-        native_denied
-            .deny_message
-            .contains("DiscoverCapabilities contract 1.0"),
-        "{native_denied:?}"
-    );
-
-    let matrix_denied = svc
-        .decide_gateway_execution(decide(
-            serde_json::to_vec(&CapabilityMatrix::built_in()).unwrap(),
-            "op-mix-matrix",
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!matrix_denied.admitted, "{matrix_denied:?}");
-    assert_eq!(matrix_denied.deny_reason, "capability_unsupported");
-    assert!(
-        matrix_denied
-            .deny_message
-            .contains(CAPABILITY_MATRIX_VERSION),
-        "{matrix_denied:?}"
-    );
-
-    let admitted = svc
-        .decide_gateway_execution(decide(
-            serde_json::to_vec(&CapabilityRequirements {
-                responses: true,
-                ..CapabilityRequirements::default()
-            })
-            .unwrap(),
-            "op-mix-requirements",
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(admitted.admitted, "{admitted:?}");
-    assert!(admitted.deny_reason.is_empty());
-}
-
-#[tokio::test]
-async fn decide_gateway_execution_requires_authenticated_principal() {
-    use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
-
-    let svc = memory_service();
-    let request = Request::new(DecideGatewayExecutionRequest {
-        contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-        namespace: "team-a".into(),
-        requested_model: "gpt-5.5".into(),
-        operation_class: "chat".into(),
-        estimated_cost_usd_micros: 0,
-        correlation_operation_id: "op-decide-missing-principal".into(),
-        correlation_attempt: 1,
-        estimated_tokens: 10,
-        task_class: "interactive".into(),
-        preferred_runtime: "openai".into(),
-        project: "team-a".into(),
-        agent: "mallory".into(),
-        key_id: String::new(),
-        work_unit: String::new(),
-        local_free_available: false,
-        user_id: "mallory".into(),
-        route_override: String::new(),
-        capability_requirements_json: Vec::new(),
-        expected_calls: 1,
-        pipeline_spec: String::new(),
-        action_claim: None,
-    });
-    let err = svc.decide_gateway_execution(request).await.unwrap_err();
-    assert_eq!(err.code(), tonic::Code::Unauthenticated);
-}
-
 #[tokio::test]
 async fn execute_plan_lookup_first_hit_skips_provider_with_zero_tokens() {
     use crate::composition::lookup_first;
@@ -14116,26 +12869,6 @@ fn enable_family(svc: &ChiseiServiceImpl, namespace: &str, family: &str, region:
     .unwrap();
 }
 
-fn enable_model(svc: &ChiseiServiceImpl, namespace: &str, model: &str) {
-    let identity = crate::chisei::model_review::identity_from_model(model).unwrap();
-    crate::chisei::model_review::set_model_review(
-        &svc.db,
-        crate::chisei::model_review::ModelReviewRecord {
-            namespace: namespace.into(),
-            identity: crate::chisei::model_review::ModelReviewIdentity::new(
-                identity.provider,
-                identity.model,
-                identity.artifact_digest.unwrap_or_default(),
-            ),
-            status: crate::chisei::model_review::ModelReviewStatus::Enabled,
-            actor: "alice".into(),
-            reason: "admission fixture".into(),
-            updated_at_ms: 1,
-        },
-    )
-    .unwrap();
-}
-
 #[tokio::test]
 async fn unreviewed_model_is_refused_at_native_planning() {
     let svc = review_admission_service();
@@ -14165,137 +12898,6 @@ async fn unreviewed_model_is_refused_at_native_planning() {
         "{}",
         error.message()
     );
-}
-
-#[tokio::test]
-async fn unreviewed_model_is_refused_at_gateway_decide() {
-    use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
-
-    let svc = review_admission_service();
-    svc.policy
-        .set_namespace_policy("sales", openai_sales_policy());
-    svc.policy
-        .set_context_admission_policy(
-            "sales",
-            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
-        )
-        .unwrap();
-    let mut request = Request::new(DecideGatewayExecutionRequest {
-        contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-        namespace: "sales".into(),
-        requested_model: "gpt-5.5".into(),
-        operation_class: "chat".into(),
-        estimated_cost_usd_micros: 0,
-        correlation_operation_id: "op-review-1".into(),
-        correlation_attempt: 1,
-        estimated_tokens: 10,
-        task_class: "interactive".into(),
-        preferred_runtime: "openai".into(),
-        project: "sales".into(),
-        agent: "local".into(),
-        key_id: String::new(),
-        work_unit: String::new(),
-        local_free_available: false,
-        user_id: "local".into(),
-        route_override: String::new(),
-        capability_requirements_json: Vec::new(),
-        expected_calls: 1,
-        pipeline_spec: String::new(),
-        action_claim: None,
-    });
-    request
-        .metadata_mut()
-        .insert("x-principal", "local".parse().unwrap());
-    let denied = svc
-        .decide_gateway_execution(request)
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(!denied.admitted, "{denied:?}");
-    assert_eq!(denied.deny_reason, "model_review_denied");
-    assert!(
-        denied
-            .deny_message
-            .contains(crate::chisei::model_review::REFUSAL_NOT_ENABLED),
-        "{}",
-        denied.deny_message
-    );
-}
-
-#[tokio::test]
-async fn unreviewed_fallback_is_omitted_from_gateway_decide() {
-    use crate::chisei::gateway_decide::GATEWAY_DECIDE_CONTRACT_VERSION;
-
-    let svc = review_admission_service();
-    svc.policy.set_namespace_policy(
-        "sales",
-        crate::chisei::policy::Policy {
-            allowed_runtimes: vec!["openai".into()],
-            allowed_models: vec!["gpt-5.5".into(), "gpt-5.5-mini".into()],
-            default_runtime: "openai".into(),
-            default_model: "gpt-5.5".into(),
-            data_class: "unclassified".into(),
-        },
-    );
-    svc.policy
-        .set_context_admission_policy(
-            "sales",
-            crate::chisei::policy::ContextAdmissionPolicy::allow_by_default(),
-        )
-        .unwrap();
-    enable_model(&svc, "sales", "gpt-5.5");
-    let mut request = Request::new(DecideGatewayExecutionRequest {
-        contract_version: GATEWAY_DECIDE_CONTRACT_VERSION.into(),
-        namespace: "sales".into(),
-        requested_model: "gpt-5.5".into(),
-        operation_class: "chat".into(),
-        estimated_cost_usd_micros: 0,
-        correlation_operation_id: "op-review-fallback-1".into(),
-        correlation_attempt: 1,
-        estimated_tokens: 10,
-        task_class: "interactive".into(),
-        preferred_runtime: "openai".into(),
-        project: "sales".into(),
-        agent: "local".into(),
-        key_id: String::new(),
-        work_unit: String::new(),
-        local_free_available: false,
-        user_id: "local".into(),
-        route_override: String::new(),
-        capability_requirements_json: Vec::new(),
-        expected_calls: 1,
-        pipeline_spec: String::new(),
-        action_claim: None,
-    });
-    request
-        .metadata_mut()
-        .insert("x-principal", "local".parse().unwrap());
-    let admitted = svc
-        .decide_gateway_execution(request)
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(admitted.admitted, "{admitted:?}");
-    assert_eq!(admitted.resolved_model, "gpt-5.5");
-    assert!(
-        admitted
-            .fallback_models
-            .iter()
-            .all(|model| !model.contains("gpt-5.5-mini")),
-        "{admitted:?}"
-    );
-    let decisions = svc
-        .db
-        .list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
-            actor: None,
-            action: Some(crate::chisei::model_review::ACTION_ADMIT_DENIED.into()),
-            target_id: None,
-            after: 0,
-            limit: 10,
-            offset: 0,
-        })
-        .unwrap();
-    assert!(decisions.is_empty(), "{decisions:?}");
 }
 
 #[tokio::test]

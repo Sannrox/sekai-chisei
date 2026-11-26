@@ -32,7 +32,6 @@ pub mod external_action_lifecycle;
 pub mod external_permit;
 pub mod federation;
 pub mod gate;
-pub mod gateway_decide;
 pub mod governed_subject;
 pub use sekai_types::governed_subject_provenance;
 pub mod gunshi;

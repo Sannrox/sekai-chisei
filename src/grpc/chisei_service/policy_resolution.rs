@@ -5,9 +5,13 @@
 //! capability gates, cost-tier and portfolio routing, exclusive local-free and
 //! portfolio runtime helpers, runtime canonicalization, and fallback projection.
 
+#[cfg(test)]
 use super::live_model::{final_runtime_for_model, route_override_allowed};
+#[cfg(test)]
 use super::rpc_policy_shadow::ShadowRequest;
 use super::*;
+#[cfg(test)]
+use crate::chisei::portfolio::{Objective, TaskDemand as PortfolioDemand};
 
 impl ChiseiServiceImpl {
     /// Reference-platform analog: a scoped token with no usable scope has no permissions.
@@ -36,6 +40,7 @@ impl ChiseiServiceImpl {
         }))
     }
 
+    #[cfg(test)]
     pub(super) async fn resolve_policy_for_actor(
         &self,
         r: ResolvePolicyRequest,
@@ -553,6 +558,7 @@ impl ChiseiServiceImpl {
         .await
     }
 
+    #[cfg(test)]
     pub(super) fn record_portfolio_shift(
         &self,
         scope: &str,
@@ -596,6 +602,7 @@ impl ChiseiServiceImpl {
     }
 }
 
+#[cfg(test)]
 pub(super) fn portfolio_model_allowed(policy: Option<&Policy>, model: &str) -> bool {
     policy.is_none_or(|policy| {
         policy.allowed_models.is_empty()
@@ -603,6 +610,7 @@ pub(super) fn portfolio_model_allowed(policy: Option<&Policy>, model: &str) -> b
     })
 }
 
+#[cfg(test)]
 pub(super) fn portfolio_runtime_for_model(
     policy: Option<&Policy>,
     current_runtime: &str,
@@ -623,6 +631,7 @@ pub(super) fn portfolio_runtime_for_model(
         .map(|_| model_runtime.to_string())
 }
 
+#[cfg(test)]
 pub(super) fn local_free_runtime_for_model(policy: Option<&Policy>, model: &str) -> Option<String> {
     let runtime = crate::llm::provider_name(model);
     if runtime != "ollama" {
@@ -645,6 +654,7 @@ pub(super) fn local_free_runtime_for_model(policy: Option<&Policy>, model: &str)
 
 /// Internal policy-resolution request used by the canonical fat-decide path.
 /// It deliberately is not a public protobuf message or RPC.
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub(super) struct ResolvePolicyRequest {
     pub(super) namespace: String,
@@ -681,6 +691,7 @@ pub(super) fn override_provider(route_override: &str, fallback: &str) -> String 
 /// The model preference a policy is applied to. A route override wins; while
 /// an evaluation regression is active, the policy's own default replaces the
 /// requested model.
+#[cfg(test)]
 fn preferred_model_for<'a>(
     policy: Option<&'a Policy>,
     route_override: &'a str,
@@ -697,6 +708,7 @@ fn preferred_model_for<'a>(
         .unwrap_or(requested)
 }
 
+#[cfg(test)]
 fn policy_scopes(req: &ResolvePolicyRequest) -> Vec<String> {
     let mut scopes = Vec::new();
     push_scope(&mut scopes, req.subject.trim());
@@ -718,6 +730,7 @@ fn policy_scopes(req: &ResolvePolicyRequest) -> Vec<String> {
 /// task classes route to the cheaper tier, and only while no eval regression is
 /// active for the scope — a regression fails safe back to the capable tier.
 /// Unknown or primary classes never bias to cheap.
+#[cfg(test)]
 pub(super) fn cheap_route_bias(task_class: &str, eval_regressed: bool) -> Option<&'static str> {
     if eval_regressed {
         return None;
@@ -737,10 +750,12 @@ pub(super) fn cheap_route_bias(task_class: &str, eval_regressed: bool) -> Option
 /// silently discard the cheaper choice. Cost tiering for those runtimes is a
 /// follow-up. This also guards against non-provider runtimes (e.g. the "kiro"
 /// default) producing a bogus alias or a runtime/model mismatch.
+#[cfg(test)]
 fn is_known_provider_runtime(runtime: &str) -> bool {
     matches!(runtime.trim(), "openai" | "anthropic")
 }
 
+#[cfg(test)]
 fn push_scope(scopes: &mut Vec<String>, scope: &str) {
     if scope.is_empty() || scopes.iter().any(|existing| existing == scope) {
         return;

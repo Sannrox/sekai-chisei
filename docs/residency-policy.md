@@ -37,7 +37,6 @@ Receipt attributes (when applied):
 | --- | --- |
 | `PlanExecution` / `resolve_model_for_run` | Enforces residency after final model/runtime resolution |
 | `ExecutePlanStream` | Re-checks residency so cached plans cannot outrun policy |
-| `DecideGatewayExecution` | Enforces residency as part of fat-decide route composition |
 | Gunshi auto-dispatch | Evaluates aligned auto-dispatch decisions; forces advisory + denial reasons when the selected model is residency-illegal and stamps receipt attributes |
 
 ## Gunshi

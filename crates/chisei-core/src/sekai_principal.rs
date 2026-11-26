@@ -231,7 +231,7 @@ mod tests {
         for (principal, target, expected) in [
             ("alice", &unmarked, MarkingClearance::Unmarked),
             ("alice", &restricted, MarkingClearance::Denied),
-            ("chisei-gateway", &restricted, MarkingClearance::Cleared),
+            ("local", &restricted, MarkingClearance::Cleared),
             ("root", &restricted, MarkingClearance::Cleared),
         ] {
             let clearance = sekai

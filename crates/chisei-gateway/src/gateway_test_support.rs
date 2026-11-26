@@ -1,11 +1,6 @@
-//! Hooks for the root crate's gateway tests that need a running control plane
-//! (`tests/gateway_control_plane.rs`). Only the root crate builds the Sekai
-//! and Chisei gRPC services, so those tests cannot live in this crate without
-//! a dev-dependency on the root crate, which rebuilds this crate's tests on
-//! every root edit (#2590).
-//!
-//! Behind the `test-support` feature and hidden from docs: not a supported
-//! API.
+//! Hooks for root-crate tests that drive the gateway HTTP surface
+//! (`tests/transform_llm_step.rs`). Behind the `test-support` feature and
+//! hidden from docs: not a supported API.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,7 +8,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::http::HeaderName;
 
-use super::{GatewayConfig, GatewayRuntime, ResilienceConfig};
+use super::{GatewayConfig, GatewayRuntime};
 use crate::llm::HttpTimeouts;
 
 pub const POLICY_FORMAT: &str = super::POLICY_FORMAT;
@@ -39,26 +34,6 @@ impl TestRuntime {
 
     pub fn with_http_timeouts(self, http_timeouts: HttpTimeouts) -> Self {
         Self(self.0.with_http_timeouts(http_timeouts))
-    }
-
-    /// Retry the control plane `retries` times, `backoff` apart, each call
-    /// bounded by `timeout`.
-    pub fn with_control_plane_retries(
-        self,
-        retries: u32,
-        backoff: Duration,
-        timeout: Duration,
-    ) -> Self {
-        Self(self.0.with_resilience(ResilienceConfig {
-            control_plane_retries: retries,
-            control_plane_retry_backoff: backoff,
-            control_plane_timeout: timeout,
-            ..ResilienceConfig::default()
-        }))
-    }
-
-    pub fn with_recovery_spool_path(self, path: PathBuf) -> Self {
-        Self(self.0.with_recovery_spool_path(Some(path)))
     }
 
     /// Serve in policy mode from the policy file at `policy_path`, with the

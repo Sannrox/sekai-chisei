@@ -10,7 +10,6 @@ pub(crate) use crate::db::sekai::{PrincipalCredential, SekaiDb};
 pub(crate) use postgres::GenericClient;
 pub(crate) use std::sync::Arc;
 
-#[cfg(any(test, feature = "gateway-test-support"))]
 pub mod source_batch_auth_counters {
     use std::cell::Cell;
 

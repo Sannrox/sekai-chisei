@@ -25,8 +25,8 @@ fn chisei_inventory_covers_every_proto_rpc() {
     assert!(inventory.entry("GetEvalRun").is_none());
     assert!(inventory.entry("ListEvalRuns").is_none());
     assert!(inventory.entry("GetSampleObservation").is_none());
-    assert!(inventory.entry("ClaimGatewayDispatch").is_some());
-    assert!(inventory.entry("DecideGatewayExecution").is_some());
+    assert!(inventory.entry("ClaimGatewayDispatch").is_none());
+    assert!(inventory.entry("DecideGatewayExecution").is_none());
     assert!(inventory.entry("PutEvaluationPlan").is_some());
     assert!(inventory.entry("ResolveEvaluationPlan").is_some());
     assert!(inventory.entry("ExecuteEvaluationManifest").is_some());

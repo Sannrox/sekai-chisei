@@ -33,14 +33,29 @@ async fn key_cache_miss_is_recorded_on_an_unknown_key() {
         "cache series existed before any lookup:\n{before}"
     );
 
-    // from_env requires some provider key. This binary holds a single test, so
-    // mutating the process environment here cannot race another test.
+    // from_env requires a provider key and a policy file. This binary holds a
+    // single test, so mutating the process environment here cannot race another
+    // test.
+    let policy_dir = tempfile::tempdir().expect("policy dir");
+    let policy_path = policy_dir.path().join("policy.json");
+    std::fs::write(
+        &policy_path,
+        serde_json::json!({
+            "format": "chisei.gateway-policy/v1",
+            "generation": 1,
+            "principals": [{
+                "name": "codex-app",
+                "key_sha256": [sekai_domain::gateway_keys::hash_gateway_key("sk-chisei-codex-app")],
+                "routes": [{"provider": "anthropic", "models": ["*"]}],
+            }],
+            "egress": [{"provider": "anthropic", "data_classes": ["unknown", "public", "internal"]}],
+        })
+        .to_string(),
+    )
+    .expect("write policy");
     unsafe {
         std::env::set_var("ANTHROPIC_API_KEY", "test-only-not-a-real-key");
-        // Without a governance target the key store is never consulted and the
-        // cache lookup is skipped entirely. Point at a closed port: the miss is
-        // recorded before the connection is attempted.
-        std::env::set_var("CHISEI_GRPC_URL", "http://127.0.0.1:1");
+        std::env::set_var("CHISEI_GATEWAY_POLICY_PATH", &policy_path);
     }
     let config = chisei_gateway::gateway::GatewayConfig::from_env().expect("gateway config");
     let app = chisei_gateway::gateway::app(config);

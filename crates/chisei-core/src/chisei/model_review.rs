@@ -12,10 +12,8 @@
 //! admission (#1494) refuses any model that is not `enabled` for the
 //! namespace, identity, and residency region before a provider call.
 
-use std::collections::{BTreeSet, HashMap};
-
-#[cfg(any(test, feature = "gateway-test-support"))]
 use std::cell::Cell;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::chisei::decision_ledger::Decision;
 use crate::chisei::model_availability::AvailableModel;
@@ -38,7 +36,6 @@ const BACKFILL_REASON: &str = "currently routed at review-state introduction";
 const TEST_SEED_ACTOR: &str = "chisei.model-review.test-seed";
 const TEST_SEED_REASON: &str = "test fixture registry family enablement";
 
-#[cfg(any(test, feature = "gateway-test-support"))]
 thread_local! {
     static SKIP_REGISTRY_FAMILY_SEED: Cell<bool> = const { Cell::new(false) };
 }
@@ -606,7 +603,6 @@ pub fn enable_registry_provider_families(db: &ChiseiStore) -> Result<usize, Stri
     Ok(written)
 }
 
-#[cfg(any(test, feature = "gateway-test-support"))]
 pub fn without_registry_family_seed<T>(f: impl FnOnce() -> T) -> T {
     SKIP_REGISTRY_FAMILY_SEED.with(|flag| {
         let previous = flag.replace(true);
@@ -624,7 +620,6 @@ pub fn without_registry_family_seed<T>(f: impl FnOnce() -> T) -> T {
     })
 }
 
-#[cfg(any(test, feature = "gateway-test-support"))]
 pub fn registry_family_seed_skipped() -> bool {
     SKIP_REGISTRY_FAMILY_SEED.with(Cell::get)
 }

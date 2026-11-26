@@ -19,10 +19,10 @@ shared the name "capabilities":
   `CapabilityMatrix` to any authenticated gateway caller. The matrix version
   was already `chisei.provider-capabilities/v1`, but the HTTP path and docs
   invited confusion with native discovery.
-- `DecideGatewayExecution.capability_requirements_json` deserializes
+- Gateway HTTP admission deserializes
   `provider_profile::CapabilityRequirements` (the same provider-capability
-  family). Submitting a native catalog page parsed as `InvalidArgument` and
-  became `policy_denied` instead of `capability_unsupported`.
+  family) from the request. Submitting a native catalog page is
+  `capability_unsupported`, not a policy deny.
 
 Dumping every registered provider profile on HTTP GET leaked authority: callers
 could observe experimental or unconfigured providers they could not route.
@@ -45,9 +45,9 @@ Keep two catalogs (option b). Do not treat the HTTP GET as
 - The HTTP matrix includes only providers the current gateway snapshot can
   route: configured, routable, and not disabled or unpromoted experimental.
   It must not dump every registered profile.
-- Decide `capability_requirements_json` accepts only
-  `CapabilityRequirements`. A native catalog page or the HTTP matrix document
-  in that field is `capability_unsupported`, not `policy_denied`.
+- Gateway admission accepts only `CapabilityRequirements`. A native catalog
+  page or the HTTP matrix document in that field is `capability_unsupported`,
+  not `policy_denied`.
 - Do not invent OpenAPI. Document the versioned JSON contract in
   `docs/capability-catalog.md`.
 
@@ -68,9 +68,9 @@ Keep two catalogs (option b). Do not treat the HTTP GET as
 ## Consequences
 
 Gateway hosts continue to call `GET /v1/chisei/capabilities` for provider
-features. They must not feed that JSON, or a native catalog page, into decide
-requirements. Native SDKs continue to call `DiscoverCapabilities` and remain
-unrelated to the HTTP matrix.
+features. They must not feed that JSON, or a native catalog page, into
+gateway admission requirements. Native SDKs continue to call
+`DiscoverCapabilities` and remain unrelated to the HTTP matrix.
 
 HTTP clients that previously parsed experimental or unconfigured profiles
 from GET will stop seeing them until those providers are configured and
@@ -80,7 +80,7 @@ lifecycle-admitted. That is intentional.
 
 - `CapabilityRequirements::parse_json` rejects native catalog JSON and the
   provider matrix document.
-- `DecideGatewayExecution` maps those mixes to `capability_unsupported`.
+- Gateway admission maps those mixes to `capability_unsupported`.
 - `CapabilityMatrix::public_discovery` omits unconfigured and experimental
   profiles; `GET /v1/chisei/capabilities` serves that view.
 - `docs/capability-catalog.md` names both contracts and the decide deny class.

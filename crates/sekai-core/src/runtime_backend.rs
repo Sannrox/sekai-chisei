@@ -397,7 +397,6 @@ impl RuntimeBackend {
         self.db.clone()
     }
 
-    #[cfg(any(test, feature = "gateway-test-support"))]
     pub fn connection_pool_max(&self) -> u32 {
         self.db.connection_pool_max()
     }

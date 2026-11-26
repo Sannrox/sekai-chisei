@@ -1,5 +1,4 @@
 use chisei_gateway::gateway::{GatewayConfig, serve};
-use chisei_gateway::gateway_report::{GatewayReportConfig, report_usage, run_report};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -11,16 +10,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.first().map(String::as_str) == Some("report") {
-        args.remove(0);
-        if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-            println!("{}", report_usage());
-            return Ok(());
-        }
-        let config = GatewayReportConfig::from_env_and_args(args)
-            .map_err(|err| format!("invalid chisei-gateway report config: {err}"))?;
-        return run_report(config).await;
-    }
     if args.first().map(String::as_str) == Some("refresh") {
         args.remove(0);
         if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -30,8 +19,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return run_refresh(args).await;
     }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!("Usage: chisei-gateway [report ...|refresh ...]");
-        println!("       chisei-gateway report --help");
+        println!("Usage: chisei-gateway [refresh ...]");
         println!("       chisei-gateway refresh --help");
         return Ok(());
     }

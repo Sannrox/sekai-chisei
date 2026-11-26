@@ -76,7 +76,7 @@ pub const COMPLIANCE_EXPORT: &str = "compliance_export";
 pub const CAPABILITIES: &[&str] = &[AGENT_TURN_WORKER, COMPLIANCE_EXPORT];
 
 /// Built-in principals with trusted authority are never service principals.
-const RESERVED_PRINCIPALS: &[&str] = &["root", "local", "anonymous", "chisei-gateway"];
+const RESERVED_PRINCIPALS: &[&str] = &["root", "local", "anonymous"];
 
 fn valid_principal(principal: &str) -> bool {
     !principal.is_empty()

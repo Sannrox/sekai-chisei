@@ -3,7 +3,7 @@
 //! Projects authorized operation receipts into the shell using the same
 //! `OperationReport` / `causal_operation_view` surfaces as `sekaictl report`.
 //! Visibility matches `GetOperationReceipt`: initiator or bootstrap principal
-//! (`root` / `local` / `chisei-gateway`). Cross-namespace and invisible IDs
+//! (`root` / `local`). Cross-namespace and invisible IDs
 //! answer as not found.
 
 use crate::chisei::receipt::OperationReceipt;
@@ -69,8 +69,7 @@ impl WorkspaceError {
 
 /// Whether the principal may read this receipt (mirrors GetOperationReceipt).
 pub fn principal_can_view_receipt(principal: &str, receipt: &OperationReceipt) -> bool {
-    matches!(principal, "root" | "local" | "chisei-gateway")
-        || principal == receipt.initiating_actor
+    matches!(principal, "root" | "local") || principal == receipt.initiating_actor
 }
 
 fn looks_like_secret_key(key: &str) -> bool {

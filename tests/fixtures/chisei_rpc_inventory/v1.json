@@ -46,38 +46,6 @@
       "product_tier": "experimental"
     },
     {
-      "rpc": "ClaimGatewayDispatch",
-      "kind": "persistent",
-      "surfaces": [
-        "gateway.governance",
-        "chisei.execution"
-      ],
-      "evidence": [
-        "tests/chisei_execution_backend_conformance.rs",
-        "crates/chisei-core/src/chisei_store/postgres_chisei_receipts.rs",
-        "tests/chisei_gateway_audit_backend_conformance.rs"
-      ],
-      "durable_dependencies": [],
-      "product_tier": "experimental"
-    },
-    {
-      "rpc": "DecideGatewayExecution",
-      "kind": "computed",
-      "surfaces": [],
-      "evidence": [
-        "tests/chisei_budget_backend_conformance.rs",
-        "crates/chisei-core/src/chisei_store/postgres_budget.rs",
-        "tests/chisei_policy_backend_conformance.rs",
-        "tests/graph_backend_conformance.rs",
-        "crates/chisei-core/src/chisei/gateway_decide.rs"
-      ],
-      "durable_dependencies": [
-        "chisei.policy",
-        "chisei.budget"
-      ],
-      "product_tier": "experimental"
-    },
-    {
       "rpc": "EvaluateGovernedSubject",
       "kind": "persistent",
       "surfaces": [

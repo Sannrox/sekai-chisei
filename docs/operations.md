@@ -295,26 +295,19 @@ and drops any partial page written after it.
 ## Gateway safeguards
 
 - Use virtual keys or authenticated passthrough only on a trusted gateway.
-- Seed durable virtual keys with `sekaictl admin gateway setup` /
-  `sekaictl admin gateway key create`. Control-plane
+- Name principals and key hashes in the gateway policy file
+  (`CHISEI_GATEWAY_POLICY_PATH`). Control-plane
   `sekaictl admin access credential create`
   tokens are for gRPC principals, not gateway HTTP keys.
-- `gateway setup` does not enable models for route admission, which denies
-  any model that model review has not enabled. Run
-  `sekaictl admin model-review backfill` once after setup to enable the models
-  its policies allow, or enable a family with `model-review family-set`.
-- Any non-loopback `GATEWAY_BIND` **requires** at least one authenticated
-  `GATEWAY_KEYS` entry and must not enable `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH`.
-  Startup fails closed if those gates are missing.
-- Set `CHISEI_GRPC_URL` or `SEKAI_SOCKET`; gateway startup fails without a
-  control-plane target and every provider request requires live admission.
+- Any non-loopback `GATEWAY_BIND` **requires** a valid policy file and must not
+  enable `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH`. Startup fails closed if those
+  gates are missing. `GATEWAY_KEYS` is refused.
+- Loopback passthrough still works: identify by policy key first, otherwise
+  the `x-chisei-agent` identity if that name is a policy principal.
 - Protect the admin refresh endpoint with a random
   `CHISEI_GATEWAY_ADMIN_TOKEN` of at least 32 bytes; it is disabled when unset.
-- Keep the durable recovery spool writable. Its default path is
-  `data/chisei-gateway-recovery.jsonl` relative to process CWD. The configured
-  byte limit is a hard capacity rather than rotation: replay or safely archive
-  processed records before it fills, because new recovery records are refused
-  at capacity.
+- Keep the gateway log directory writable (`CHISEI_GATEWAY_LOG_DIR`). Back it
+  up with the policy; one gateway process owns it at a time.
 - Treat cross-provider routing as opt-in because request/response translation
   can be lossy. Tool-call streams remain denied where semantics cannot be
   preserved.
@@ -326,8 +319,8 @@ and drops any partial page written after it.
 - [ ] Network-accessible control-plane traffic uses TLS.
 - [ ] The ops listener is reachable only by intended monitoring systems.
 - [ ] Provider secrets come from the process environment or a secrets adapter.
-- [ ] Gateway request, rate, context, and spool limits are explicit.
-- [ ] The governance failure posture matches the deployment risk model.
+- [ ] Gateway request, rate, and log limits are explicit.
+- [ ] The gateway policy file is present and the failure posture matches the deployment risk model.
 - [ ] Database, object log, and sidecar/state backup restoration has been tested.
 - [ ] Logs, receipts, audit records, and metrics have an operator-owned
   retention policy.

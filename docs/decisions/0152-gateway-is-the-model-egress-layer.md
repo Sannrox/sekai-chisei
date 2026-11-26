@@ -126,13 +126,13 @@ flowchart LR
 - The gateway gains durable state (its log and its policy). Backup, restore,
   and rollback cover both, and a restarted instance resumes from them.
 - Chisei gains configuration naming the gateways it reads from.
-- Breaking: `DecideGatewayExecution`, `ClaimGatewayDispatch`, and the
-  gateway-only `RecordUsage` leave `proto/`; the reserved principal and the
-  `gateway-test-support` feature go away; `chisei_context` is removed.
-  Releases carry `risk:breaking` and an upgrade note.
-- Rolling upgrade: a gateway with its own policy and an old gateway on
-  `gateway.decide/v2` work side by side for one release. The old RPCs are
-  deleted only after that release.
+- Breaking: `DecideGatewayExecution` and `ClaimGatewayDispatch` leave
+  `proto/`; the reserved principal and the `gateway-test-support` feature go
+  away; `chisei_context` is removed. `RecordUsage` stays on Chisei for
+  operators and accounting principals; the gateway never calls it. Releases
+  carry `risk:breaking` and an upgrade note.
+- Upgrade: switch gateway clients to policy mode (`CHISEI_GATEWAY_POLICY_PATH`)
+  before upgrading. The old `gateway.decide/v2` RPCs are gone.
 - Principals using client-login passthrough, or with no gateway mapping, see
   less graph data over MCP.
 - `VISION.md` ("Governed Entry Paths"), `docs/architecture.md`, and
@@ -155,5 +155,5 @@ flowchart LR
 - `chisei-gateway` has no dependency on Sekai or Chisei service clients.
 - A restricted field is withheld from a principal whose egress includes a
   route that may not receive it, and from a principal with unknown egress.
-- Rollback to the previous release with the old gateway keeps admitting
-  through `gateway.decide/v2`.
+- Rollback to the previous release restores `gateway.decide/v2` admission
+  only on that older binary; this release has no dual path.

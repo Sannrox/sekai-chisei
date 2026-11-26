@@ -147,10 +147,9 @@ routing, evaluation gates, outcome attribution, and learning rules.
 
 The LLM provider adapters execute calls but do not own these decisions.
 Provider-specific behavior stays behind the `chisei-provider` crate. The
-`chisei-gateway` crate depends on `sekai-proto`, `chisei-provider`,
-`sekai-admin-client`, `sekai-domain`, and `sekai-obs` among workspace packages; governed decisions and durable
-mutations cross the gRPC contract instead of reaching into control-plane
-implementation modules.
+`chisei-gateway` crate depends on `chisei-provider`, `sekai-domain`, and
+`sekai-obs` among workspace packages. It owns its egress policy and never
+calls Sekai or Chisei.
 
 Provider registry persistence and lifecycle records are owned by
 `provider_profile`; `provider_resolution` is the single orchestration boundary
@@ -168,11 +167,10 @@ and records normalized usage and audit evidence.
 Native integrations use the gRPC planning and execution APIs. Both paths
 share the same policy, data, and audit layers today.
 
-[ADR 0152](decisions/0152-gateway-is-the-model-egress-layer.md) replaces this
-with one egress layer: the gateway owns its egress policy, records admission
-and usage in its own log that Chisei reads, never calls Sekai or Chisei, and
-carries native execution's provider calls too. The `gateway.decide/v2` path
-described above is drained in steps tracked by #2696 to #2702.
+[ADR 0152](decisions/0152-gateway-is-the-model-egress-layer.md) is that egress
+layer: the gateway owns its egress policy, records admission and usage in its
+own log that Chisei reads, never calls Sekai or Chisei, and carries native
+execution's provider calls too. Policy mode is the only admission path.
 
 Ordered text, image, audio, and document inputs use the parallel
 `PlanContentExecution` and `ExecuteContentPlanStream` contract. The ordinary

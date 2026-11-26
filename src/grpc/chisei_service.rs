@@ -30,7 +30,8 @@ use crate::chisei::governed_subject as subject;
 use crate::chisei::governed_subject_provenance as subject_provenance;
 use crate::chisei::pipeline as pipe;
 use crate::chisei::policy::{Policy, PolicyResolver};
-use crate::chisei::portfolio::{Objective, PortfolioStore, TaskDemand as PortfolioDemand};
+#[cfg(test)]
+use crate::chisei::portfolio::PortfolioStore;
 use crate::chisei::privacy::{DataClass, LeakAction, LeakFinding, TaskClass};
 use crate::chisei::promotion::CandidateStore;
 use crate::chisei::receipt::{
@@ -57,7 +58,6 @@ mod evaluation_execution_lifecycle;
 mod evaluation_manifest_resolution;
 mod execution_planning;
 mod external_action_admission;
-mod gateway_decide_lifecycle;
 mod gateway_receipt_admission;
 mod governed_subject_lifecycle;
 mod live_model;
@@ -121,6 +121,7 @@ pub struct ChiseiServiceImpl {
     pub(super) policy: Arc<PolicyResolver>,
     pub(super) pipeline: pipe::Pipeline,
     pub(super) eval: Arc<EvalStore>,
+    #[cfg(test)]
     pub(super) portfolio: Arc<PortfolioStore>,
     pub(super) planned_executions: Arc<Mutex<HashMap<String, CachedExecutionPlan>>>,
     pub(super) planned_content_executions: Arc<Mutex<HashMap<String, CachedContentExecutionPlan>>>,
@@ -161,7 +162,6 @@ const POLICY_KIND: &str = "policy";
 const MIN_EVIDENCE_CONTEXT_EVAL_CASES: usize = 3;
 const EXECUTION_SCHEMA_VERSION: &str = "chisei.execution/v1";
 const AUTH_SOURCE_HEADER: &str = "x-sekai-auth-source";
-const DELEGATED_PRINCIPAL_HEADER: &str = "x-sekai-delegated-principal";
 const KIOKU_MIN_SAMPLES_PER_ARM: usize = 3;
 const KIOKU_REGRESSION_THRESHOLD: f64 = 0.05;
 const KIOKU_TRUSTED_OUTCOME_ATTRIBUTE: &str = "kioku_trusted_outcome";
@@ -207,23 +207,6 @@ struct EvaluationGateAssertionSnapshot {
     assert_type: String,
     #[prost(string, tag = "2")]
     value: String,
-}
-
-struct GatewayPipelineInput<'a> {
-    actor: &'a str,
-    delegated_principal: Option<&'a str>,
-    request_id: &'a str,
-    namespace: &'a str,
-    spec: &'a str,
-    model: &'a str,
-    runtime: &'a str,
-    task_class: &'a str,
-    action_impact: &'a crate::chisei::action_impact::ActionImpact,
-}
-
-struct GatewayPipelineDecision {
-    run: pipe::RunResult,
-    sampling: crate::chisei::sampling::SamplingDecision,
 }
 
 /// Complete result used by local embedding/test callers of the streaming path.
@@ -345,6 +328,7 @@ impl ChiseiServiceImpl {
             policy,
             pipeline: pipe::default_pipeline_with(config.sample_rate, config.sample_risk_threshold),
             eval,
+            #[cfg(test)]
             portfolio: Arc::new(PortfolioStore::new(db.clone())),
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
             planned_content_executions: Arc::new(Mutex::new(HashMap::new())),
@@ -434,6 +418,7 @@ impl ChiseiServiceImpl {
             policy,
             pipeline: pipe::default_pipeline_with(config.sample_rate, config.sample_risk_threshold),
             eval,
+            #[cfg(test)]
             portfolio: Arc::new(PortfolioStore::new(db.clone())),
             planned_executions: Arc::new(Mutex::new(HashMap::new())),
             planned_content_executions: Arc::new(Mutex::new(HashMap::new())),
@@ -684,13 +669,6 @@ impl ChiseiService for ChiseiServiceImpl {
         rpc_control::set_external_action_policy(self, req).await
     }
 
-    async fn decide_gateway_execution(
-        &self,
-        req: Request<DecideGatewayExecutionRequest>,
-    ) -> Result<Response<DecideGatewayExecutionResponse>, Status> {
-        rpc_control::decide_gateway_execution(self, req).await
-    }
-
     async fn record_usage(
         &self,
         req: Request<RecordUsageRequest>,
@@ -892,13 +870,6 @@ impl ChiseiService for ChiseiServiceImpl {
         req: Request<ReportOperationEventRequest>,
     ) -> Result<Response<ReportOperationEventResponse>, Status> {
         rpc_execution::report_operation_event(self, req).await
-    }
-
-    async fn claim_gateway_dispatch(
-        &self,
-        req: Request<ClaimGatewayDispatchRequest>,
-    ) -> Result<Response<ClaimGatewayDispatchResponse>, Status> {
-        rpc_execution::claim_gateway_dispatch(self, req).await
     }
 
     async fn get_operation_receipt(

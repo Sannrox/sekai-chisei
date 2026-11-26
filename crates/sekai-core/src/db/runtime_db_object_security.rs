@@ -503,7 +503,6 @@ impl RuntimeDb {
         namespace: &str,
         kind: &str,
     ) -> Result<Option<ObjectSecurityPolicy>, String> {
-        #[cfg(any(test, feature = "gateway-test-support"))]
         source_batch_auth_counters::POLICY_LOOKUPS.with(|c| c.set(c.get() + 1));
         let Some(activation) = self.get_object_security_activation(namespace)? else {
             return Ok(None);

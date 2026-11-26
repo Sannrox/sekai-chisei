@@ -516,9 +516,7 @@ mod tests {
             "UpdateDataset",
             "AppendRows",
             "QueryRows",
-            "DecideGatewayExecution",
             "RecordUsage",
-            "ClaimGatewayDispatch",
         ] {
             assert_eq!(
                 table.classification_of(rpc),

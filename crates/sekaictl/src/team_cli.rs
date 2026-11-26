@@ -103,10 +103,7 @@ impl TeamJoinConfig {
     fn validate(&self) -> Result<(), String> {
         validate_identifier("namespace", &self.namespace)?;
         validate_identifier("principal", &self.principal)?;
-        if matches!(
-            self.principal.as_str(),
-            "root" | "local" | "anonymous" | "chisei-gateway"
-        ) {
+        if matches!(self.principal.as_str(), "root" | "local" | "anonymous") {
             return Err(format!(
                 "principal {:?} is reserved for control-plane authentication",
                 self.principal
@@ -384,7 +381,7 @@ mod tests {
         assert!(invalid_budget.contains("positive integer"));
 
         let reserved = TeamJoinConfig::from_env_and_args(
-            ["--namespace", "team-one", "--principal", "chisei-gateway"].map(str::to_string),
+            ["--namespace", "team-one", "--principal", "root"].map(str::to_string),
         )
         .unwrap_err();
         assert!(reserved.contains("reserved"));

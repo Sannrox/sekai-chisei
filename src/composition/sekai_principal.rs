@@ -45,10 +45,7 @@ mod tests {
         // No clearance: the marking denies even though no grant restricts it.
         assert!(denied(&retrieve("alice")));
         // Trusted service subjects clear every marking.
-        assert!(matches!(
-            retrieve("chisei-gateway"),
-            LookupDecision::Hit { .. }
-        ));
+        assert!(matches!(retrieve("root"), LookupDecision::Hit { .. }));
 
         // A sealed, admin-granted principal profile raises alice's clearance.
         let profile = Object {

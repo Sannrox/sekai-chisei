@@ -352,7 +352,7 @@ mod tests {
                 .entry("GetGovernedSubjectProvenanceTrustRoot")
                 .is_none()
         );
-        assert_eq!(inventory.by_kind()["persistent"], 41);
+        assert_eq!(inventory.by_kind()["persistent"], 40);
         assert!(inventory.entry("SetBudgetWorkUnitDefault").is_some());
         assert!(inventory.entry("PlanContentExecution").is_some());
         assert!(inventory.entry("ExecuteContentPlanStream").is_some());
@@ -364,7 +364,7 @@ mod tests {
         assert!(inventory.entry("GetEvalRun").is_none());
         assert!(inventory.entry("ListEvalRuns").is_none());
         assert!(inventory.entry("GetSampleObservation").is_none());
-        assert!(inventory.entry("ClaimGatewayDispatch").is_some());
+        assert!(inventory.entry("ClaimGatewayDispatch").is_none());
         assert!(inventory.entry("ResolveEvaluationPlan").is_some());
         assert!(inventory.entry("ExecuteEvaluationManifest").is_some());
         assert!(inventory.entry("GetEvaluationExecution").is_none());

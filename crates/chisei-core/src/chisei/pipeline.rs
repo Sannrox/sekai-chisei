@@ -2320,7 +2320,6 @@ fn decode_review_policy(steps: &[StepDecision]) -> Option<ReviewPolicy> {
 }
 
 /// Minimal request for tests in sibling modules.
-#[cfg(any(test, feature = "gateway-test-support"))]
 pub fn test_request(sekai_facts: SekaiFacts) -> PipelineRequest {
     PipelineRequest {
         request_id: "t1".into(),

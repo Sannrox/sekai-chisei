@@ -307,7 +307,6 @@ pub(super) async fn proxy_gateway_inner_scoped(
     }
     let request_id = correlation.request_id.clone();
     let work_unit_id = gateway_work_unit_id(&headers).map(ToOwned::to_owned);
-    let pipeline_spec = extract_gateway_pipeline_spec(&body);
     let cache_requested = prompt_cache_requested(&body);
     let started_ms = Utc::now().timestamp_millis();
     let task_class = resolve_task_class(&headers, requested_model.as_deref());
@@ -315,23 +314,6 @@ pub(super) async fn proxy_gateway_inner_scoped(
     let registry_snapshot_version = capability_snapshot_identifier(&registry_snapshot);
     let policy_model_sentinel = requested_model.as_deref() == Some("auto");
     let wire_provider_id = capability_provider_id(client_provider);
-    let requested_provider_without_lifecycle = requested_model
-        .as_deref()
-        .filter(|_| !policy_model_sentinel)
-        .and_then(|model| ProviderKind::from_model(model).ok())
-        .unwrap_or(client_provider);
-    let alias_context = early_refusal_context(
-        &correlation,
-        responses_profile,
-        requested_provider_without_lifecycle,
-        requested_model.clone(),
-        work_unit_id.clone(),
-        request_bytes,
-        started_ms,
-        task_class.clone(),
-        request_hash.clone(),
-        registry_snapshot_version.clone(),
-    );
     let requested_registry_model = match requested_model
         .as_deref()
         .filter(|_| !policy_model_sentinel)
@@ -458,15 +440,14 @@ pub(super) async fn proxy_gateway_inner_scoped(
         .await;
         return rejection.response();
     }
-    // A configured gateway has one canonical governance boundary:
-    // DecideGatewayExecution. Any denial or unavailable decision returns
-    // before provider contact.
+    // A configured gateway admits against its own egress policy. Any denial
+    // returns before provider contact.
     let model_metadata_path = matches!(uri.path(), "/v1/models" | "/models")
         || uri.path().starts_with("/v1/models/")
         || uri.path().starts_with("/models/");
     let model_metadata_request =
         matches!(method, Method::GET | Method::HEAD) && model_metadata_path && body.is_empty();
-    let capability_requirements_json = capability_surface
+    if let Err(rejection) = capability_surface
         .map(|surface| match surface {
             CapabilityRequestSurface::Responses => {
                 CapabilityRequirements::from_responses_body(&body)
@@ -485,37 +466,18 @@ pub(super) async fn proxy_gateway_inner_scoped(
                 "invalid_request_error",
                 format!("cannot derive request capabilities: {reason}"),
             )
-        });
-    let capability_requirements_json = match capability_requirements_json {
-        Ok(requirements) => requirements
-            .as_ref()
-            .map(|requirements| {
-                serde_json::to_vec(requirements).expect("capability requirements are serializable")
-            })
-            .unwrap_or_default(),
-        Err(rejection) => {
-            record_refusal_and_append(
-                &state.config,
-                &state.runtime,
-                &identity,
-                &preflight_context,
-                &rejection,
-            )
-            .await;
-            return rejection.response();
-        }
-    };
-    let preferred_runtime = requested_registry_model
-        .as_ref()
-        .map(|model| model.provider.as_str())
-        .unwrap_or_else(|| capability_provider_id(requested_provider));
-    let preferred_model = requested_registry_model
-        .as_ref()
-        .map(|model| model.canonical_model.as_str())
-        .or(requested_model.as_deref())
-        .unwrap_or("");
-    // Policy mode admits against the gateway's own policy; otherwise the
-    // control plane decides.
+        })
+    {
+        record_refusal_and_append(
+            &state.config,
+            &state.runtime,
+            &identity,
+            &preflight_context,
+            &rejection,
+        )
+        .await;
+        return rejection.response();
+    }
     let decided = match &state.runtime.policy {
         Some(policy) => policy_preflight(
             policy,
@@ -529,41 +491,11 @@ pub(super) async fn proxy_gateway_inner_scoped(
             model_metadata_request,
             &caller_data_class,
         ),
-        None => match gateway_decision_preflight(
-            &state.config,
-            &state.runtime,
-            &identity,
-            preferred_runtime,
-            preferred_model,
-            request_bytes,
-            work_unit_id.as_deref().unwrap_or(""),
-            &task_class,
-            &request_id,
-            route_override.as_deref(),
-            capability_requirements_json,
-            model_metadata_request,
-            &pipeline_spec,
-        )
-        .await
-        {
-            Ok(gateway_admit) => {
-                apply_gateway_decision(
-                    &state.config,
-                    &state.runtime,
-                    &identity,
-                    &mut preflight_context,
-                    &registry_snapshot,
-                    gateway_admit,
-                    body.to_vec(),
-                    requested_provider,
-                    client_provider,
-                    capability_surface,
-                    requested_model.as_deref(),
-                )
-                .await
-            }
-            Err(rejection) => Err(rejection),
-        },
+        None => Err(GatewayRejection::json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "policy_unavailable",
+            "the gateway has no valid egress policy",
+        )),
     };
     let (mut resolved, mut egress, budget) = match decided {
         Ok(triple) => triple,
@@ -777,10 +709,9 @@ pub(super) async fn proxy_gateway_inner_scoped(
 
     // Atomically bind the opaque alias and claim its one provider dispatch only
     // after every fallible pre-dispatch step has completed.
-    // Policy mode has no control plane to claim the alias with; a request id
-    // is not deduplicated there. It records the admission in its own log
-    // instead, and a request it cannot record never reaches the provider.
-    let dispatch_token = uuid::Uuid::new_v4().to_string();
+    // A request id is not deduplicated on a control plane. Policy mode records
+    // the admission in its own log instead, and a request it cannot record
+    // never reaches the provider.
     let logged_admission = state.runtime.egress_log.is_some();
     if let Some(log) = &state.runtime.egress_log {
         let admission = LogEntry::Admission {
@@ -810,13 +741,6 @@ pub(super) async fn proxy_gateway_inner_scoped(
             return rejection.response();
         }
     }
-    if state.runtime.policy.is_none()
-        && let Err(error) =
-            claim_gateway_dispatch(&state.config, &alias_context, &dispatch_token).await
-    {
-        return alias_reservation_error_response(error);
-    }
-
     let mut tried_provider_ids: Vec<String> =
         vec![capability_provider_id(resolved.resolved_provider).into()];
     let mut provider_attempt: u32 = 1;

@@ -293,14 +293,6 @@ pub trait BudgetSekaiDbExt {
         scope_id: &str,
         now_ms: i64,
     ) -> Result<Vec<BudgetScopeUsage>, String>;
-    #[cfg(feature = "gateway-test-support")]
-    #[doc(hidden)]
-    fn gateway_test_budget_usage(
-        &self,
-        scope_id: &str,
-        metric: &str,
-        now_ms: i64,
-    ) -> Result<(i64, i64, String), String>;
     /// Worst pressure level among scopes whose id starts with `namespace`
     /// (matches the pre-hierarchy prefix-scan semantics of
     /// `BudgetTracker::namespace_pressure`, now backed by SQL `LIKE`).
@@ -1105,17 +1097,6 @@ impl BudgetSekaiDbExt for SekaiDb {
         }
         transaction.commit().map_err(|e| e.to_string())?;
         Ok(levels)
-    }
-
-    #[cfg(feature = "gateway-test-support")]
-    #[doc(hidden)]
-    fn gateway_test_budget_usage(
-        &self,
-        scope_id: &str,
-        metric: &str,
-        now_ms: i64,
-    ) -> Result<(i64, i64, String), String> {
-        self.budget_usage(scope_id, metric, now_ms)
     }
 
     /// Worst pressure level among scopes whose id starts with `namespace`

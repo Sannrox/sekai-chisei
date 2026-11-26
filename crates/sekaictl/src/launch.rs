@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use chisei_provider::gateway_keys::default_virtual_key;
 use sekai_admin_client::gateway_setup::{GatewaySetupConfig, run_setup};
+use sekai_domain::gateway_keys::hash_gateway_key;
+use serde_json::json;
 
 const SERVER_BIN: &str = "sekai-chisei";
 const GATEWAY_BIN: &str = "chisei-gateway";
@@ -532,10 +534,74 @@ fn namespace_default(launched: AgentKind, launched_model: &str) -> (String, Stri
     (AgentKind::OpenAi.provider().to_string(), model)
 }
 
+/// Policy file `sekaictl launch` writes for the local gateway.
+const LAUNCH_POLICY_PATH: &str = "./data/chisei-gateway-policy.json";
+
+/// Writes a gateway-owned egress policy covering every launched app agent
+/// (and a `--no-app` agent name). The SHA-256 of each `default_virtual_key`
+/// is the policy key; loopback passthrough still identifies by `x-chisei-agent`
+/// when that name is a principal here.
+fn write_launch_policy(
+    config: &LaunchConfig,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut names: Vec<String> = ALL_KINDS
+        .iter()
+        .map(|kind| kind.agent_name().to_string())
+        .collect();
+    if !names.iter().any(|name| name == &config.agent) {
+        names.push(config.agent.clone());
+    }
+    let providers = ["openai", "anthropic", "ollama"];
+    let routes: Vec<serde_json::Value> = providers
+        .iter()
+        .map(|provider| json!({"provider": provider, "models": ["*"]}))
+        .collect();
+    let principals: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| {
+            json!({
+                "name": name,
+                "project": config.project,
+                "key_sha256": [hash_gateway_key(&default_virtual_key(name))],
+                "routes": routes,
+            })
+        })
+        .collect();
+    let egress: Vec<serde_json::Value> = providers
+        .iter()
+        .map(|provider| {
+            json!({
+                "provider": provider,
+                "data_classes": ["unknown", "public", "internal"],
+            })
+        })
+        .collect();
+    let generation = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_str::<serde_json::Value>(&bytes).ok())
+        .and_then(|file| file.get("generation")?.as_u64())
+        .unwrap_or(0)
+        .saturating_add(1);
+    let policy = json!({
+        "format": "chisei.gateway-policy/v1",
+        "generation": generation,
+        "principals": principals,
+        "egress": egress,
+    });
+    std::fs::write(path, serde_json::to_vec_pretty(&policy)?)?;
+    Ok(())
+}
+
 async fn ensure_gateway(
     config: &LaunchConfig,
-    auth_token: &str,
+    _auth_token: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let policy_path = PathBuf::from(LAUNCH_POLICY_PATH);
+    write_launch_policy(config, &policy_path)?;
     let addr = connect_addr(&config.gateway_bind);
     if tcp_ready(&addr).await {
         println!("chisei-gateway already running at {addr}");
@@ -546,9 +612,11 @@ async fn ensure_gateway(
     }
 
     let mut envs = vec![
-        ("SEKAI_SOCKET".to_string(), config.socket.clone()),
         ("GATEWAY_BIND".to_string(), config.gateway_bind.clone()),
-        ("SEKAI_CREDENTIAL".to_string(), auth_token.to_string()),
+        (
+            "CHISEI_GATEWAY_POLICY_PATH".to_string(),
+            policy_path.display().to_string(),
+        ),
     ];
 
     // The gateway routes upstream by resolved model, so one process fronts every
@@ -1403,6 +1471,34 @@ mod tests {
         // Operator base set: respected (not overridden).
         let env = openai_gateway_env(false, Some("https://my.internal/v1"));
         assert_eq!(get(&env, "CHISEI_OPENAI_BASE_URL"), None);
+    }
+
+    #[test]
+    fn launch_policy_hashes_virtual_keys_for_every_app_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.json");
+        let config = LaunchConfig::from_env_and_args(["codex-app".to_string()]).unwrap();
+        write_launch_policy(&config, &path).unwrap();
+        let policy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(policy["format"], "chisei.gateway-policy/v1");
+        assert_eq!(policy["generation"], 1);
+        let names: Vec<&str> = policy["principals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|principal| principal["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["codex-app", "claude-code"]);
+        let codex = &policy["principals"][0];
+        assert_eq!(
+            codex["key_sha256"][0],
+            hash_gateway_key(&default_virtual_key("codex-app"))
+        );
+        write_launch_policy(&config, &path).unwrap();
+        let reloaded: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(reloaded["generation"], 2);
     }
 
     #[test]

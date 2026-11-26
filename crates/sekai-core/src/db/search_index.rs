@@ -853,7 +853,6 @@ impl SekaiDb {
         })
     }
 
-    #[cfg(any(test, feature = "gateway-test-support"))]
     pub fn purge_object_changes_for_test(&self) -> Result<(), String> {
         self.conn()
             .execute("DELETE FROM sekai_object_changes", [])
@@ -861,7 +860,6 @@ impl SekaiDb {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "gateway-test-support"))]
     pub fn purge_object_changes_for_object_for_test(&self, object_id: &str) -> Result<(), String> {
         self.conn()
             .execute(
@@ -1359,9 +1357,7 @@ pub trait SearchIndexStore {
         now_ms: i64,
     ) -> Result<SearchCatchUpReport, SearchIndexError>;
     fn search_index_dump(&self, namespace: &str) -> Result<SearchIndexDump, SearchIndexError>;
-    #[cfg(any(test, feature = "gateway-test-support"))]
     fn purge_object_changes_for_test(&self) -> Result<(), SearchIndexError>;
-    #[cfg(any(test, feature = "gateway-test-support"))]
     fn purge_object_changes_for_object_for_test(
         &self,
         object_id: &str,
@@ -1394,7 +1390,6 @@ impl SearchIndexStore for RuntimeDb {
         }
     }
 
-    #[cfg(any(test, feature = "gateway-test-support"))]
     fn purge_object_changes_for_test(&self) -> Result<(), SearchIndexError> {
         match self {
             Self::Sqlite(db) => db
@@ -1407,7 +1402,6 @@ impl SearchIndexStore for RuntimeDb {
         }
     }
 
-    #[cfg(any(test, feature = "gateway-test-support"))]
     fn purge_object_changes_for_object_for_test(
         &self,
         object_id: &str,

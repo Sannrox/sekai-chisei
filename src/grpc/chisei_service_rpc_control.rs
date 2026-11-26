@@ -189,21 +189,6 @@ pub(super) async fn set_external_action_policy(
         )),
     }
 }
-pub(super) async fn decide_gateway_execution(
-    service: &ChiseiServiceImpl,
-    req: Request<DecideGatewayExecutionRequest>,
-) -> Result<Response<DecideGatewayExecutionResponse>, Status> {
-    let actor = required_authenticated_actor(&req)?;
-    let delegated_principal = req
-        .metadata()
-        .get(DELEGATED_PRINCIPAL_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let response = service
-        .decide_from_authenticated_request(actor, delegated_principal, req.into_inner())
-        .await?;
-    Ok(Response::new(response))
-}
 pub(super) async fn record_usage(
     service: &ChiseiServiceImpl,
     req: Request<RecordUsageRequest>,

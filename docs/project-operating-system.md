@@ -117,7 +117,7 @@ creating a second project-management tree.
 | `crates/chisei-core/` | Chisei maintainers | Policy, budget, routing, approval, evaluation, learning, and Chisei persistence. |
 | `src/composition/` | Both-plane maintainers | Code that needs both stores (ADR 0092). |
 | `crates/chisei-provider/` | Provider maintainers | Chisei provider registry, provider-specific execution, pricing, and routing. |
-| `crates/chisei-gateway/` | Gateway maintainers | Compatible HTTP egress proxy, setup/report clients, and gateway-local observability. |
+| `crates/chisei-gateway/` | Gateway maintainers | Compatible HTTP egress proxy, gateway-owned policy, and gateway-local observability. |
 | `src/grpc/`, `proto/` | API maintainers | Transport implementations and public native contracts. |
 | `adapters/` | Integration owners | Domain-neutral external evidence adapters; not core ontology. |
 | `examples/` | Feature authors | Runnable paths that prove and teach supported integration behavior. |
