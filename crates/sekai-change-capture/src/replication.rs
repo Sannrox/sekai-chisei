@@ -196,11 +196,15 @@ struct Open {
 }
 
 impl Decoder {
-    /// A decoder for a stream that resumes after `confirmed_lsn`: a
-    /// transaction committing at or before it is refused as out of order.
+    /// A decoder for a stream that resumes after `confirmed_lsn`, the end
+    /// of the last transaction already read: a transaction committing
+    /// before it is refused as out of order. One committing exactly there
+    /// is new, since the next commit record can start where the last one
+    /// ended.
     pub fn resuming_after(confirmed_lsn: u64) -> Self {
         Self {
-            last_commit_lsn: Some(confirmed_lsn),
+            // `begin` refuses a commit at or before the last one decoded.
+            last_commit_lsn: confirmed_lsn.checked_sub(1),
             ..Self::default()
         }
     }

@@ -246,10 +246,11 @@ impl Runtime {
                     offset,
                     cursor,
                 } => {
-                    let reading_epoch = epoch.clone();
+                    let (reading_epoch, after) = (epoch.clone(), cursor.clone());
                     let page = blocking(move || {
                         connectors.read_changes(
                             &reading,
+                            &after,
                             &reading_epoch,
                             offset,
                             MAX_SOURCE_BATCH_RECORDS,

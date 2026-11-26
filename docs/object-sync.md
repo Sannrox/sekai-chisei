@@ -378,20 +378,36 @@ An object with no rows is fetched again on every pass. `check` proves the
 endpoint answers, the key pair signs and the prefix can be listed, and reports
 `auth_failed`, `permission_missing`, `unreachable` or `invalid`.
 
-A `postgres_capture` Source (#3083, ADR 0170) captures row changes of the
-tables in one PostgreSQL publication. Its configuration names the `endpoint`,
-`database`, `user`, the Source's one replication `slot` and `publication`, and
-`type_digest`; the credential slot is `password`. It syncs as an ordered feed
-(ADR 0023): `sekai.source-batch/v2` snapshot pages of generation 1, whose last
-page names the feed epoch and the barrier offset, then change pages whose
-records carry contiguous `source_sequence` values after the plane's committed
-offset. The source's log position stays in the opaque cursor (ADR 0118). Each
-sync starts from the plane's state, so a runtime that dies resumes from the
-last committed page. A change page that does not start at the committed
-offset, skips a sequence, or is empty without being caught up fails the sync
-as `invalid` and commits nothing. A generation in recovery starts the next
-generation's snapshot. No runtime offers the type yet: the capture child and
-its sandbox self-test gate it, Linux only.
+A `postgres_capture` Source (#3083, ADR 0170) captures row changes of the one
+table in a PostgreSQL publication, on PostgreSQL 15 or newer. Its configuration
+names the `endpoint`, `database`, `user`, the Source's one replication `slot`
+and `publication`, the `record_kind` and `type_digest`; the credential slot is
+`password`. It syncs as an ordered feed (ADR 0023): `sekai.source-batch/v2`
+snapshot pages of generation 1, whose last page names the feed epoch and the
+barrier offset, then change pages whose records carry contiguous
+`source_sequence` values after the plane's committed offset. The source's log
+position stays in the opaque cursor (ADR 0118). Each sync starts from the
+plane's state, so a runtime that dies resumes from the last committed page. A
+change page that does not start at the committed offset, skips a sequence, or
+is empty without being caught up fails the sync as `invalid` and commits
+nothing. A generation in recovery starts the next generation's snapshot.
+
+Each change page runs one sandboxed capture child over a connection the
+runtime dialed after the egress check. A record's `external_id` is its
+replica-identity key values in column-name order, percent-encoded and joined
+by `~`; its properties are the row's non-null text values. A delete is a
+tombstone, and an update that changes the key is a tombstone of the old key
+plus the row under the new one. A transaction larger than a page is delivered
+across pages, and each page reads it again from the last whole transaction.
+A child that dies, overruns, or finds the slot still held is restarted with
+backoff three times, then the sync fails as `unavailable`; a host whose
+sandbox cannot apply fails `unavailable` at once. A refused password is
+`auth_failed`, a role without replication permission `permission_missing`, and
+every other refusal `invalid`: an unverified certificate, a publication
+without exactly one table, a truncate, an update that leaves a large value out
+of the stream, and a slot that is missing or confirmed past the cursor once
+the feed runs. No runtime offers the type yet: its snapshot, the capture child
+and its sandbox self-test gate it, Linux only.
 
 The GitHub object-sync profile admits exactly one code-owned type revision:
 

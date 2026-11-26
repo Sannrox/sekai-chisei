@@ -6,10 +6,13 @@
 //!   SCRAM-SHA-256 only, so the credential never crosses in the clear or as
 //!   a weak hash.
 //! - [`check`] names what the database lacks for capture before any data is
-//!   read: logical write-ahead logging, a role with replication permission,
-//!   the Source's publication.
+//!   read: version 15 or newer (older servers stream empty transactions),
+//!   logical write-ahead logging, a role with replication permission, and
+//!   the Source's publication of exactly one table.
 //! - [`changes`] reads one bounded page: it creates the Source's slot when
-//!   it is missing, streams from the position the plane committed, and
+//!   it is missing and nothing is committed yet (`resume_lsn` 0), refuses a
+//!   slot that is missing later or already confirmed past the committed
+//!   position, streams from the position the plane committed, and
 //!   writes [`Line`]s until it has `max_commits` transactions or the stream
 //!   is idle outside a transaction. It confirms to the server only the
 //!   position it started from, so the slot never releases log the plane has
@@ -42,6 +45,11 @@ pub const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the stream may be silent outside a transaction before a page
 /// counts as caught up.
 pub const IDLE: Duration = Duration::from_secs(2);
+
+/// The oldest server (`server_version_num`) captured from. Older servers
+/// stream empty transactions, which would stall a feed whose position
+/// moves only with a record.
+const MIN_SERVER_VERSION: u32 = 150_000;
 
 /// The longest slot or publication name the server accepts.
 const MAX_NAME_BYTES: usize = 63;
@@ -144,6 +152,13 @@ pub fn connect(socket: TcpStream, settings: &Settings, password: &str) -> Result
 /// Refuses a database that cannot capture, naming what it lacks. A role
 /// without REPLICATION never gets here: `connect` is refused at startup.
 pub fn check(session: &mut Session, settings: &Settings) -> Result<(), Refusal> {
+    let version = session.single("SHOW server_version_num")?;
+    if !version
+        .and_then(|version| version.parse::<u32>().ok())
+        .is_some_and(|version| version >= MIN_SERVER_VERSION)
+    {
+        return Err(Refusal("server_version_unsupported"));
+    }
     let level = session.single("SHOW wal_level")?;
     if level.as_deref() != Some("logical") {
         return Err(Refusal("wal_level_not_logical"));
@@ -154,6 +169,14 @@ pub fn check(session: &mut Session, settings: &Settings) -> Result<(), Refusal> 
     ))?;
     if publication.is_empty() {
         return Err(Refusal("publication_missing"));
+    }
+    // A Source is one record kind, so its publication carries one table.
+    let tables = session.single(&format!(
+        "SELECT count(*) FROM pg_catalog.pg_publication_tables WHERE pubname = '{}'",
+        settings.publication
+    ))?;
+    if tables.as_deref() != Some("1") {
+        return Err(Refusal("publication_not_one_table"));
     }
     Ok(())
 }
@@ -168,10 +191,21 @@ pub fn changes(
         return Err(Refusal("invalid_config"));
     }
     check(session, settings)?;
-    if let Some(consistent_lsn) = session.ensure_slot(settings)? {
-        emit(out, &Line::SlotCreated { consistent_lsn })?;
-    }
     let start = settings.resume_lsn;
+    match session.slot(settings)? {
+        // Nothing committed yet: the stream starts where the new slot does.
+        None if start == 0 => {
+            let consistent_lsn = session.create_slot(settings)?;
+            emit(out, &Line::SlotCreated { consistent_lsn })?;
+        }
+        // A slot that vanished, or one confirmed past the committed
+        // position, would skip changes the plane never received.
+        None => return Err(Refusal("slot_missing")),
+        Some(confirmed) if start != 0 && confirmed > start => {
+            return Err(Refusal("slot_ahead"));
+        }
+        Some(_) => {}
+    }
     session.start_replication(settings, start)?;
     session.status(start)?;
     session.stream_timeout(Some(IDLE))?;
@@ -342,21 +376,28 @@ impl Session {
         }
     }
 
-    /// Creates the Source's slot when it is missing and returns the
-    /// position it starts at; an existing slot must decode this database
-    /// with the built-in plugin.
-    fn ensure_slot(&mut self, settings: &Settings) -> Result<Option<u64>, Refusal> {
+    /// The position the Source's slot has confirmed, or `None` when it is
+    /// missing. An existing slot must decode this database with the
+    /// built-in plugin.
+    fn slot(&mut self, settings: &Settings) -> Result<Option<u64>, Refusal> {
         let existing = self.query(&format!(
-            "SELECT plugin, database = current_database() FROM pg_catalog.pg_replication_slots \
-             WHERE slot_name = '{}'",
+            "SELECT plugin, database = current_database(), confirmed_flush_lsn \
+             FROM pg_catalog.pg_replication_slots WHERE slot_name = '{}'",
             settings.slot
         ))?;
-        if let Some(row) = existing.first() {
-            return match row.as_slice() {
-                [Some(plugin), Some(same)] if plugin == "pgoutput" && same == "t" => Ok(None),
-                _ => Err(Refusal("slot_mismatch")),
-            };
+        let Some(row) = existing.first() else {
+            return Ok(None);
+        };
+        match row.as_slice() {
+            [Some(plugin), Some(same), Some(confirmed)] if plugin == "pgoutput" && same == "t" => {
+                parse_lsn(confirmed).map(Some)
+            }
+            _ => Err(Refusal("slot_mismatch")),
         }
+    }
+
+    /// Creates the Source's slot and returns the position it starts at.
+    fn create_slot(&mut self, settings: &Settings) -> Result<u64, Refusal> {
         let created = self
             .try_query(&format!(
                 "CREATE_REPLICATION_SLOT {} LOGICAL pgoutput NOEXPORT_SNAPSHOT",
@@ -373,7 +414,7 @@ impl Session {
             .cloned()
             .flatten()
             .ok_or(Refusal("protocol_violation"))?;
-        parse_lsn(&consistent).map(Some)
+        parse_lsn(&consistent)
     }
 
     fn start_replication(&mut self, settings: &Settings, start: u64) -> Result<(), Refusal> {

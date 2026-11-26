@@ -307,11 +307,12 @@ pub const OBJECT_STORAGE_CONNECTOR: ConnectorType = ConnectorType {
     }],
 };
 
-/// Row changes of the tables in one PostgreSQL publication, captured from
-/// the write-ahead log by a sandboxed child (ADR 0170). `slot` and
-/// `publication` name the Source's one replication slot and publication;
-/// a missing slot is created. The type syncs as an ordered feed: a
-/// snapshot, then change pages after the plane-owned offset.
+/// Row changes of the one table in a PostgreSQL publication, captured
+/// from the write-ahead log by a sandboxed child (ADR 0170), as records of
+/// `record_kind`. `slot` and `publication` name the Source's one
+/// replication slot and publication; a missing slot is created. The type
+/// syncs as an ordered feed: a snapshot, then change pages after the
+/// plane-owned offset.
 pub const POSTGRES_CAPTURE_CONNECTOR: ConnectorType = ConnectorType {
     name: "postgres_capture",
     version: "1",
@@ -323,6 +324,7 @@ pub const POSTGRES_CAPTURE_CONNECTOR: ConnectorType = ConnectorType {
         field("user", ConfigFieldKind::Text, true),
         field("slot", ConfigFieldKind::Text, true),
         field("publication", ConfigFieldKind::Text, true),
+        field("record_kind", ConfigFieldKind::Text, true),
         field("type_digest", ConfigFieldKind::Text, true),
     ],
     credential_slots: &[CredentialSlot {
@@ -675,6 +677,9 @@ pub enum ConnectorFailure {
     Conflict,
     /// The remote system returned something the type cannot use.
     Invalid,
+    /// This host cannot run the operation as it stands, such as a
+    /// change-capture child whose sandbox cannot apply or that keeps dying.
+    Unavailable,
 }
 
 impl std::fmt::Display for ConnectorFailure {
@@ -686,6 +691,7 @@ impl std::fmt::Display for ConnectorFailure {
             Self::PermissionMissing => "source credentials lack a required permission",
             Self::Conflict => "source record changed; nothing was written",
             Self::Invalid => "source returned an unusable response",
+            Self::Unavailable => "the runtime cannot run the operation on this host",
         })
     }
 }
@@ -845,6 +851,20 @@ pub trait Connector {
         _max_records: usize,
     ) -> Result<ChangeFeedPage, ConnectorFailure> {
         Err(ConnectorFailure::Unsupported)
+    }
+
+    /// [`Connector::read_changes`] with the plane's committed cursor, for a
+    /// type whose source position lives in it (ADR 0118), such as a log
+    /// position. The runtime calls this one; the default ignores the
+    /// cursor.
+    fn read_changes_from(
+        &mut self,
+        _committed_cursor: &str,
+        source_feed_epoch: &str,
+        committed_offset: u64,
+        max_records: usize,
+    ) -> Result<ChangeFeedPage, ConnectorFailure> {
+        self.read_changes(source_feed_epoch, committed_offset, max_records)
     }
 
     fn deliver(&mut self, _artifact: &ExportArtifact<'_>) -> Result<(), ConnectorFailure> {

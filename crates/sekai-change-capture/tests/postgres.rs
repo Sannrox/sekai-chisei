@@ -77,18 +77,23 @@ impl Server {
     /// One `changes` page; retried while the previous page's session still
     /// holds the slot on the server.
     fn page(&self, settings: &Settings) -> Vec<Line> {
+        self.try_page(settings).unwrap()
+    }
+
+    /// [`Server::page`], keeping a refusal for the caller.
+    fn try_page(&self, settings: &Settings) -> Result<Vec<Line>, Refusal> {
         for _ in 0..50 {
             let mut out = Vec::new();
             let mut session = self.session(settings, &self.password()).unwrap();
             match pg::changes(&mut session, settings, &mut out) {
                 Err(Refusal("slot_in_use")) => std::thread::sleep(Duration::from_millis(100)),
                 result => {
-                    result.unwrap();
-                    return String::from_utf8(out)
+                    result?;
+                    return Ok(String::from_utf8(out)
                         .unwrap()
                         .lines()
                         .map(|line| Line::parse(line).unwrap())
-                        .collect();
+                        .collect());
                 }
             }
         }
@@ -146,7 +151,9 @@ fn test_password() -> String {
 #[ignore = "requires SEKAI_TEST_POSTGRES_URL with wal_level=logical; run through scripts/postgres-conformance.sh"]
 fn postgres_check_names_what_the_database_lacks_before_reading_data() {
     let server = Server::from_env();
+    let table = unique("cc_check_items");
     let publication = unique("cc_check_pub");
+    let empty = unique("cc_check_empty");
     let role = unique("cc_check_role");
     let role_password = test_password();
     // The server stores only the SCRAM verifier, never the password itself.
@@ -154,7 +161,9 @@ fn postgres_check_names_what_the_database_lacks_before_reading_data() {
     let mut admin = server.admin();
     admin
         .batch_execute(&format!(
-            "CREATE PUBLICATION {publication}; \
+            "CREATE TABLE {table} (id int PRIMARY KEY); \
+             CREATE PUBLICATION {publication} FOR TABLE {table}; \
+             CREATE PUBLICATION {empty}; \
              CREATE ROLE {role} LOGIN PASSWORD '{verifier}'"
         ))
         .unwrap();
@@ -165,6 +174,10 @@ fn postgres_check_names_what_the_database_lacks_before_reading_data() {
 
     let ready = server.settings("cc_unused", &publication);
     assert_eq!(check(&ready, &server.password()), Ok(()));
+    assert_eq!(
+        check(&server.settings("cc_unused", &empty), &server.password()),
+        Err(Refusal("publication_not_one_table"))
+    );
     assert_eq!(
         check(
             &server.settings("cc_unused", "cc_no_such_pub"),
@@ -198,7 +211,10 @@ fn postgres_check_names_what_the_database_lacks_before_reading_data() {
     ));
 
     admin
-        .batch_execute(&format!("DROP PUBLICATION {publication}; DROP ROLE {role}"))
+        .batch_execute(&format!(
+            "DROP PUBLICATION {publication}; DROP PUBLICATION {empty}; \
+             DROP TABLE {table}; DROP ROLE {role}"
+        ))
         .unwrap();
 }
 
@@ -277,6 +293,15 @@ fn postgres_changes_page_through_committed_transactions_once() {
         "{rest:?}"
     );
 
+    // The slot now confirms `last_end`: resuming before it would skip the
+    // update, and a slot gone after the first commit is never re-created.
+    settings.resume_lsn = *end_lsn;
+    assert_eq!(server.try_page(&settings), Err(Refusal("slot_ahead")));
+    let mut vanished = settings.clone();
+    vanished.slot = unique("cc_gone");
+    vanished.resume_lsn = *last_end;
+    assert_eq!(server.try_page(&vanished), Err(Refusal("slot_missing")));
+
     server.drop_slot(&slot);
     admin
         .batch_execute(&format!(
@@ -298,10 +323,14 @@ fn postgres_check_runs_in_the_sandboxed_child_on_the_inherited_socket() {
     use std::process::{Command, Stdio};
 
     let server = Server::from_env();
+    let table = unique("cc_child_items");
     let publication = unique("cc_child_pub");
     let mut admin = server.admin();
     admin
-        .batch_execute(&format!("CREATE PUBLICATION {publication}"))
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (id int PRIMARY KEY); \
+             CREATE PUBLICATION {publication} FOR TABLE {table}"
+        ))
         .unwrap();
     let child = env!("CARGO_BIN_EXE_sekai-change-capture");
     let run = |publication: &str| {
@@ -357,6 +386,8 @@ fn postgres_check_runs_in_the_sandboxed_child_on_the_inherited_socket() {
     );
 
     admin
-        .batch_execute(&format!("DROP PUBLICATION {publication}"))
+        .batch_execute(&format!(
+            "DROP PUBLICATION {publication}; DROP TABLE {table}"
+        ))
         .unwrap();
 }

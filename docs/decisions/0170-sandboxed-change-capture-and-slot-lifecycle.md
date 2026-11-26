@@ -81,6 +81,18 @@ it or names another. The refusal lives with the first-sync logic, which
 knows whether a sync has completed; the change-capture child alone does
 not.
 
+## Clarification (2026-11-26): the slot once the feed runs
+
+Point 7's "a missing one is created" holds only while nothing is
+committed. Once the plane holds a feed position, the child refuses a
+missing slot as `slot_missing` rather than creating one that starts later,
+and refuses a slot confirmed past the committed position as `slot_ahead`.
+Either would skip changes the plane never received. The child confirms only
+the committed position, so neither happens while the runtime alone drives
+the slot. A Source's publication carries exactly one table, its record
+kind, on PostgreSQL 15 or newer, so every streamed transaction carries a
+record and the feed position always moves with a committed page.
+
 ## Consequences
 
 - The sandbox's dependencies live only in the child crate; the runtime

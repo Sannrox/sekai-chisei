@@ -3,13 +3,14 @@
 //!
 //! The runtime bounds every child from outside: an empty environment, its
 //! own process group, a wall-time limit after which the child and every
-//! process it started are killed, and a cap on the bytes it may write. Its
-//! input is written once to stdin, which is then closed; stderr is
-//! discarded.
+//! process it started are killed, and a cap on the bytes it may write
+//! (for a streamed child, its reader's). Its input is written once to
+//! stdin, which is then closed; stderr is discarded.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// The outer bounds of one child run.
@@ -43,25 +44,88 @@ pub(crate) fn beside_runtime(name: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// Runs `command` once with `input` on stdin, under `bounds`. The command's
-/// environment is cleared and its stdio replaced here.
-pub(crate) fn run_bounded(
-    mut command: Command,
-    input: &[u8],
-    bounds: Bounds,
-) -> Result<Finished, ChildError> {
+/// A streamed child's end: its own exit, or `None` when the reader was
+/// done first and the child was killed, and what the reader returned.
+#[derive(Debug)]
+pub(crate) struct Streamed<T> {
+    pub(crate) status: Option<ExitStatus>,
+    pub(crate) read: T,
+}
+
+/// Starts `command` with a cleared environment, piped stdin and stdout,
+/// stderr discarded, in its own process group.
+fn spawn(mut command: Command) -> Result<(Child, ChildStdin, ChildStdout), ChildError> {
     command
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     // Its own process group, so a deadline kill reaches anything it
-    // started too; one left holding stdout would stall the read below.
+    // started too; one left holding stdout would stall the reader.
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.spawn().map_err(|_| ChildError::Spawn)?;
-    let mut stdin = child.stdin.take().ok_or(ChildError::Spawn)?;
-    let mut stdout = child.stdout.take().ok_or(ChildError::Spawn)?;
+    let stdin = child.stdin.take().ok_or(ChildError::Spawn)?;
+    let stdout = child.stdout.take().ok_or(ChildError::Spawn)?;
+    Ok((child, stdin, stdout))
+}
+
+/// Runs `command` once with `input` on stdin, handing its stdout to `read`
+/// as it arrives. When `read` returns while the child still runs, the
+/// child is killed: the reader has what it needs. Past `timeout` the child
+/// is killed and the run overran. `read` bounds what it buffers itself.
+pub(crate) fn run_streaming<T: Send>(
+    command: Command,
+    input: &[u8],
+    timeout: Duration,
+    read: impl FnOnce(&mut dyn BufRead) -> T + Send,
+) -> Result<Streamed<T>, ChildError> {
+    let (mut child, mut stdin, stdout) = spawn(command)?;
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let _ = stdin.write_all(input);
+        });
+        let reader = scope.spawn(|| {
+            let read = read(&mut BufReader::new(stdout));
+            done.store(true, Ordering::SeqCst);
+            read
+        });
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(Some(status)),
+                Ok(None) if done.load(Ordering::SeqCst) => {
+                    kill_group(&mut child);
+                    let _ = child.wait();
+                    break Ok(None);
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => {
+                    kill_group(&mut child);
+                    let _ = child.wait();
+                    break Err(ChildError::Overran);
+                }
+            }
+        };
+        let read = reader.join().map_err(|_| ChildError::Overran)?;
+        Ok(Streamed {
+            status: status?,
+            read,
+        })
+    })
+}
+
+/// Runs `command` once with `input` on stdin, under `bounds`. The command's
+/// environment is cleared and its stdio replaced here.
+pub(crate) fn run_bounded(
+    command: Command,
+    input: &[u8],
+    bounds: Bounds,
+) -> Result<Finished, ChildError> {
+    let (mut child, mut stdin, mut stdout) = spawn(command)?;
     // Feed and drain on their own threads so neither pipe can stall the
     // other. A child that stops reading early just closes its stdin.
     std::thread::scope(|scope| {
