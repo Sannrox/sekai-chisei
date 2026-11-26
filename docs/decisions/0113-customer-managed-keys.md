@@ -96,8 +96,8 @@ refused.
 
 ### Conformance
 
-`sekai-keys` is the shared contract crate. Every store adapter runs
-`sekai_keys::conformance::assert_provider_contract`: a revoked key yields no
+`envelope-keys` is the shared contract crate. Every store adapter runs
+`envelope_keys::conformance::assert_provider_contract`: a revoked key yields no
 reads, KEK rotation loses no plaintext, and Debug/audit contain no plaintext
 key.
 
@@ -117,7 +117,16 @@ record does not encrypt existing community data.
 
 ## Validation
 
-`sekai-keys` unit and conformance tests cover wrap/unwrap, grant mismatch,
+`envelope-keys` unit and conformance tests cover wrap/unwrap, grant mismatch,
 revocation, KEK rewrap without data rewrite, production refusal of file and
 memory providers, and redacted Debug. Per-store slices add their own
 compaction and rewrite evidence.
+
+## Amendment: retire `sekai-keys` (#3526)
+
+The contract crate is `envelope-keys` 1.0.0, extracted unchanged apart from
+the name from `crates/sekai-keys` at `ad7d08f4` and published from
+[Sannrox/envelope-keys](https://github.com/Sannrox/envelope-keys). This
+workspace no longer carries an in-tree copy or a git patch for `sekai-keys`.
+mikura resolves `envelope-keys` from crates.io. Existing pins of an older
+revision of this repository keep building from that revision.
