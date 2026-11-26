@@ -1,5 +1,6 @@
-//! The `postgres_capture` connector type (ADR 0170): `check` and ordered
-//! change pages through the sandboxed change-capture child of [`capture`].
+//! The `postgres_capture` connector type (ADR 0170): `check`, snapshot
+//! pages and ordered change pages through the sandboxed change-capture
+//! child of [`capture`].
 //!
 //! Every operation dials the Source's `endpoint` after the egress check
 //! ([`capture::connect_admitted`]) and starts one child over that socket,
@@ -8,7 +9,19 @@
 //! lines; this module turns them into records of the Source's
 //! `record_kind`, numbered from the plane's committed offset.
 //!
-//! The source position lives only in the plane's cursor (ADR 0118):
+//! The snapshot is read after the slot's position `P` (ADR 0170, option B
+//! of #3083): the first page makes sure the slot exists and takes its
+//! confirmed position, and each page reads the next rows in key order in a
+//! fresh child. Its cursor is `pg1s/<P>/<last key>`, the key in the
+//! `external_id` encoding below, so it never contains `/`. The last page
+//! hands off as `pg1/<P>` at offset 0, and the feed replays every change
+//! committed after `P`. Rows read after `P` are keyed upserts the feed
+//! brings to the latest value, so the plane ends in the source's state; a
+//! row can briefly show an older value again during the hand-off. An empty
+//! table is refused as `table_empty` and fails the run `unavailable`, so
+//! the next sync tries again.
+//!
+//! The feed position lives only in the plane's cursor (ADR 0118):
 //! `pg1/<lsn>` is the end of the last transaction the plane holds whole,
 //! and `pg1/<lsn>/<commit>/<index>` adds that it also holds the changes
 //! before `index` of the transaction committing at `commit`, when a
@@ -37,7 +50,8 @@
 //! password is `auth_failed`, a role without replication permission
 //! `permission_missing`, and every other refusal `invalid`, including a
 //! certificate that does not verify and a slot gone or ahead of the
-//! cursor. Nothing here offers the type yet; the snapshot lands first.
+//! cursor. [`Capture::offered`] offers the type only where the child's
+//! sandbox self-test passes.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -47,14 +61,14 @@ use std::time::Duration;
 
 use sekai_source_sdk::{
     ChangeFeedPage, ConfigValue, Connector, ConnectorFailure, Destination, EgressAllowlist,
-    PropertyValue, SourceRecord, column_name_suggests_sensitive,
+    GenerationSnapshotPage, PropertyValue, SourceRecord, column_name_suggests_sensitive,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::capture::{self, CaptureChild, ConnectRefused, EXIT_UNAVAILABLE};
+use crate::capture::{self, CaptureChild, ConnectRefused, EXIT_UNAVAILABLE, Unavailable};
 use crate::child::{ChildError, Streamed};
 use crate::credentials::Secret;
-use crate::relational::{digest_of, percent_encode};
+use crate::relational::{digest_of, percent_decode, percent_encode};
 use crate::rest::now_ms;
 use crate::sync::Prepared;
 
@@ -91,6 +105,30 @@ impl Capture {
     pub fn new(child: CaptureChild, ca_pem: Option<String>) -> Self {
         Self { child, ca_pem }
     }
+
+    /// The capture this host offers: the child installed beside the
+    /// runtime, once its sandbox self-test passes with the paths every run
+    /// reads. Linux only; elsewhere, or when the test fails, the reason.
+    pub fn offered(ca_pem: Option<String>) -> Result<Self, Unavailable> {
+        let child = CaptureChild::beside_runtime()
+            .ok_or_else(|| Unavailable("change-capture child not installed".into()))?;
+        child.self_test(&read_paths(child.path()))?;
+        Ok(Self::new(child, ca_pem))
+    }
+}
+
+/// The paths the child reads under its sandbox: its own executable and
+/// the system trust roots this host has. A path the sandbox cannot open
+/// would make it fail closed, so only existing ones are listed.
+fn read_paths(child: &Path) -> Vec<&Path> {
+    std::iter::once(child)
+        .chain(
+            TRUST_ROOTS
+                .iter()
+                .map(Path::new)
+                .filter(|path| path.exists()),
+        )
+        .collect()
 }
 
 /// Opens the type for a prepared Source; register it with
@@ -121,6 +159,9 @@ pub fn open(
             publication: text("publication")?,
             resume_lsn: 0,
             max_commits: 0,
+            snapshot_lsn: 0,
+            snapshot_after: None,
+            max_rows: 0,
         },
         endpoint,
         egress: prepared.egress.clone(),
@@ -149,6 +190,9 @@ struct Settings {
     publication: String,
     resume_lsn: u64,
     max_commits: u32,
+    snapshot_lsn: u64,
+    snapshot_after: Option<Vec<String>>,
+    max_rows: u32,
 }
 
 impl Connector for PostgresCapture {
@@ -158,6 +202,57 @@ impl Connector for PostgresCapture {
             Next::Line(other) => other.outcome(),
             Next::End => Outcome::Ended(None),
             Next::Invalid => Outcome::Invalid,
+        })
+    }
+
+    fn read_snapshot_page(
+        &mut self,
+        committed_cursor: Option<&str>,
+        max_records: usize,
+    ) -> Result<GenerationSnapshotPage, ConnectorFailure> {
+        // Any other cursor, such as a feed position the plane moved to
+        // recovery, starts a new snapshot.
+        let from = match committed_cursor {
+            Some(text) if text.starts_with(SnapshotCursor::PREFIX) => {
+                Some(SnapshotCursor::parse(text).ok_or(ConnectorFailure::Invalid)?)
+            }
+            _ => None,
+        };
+        if max_records == 0 {
+            return Err(ConnectorFailure::Invalid);
+        }
+        let settings = Settings {
+            snapshot_lsn: from.as_ref().map_or(0, |from| from.lsn),
+            snapshot_after: from.as_ref().map(|from| from.after.clone()),
+            max_rows: u32::try_from(max_records).unwrap_or(u32::MAX),
+            ..self.settings.clone()
+        };
+        let reading = SnapshotReading {
+            from: from.as_ref(),
+            max_records,
+            kind: Kind {
+                record_kind: &self.record_kind,
+                now_ms: now_ms(),
+            },
+        };
+        let page = self.supervised("snapshot", &settings, |out| reading.read(out))?;
+        let handoff = Cursor {
+            lsn: page.lsn,
+            within: None,
+        };
+        let proposed_next_cursor = match page.records.last() {
+            Some(last) if !page.complete => SnapshotCursor::text(page.lsn, &last.external_id),
+            _ => handoff.to_string(),
+        };
+        Ok(GenerationSnapshotPage {
+            records: page.records,
+            proposed_next_cursor,
+            collected_at_ms: reading.kind.now_ms,
+            complete: page.complete,
+            source_feed_epoch: page
+                .complete
+                .then(|| format!("{}@{}", self.settings.slot, page.lsn)),
+            handoff_offset: page.complete.then_some(0),
         })
     }
 
@@ -182,15 +277,17 @@ impl Connector for PostgresCapture {
             from,
             offset: committed_offset,
             max_records,
-            record_kind: &self.record_kind,
-            now_ms: now_ms(),
+            kind: Kind {
+                record_kind: &self.record_kind,
+                now_ms: now_ms(),
+            },
         };
         let page = self.supervised("changes", &settings, |out| reading.read(out))?;
         Ok(ChangeFeedPage {
             offset_start: committed_offset,
             records: page.records,
             proposed_next_cursor: page.next.to_string(),
-            collected_at_ms: reading.now_ms,
+            collected_at_ms: reading.kind.now_ms,
             caught_up: page.caught_up,
         })
     }
@@ -249,9 +346,7 @@ impl PostgresCapture {
     }
 
     fn read_paths(&self) -> Vec<&Path> {
-        std::iter::once(self.child.path())
-            .chain(TRUST_ROOTS.iter().map(Path::new))
-            .collect()
+        read_paths(self.child.path())
     }
 }
 
@@ -305,6 +400,8 @@ fn refused<T>(reason: &str) -> Attempt<T> {
         // The previous child's session still holds the slot, or another
         // runtime created it a moment ago.
         "slot_in_use" | "slot_conflict" => Attempt::Died(ConnectorFailure::Unavailable),
+        // Fails visibly; the next sync tries again once a row exists.
+        "table_empty" => Attempt::Failed(ConnectorFailure::Unavailable),
         _ => Attempt::Failed(ConnectorFailure::Invalid),
     }
 }
@@ -327,6 +424,19 @@ enum Line {
         end_lsn: u64,
     },
     SlotCreated {},
+    SnapshotAt {
+        lsn: u64,
+    },
+    Row {
+        key: BTreeMap<String, Option<String>>,
+        row: BTreeMap<String, Option<String>>,
+    },
+    Gone {
+        key: BTreeMap<String, Option<String>>,
+    },
+    SnapshotEnd {
+        complete: bool,
+    },
     CaughtUp {},
     Checked,
     Refused {
@@ -422,13 +532,130 @@ struct Page {
     caught_up: bool,
 }
 
+/// The snapshot position in the plane's cursor: `pg1s/<P>/<last key>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotCursor {
+    /// The slot position the snapshot reads after.
+    lsn: u64,
+    /// The `external_id` of the last row the plane holds.
+    key: String,
+    /// That key's values, in column-name order.
+    after: Vec<String>,
+}
+
+impl SnapshotCursor {
+    const PREFIX: &str = "pg1s/";
+
+    fn parse(text: &str) -> Option<Self> {
+        let (lsn, key) = text.strip_prefix(Self::PREFIX)?.split_once('/')?;
+        let lsn = lsn.parse().ok().filter(|lsn| *lsn > 0)?;
+        let after = key
+            .split('~')
+            .map(|part| percent_decode(part).filter(|value| !value.is_empty()))
+            .collect::<Option<Vec<_>>>()?;
+        // Only the encoding this type writes, so one key has one cursor.
+        let canonical = after
+            .iter()
+            .map(|value| percent_encode(value))
+            .collect::<Vec<_>>();
+        (canonical.join("~") == key).then(|| Self {
+            lsn,
+            key: key.to_owned(),
+            after,
+        })
+    }
+
+    /// The cursor after the row whose `external_id` is `key`.
+    fn text(lsn: u64, key: &str) -> String {
+        format!("{}{lsn}/{key}", Self::PREFIX)
+    }
+}
+
+/// One snapshot page as read.
+#[derive(Debug, PartialEq)]
+struct SnapshotPage {
+    lsn: u64,
+    records: Vec<SourceRecord>,
+    complete: bool,
+}
+
+/// What one snapshot page reads after the plane's cursor.
+struct SnapshotReading<'a> {
+    from: Option<&'a SnapshotCursor>,
+    max_records: usize,
+    kind: Kind<'a>,
+}
+
+impl SnapshotReading<'_> {
+    /// Reads the child's lines into one page: the position, then rows in
+    /// key order, or the starting key gone, then the page's end.
+    fn read(&self, out: &mut dyn BufRead) -> Outcome<SnapshotPage> {
+        let mut page: Option<SnapshotPage> = None;
+        loop {
+            let line = match next_line(out) {
+                Next::Line(line) => line,
+                Next::End => return Outcome::Ended(None),
+                Next::Invalid => return Outcome::Invalid,
+            };
+            match (line, page.as_mut()) {
+                (Line::SlotCreated {}, None) => {}
+                (Line::SnapshotAt { lsn }, None)
+                    if lsn > 0 && self.from.is_none_or(|from| from.lsn == lsn) =>
+                {
+                    page = Some(SnapshotPage {
+                        lsn,
+                        records: Vec::new(),
+                        complete: false,
+                    });
+                }
+                (Line::Row { key, row }, Some(page)) if page.records.len() < self.max_records => {
+                    let version = page.lsn.to_string();
+                    let Some(mut records) = self.kind.records(Op::Insert, &key, &row, &version)
+                    else {
+                        return Outcome::Invalid;
+                    };
+                    page.records.append(&mut records);
+                }
+                // Only the key the page started after can be gone, alone.
+                (Line::Gone { key }, Some(page)) if page.records.is_empty() => {
+                    let id =
+                        external_id(key.iter().map(|(column, value)| (column, value.as_deref())));
+                    match (id, self.from) {
+                        (Some(id), Some(from)) if id == from.key => {
+                            let version = page.lsn.to_string();
+                            page.records.push(self.kind.record(
+                                id,
+                                &version,
+                                BTreeMap::new(),
+                                true,
+                            ));
+                        }
+                        _ => return Outcome::Invalid,
+                    }
+                }
+                (Line::SnapshotEnd { complete }, Some(page)) if !page.records.is_empty() => {
+                    page.complete = complete;
+                    break;
+                }
+                (other, _) => return other.outcome(),
+            }
+        }
+        page.map_or(Outcome::Invalid, Outcome::Done)
+    }
+}
+
+/// How one change becomes records of the Source's kind.
+struct Kind<'a> {
+    record_kind: &'a str,
+    now_ms: i64,
+}
+
 /// What one change page reads after the plane's state.
 struct Reading<'a> {
     from: Cursor,
     offset: u64,
     max_records: usize,
-    record_kind: &'a str,
-    now_ms: i64,
+    kind: Kind<'a>,
 }
 
 impl Reading<'_> {
@@ -488,7 +715,7 @@ impl Reading<'_> {
                         return Outcome::Invalid;
                     }
                     let version = format!("{commit_lsn}.{index}");
-                    let Some(records) = self.records(op, &key, &row, &version) else {
+                    let Some(records) = self.kind.records(op, &key, &row, &version) else {
                         return Outcome::Invalid;
                     };
                     if page.records.len() + records.len() > self.max_records {
@@ -525,7 +752,9 @@ impl Reading<'_> {
             }
         }
     }
+}
 
+impl Kind<'_> {
     /// The records one change makes; `None` when it cannot be one.
     fn records(
         &self,
@@ -608,10 +837,14 @@ mod tests {
             from: Cursor::parse(from).unwrap(),
             offset,
             max_records,
-            record_kind: "Item",
-            now_ms: 1,
+            kind: KIND,
         }
     }
+
+    const KIND: Kind<'static> = Kind {
+        record_kind: "Item",
+        now_ms: 1,
+    };
 
     fn change(commit: u64, index: u32, op: &str, id: &str, name: Option<&str>) -> String {
         serde_json::json!({
@@ -663,6 +896,100 @@ mod tests {
         ] {
             assert_eq!(Cursor::parse(text), None, "{text:?}");
         }
+    }
+
+    fn snapshot(from: Option<&str>, max_records: usize, lines: &[&str]) -> Outcome<SnapshotPage> {
+        let from = from.map(|text| SnapshotCursor::parse(text).unwrap());
+        let reading = SnapshotReading {
+            from: from.as_ref(),
+            max_records,
+            kind: KIND,
+        };
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        reading.read(&mut text.as_bytes())
+    }
+
+    fn row(id: &str) -> String {
+        serde_json::json!({ "kind": "row", "key": { "id": id }, "row": { "id": id, "name": "a" } })
+            .to_string()
+    }
+
+    #[test]
+    fn snapshot_cursors_carry_the_position_and_the_last_key() {
+        let cursor = SnapshotCursor::parse("pg1s/208/eu~a%2Fb").unwrap();
+        assert_eq!(cursor.lsn, 208);
+        assert_eq!(cursor.after, ["eu", "a/b"]);
+        for text in [
+            "pg1s/208",
+            "pg1s/0/1",
+            "pg1s/208/",
+            "pg1s/208/a~",
+            "pg1s/208/a/b",
+            "pg1s/208/%zz",
+            // A second spelling of one key.
+            "pg1s/208/%61",
+        ] {
+            assert_eq!(SnapshotCursor::parse(text), None, "{text:?}");
+        }
+    }
+
+    /// Rows after the cursor's key become upserts at the snapshot's
+    /// position; the page ends where the child says, and the starting key
+    /// can only come back alone, as itself or gone.
+    #[test]
+    fn snapshot_pages_read_rows_after_the_position_in_key_order() {
+        let at = r#"{"kind":"snapshot_at","lsn":208}"#;
+        let more = r#"{"kind":"snapshot_end","complete":false}"#;
+        let done = r#"{"kind":"snapshot_end","complete":true}"#;
+        let created = r#"{"kind":"slot_created","consistent_lsn":208}"#;
+        let Outcome::Done(page) = snapshot(None, 2, &[created, at, &row("1"), &row("a/b"), more])
+        else {
+            panic!();
+        };
+        assert_eq!((page.lsn, page.complete), (208, false));
+        assert_eq!(
+            page.records
+                .iter()
+                .map(|record| (record.external_id.as_str(), record.source_version.as_str()))
+                .collect::<Vec<_>>(),
+            [("1", "208"), ("a%2Fb", "208")]
+        );
+        assert!(
+            page.records
+                .iter()
+                .all(|record| record.source_sequence.is_none())
+        );
+
+        let gone = r#"{"kind":"gone","key":{"id":"a/b"}}"#;
+        let Outcome::Done(page) = snapshot(Some("pg1s/208/a%2Fb"), 2, &[at, gone, done]) else {
+            panic!();
+        };
+        assert!(page.complete && page.records[0].deleted);
+
+        let (r1, r2, r3, rc) = (row("1"), row("2"), row("3"), row("c"));
+        for (from, lines) in [
+            // Another position than the cursor's, or none.
+            (Some("pg1s/300/1"), vec![at, done]),
+            (None, vec![&r1, done]),
+            // More rows than the page holds, or none at all.
+            (None, vec![at, &r1, &r2, &r3, done]),
+            (None, vec![at, done]),
+            // Gone is only the starting key, and only alone.
+            (None, vec![at, gone, done]),
+            (Some("pg1s/208/1"), vec![at, gone, done]),
+            (Some("pg1s/208/a%2Fb"), vec![at, &rc, gone, done]),
+        ] {
+            assert_eq!(
+                snapshot(from, 2, &lines),
+                Outcome::Invalid,
+                "{from:?} {lines:?}"
+            );
+        }
+        // A child that stops before the page's end died.
+        assert!(matches!(
+            snapshot(None, 2, &[at, &row("1")]),
+            Outcome::Ended(None)
+        ));
     }
 
     #[test]
@@ -819,6 +1146,7 @@ mod tests {
             ("slot_ahead", ConnectorFailure::Invalid, false),
             ("retention_lost", ConnectorFailure::Invalid, false),
             ("slot_in_use", ConnectorFailure::Unavailable, true),
+            ("table_empty", ConnectorFailure::Unavailable, false),
             ("connection_closed", ConnectorFailure::Unreachable, true),
         ] {
             match refused::<()>(reason) {
@@ -872,6 +1200,9 @@ echo '{"kind":"caught_up","wal_end":308}'
                 publication: "p".into(),
                 resume_lsn: 0,
                 max_commits: 0,
+                snapshot_lsn: 0,
+                snapshot_after: None,
+                max_rows: 0,
             },
             record_kind: "Item".into(),
         };

@@ -1052,7 +1052,7 @@ pub(crate) fn percent_encode(value: &str) -> String {
     out
 }
 
-fn percent_decode(value: &str) -> Option<String> {
+pub(crate) fn percent_decode(value: &str) -> Option<String> {
     let bytes = value.as_bytes();
     let mut out = Vec::new();
     let mut index = 0;

@@ -17,6 +17,8 @@
 //!   is idle outside a transaction. It confirms to the server only the
 //!   position it started from, so the slot never releases log the plane has
 //!   not committed.
+//! - [`snapshot`] reads one page of the publication's table in key order,
+//!   after the slot's position, which the feed replays from.
 //!
 //! Every refusal is a [`Refusal`] naming the reason; none carries a server
 //! message, a value or the credential.
@@ -25,6 +27,7 @@
 //! authors (Apache-2.0), rewritten for blocking I/O, native TLS and the
 //! confirm-only-what-was-committed rule.
 
+use std::collections::BTreeMap;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -78,6 +81,17 @@ pub struct Settings {
     /// `changes`: the most transactions one page carries.
     #[serde(default)]
     pub max_commits: u32,
+    /// `snapshot`: the slot position the snapshot reads after; 0 starts a
+    /// new snapshot at the slot's confirmed position.
+    #[serde(default)]
+    pub snapshot_lsn: u64,
+    /// `snapshot`: the key of the last row the plane holds, its values in
+    /// column-name order; `None` on the first page.
+    #[serde(default)]
+    pub snapshot_after: Option<Vec<String>>,
+    /// `snapshot`: the most rows one page carries.
+    #[serde(default)]
+    pub max_rows: u32,
 }
 
 /// Why the session stopped, by name.
@@ -261,7 +275,247 @@ pub fn changes(
     }
 }
 
+/// Reads one snapshot page into `out` (ADR 0170, option B of #3083): the
+/// rows after `settings.snapshot_after` in key order, read after the slot's
+/// position, which the feed then replays from.
+///
+/// A new snapshot (`snapshot_lsn` 0) makes sure the slot exists and reads
+/// after its confirmed position; a later page refuses a slot that is gone
+/// or confirmed past the snapshot's position. Each page is its own
+/// read-only transaction, so no session outlives a page. The rows are
+/// whatever the table holds when the page reads them, possibly changed
+/// after the position: every row is a keyed upsert, and the feed replays
+/// every change after the position, so the plane ends in the source's
+/// state. An empty table is refused as `table_empty`. When no row follows
+/// the starting key, the page carries that key's row again, or `gone` when
+/// it was deleted, so no page is empty.
+pub fn snapshot(
+    session: &mut Session,
+    settings: &Settings,
+    out: &mut impl Write,
+) -> Result<(), Refusal> {
+    if settings.max_rows == 0 {
+        return Err(Refusal("invalid_config"));
+    }
+    check(session, settings)?;
+    let lsn = match (session.slot(settings)?, settings.snapshot_lsn) {
+        (None, 0) => {
+            let consistent_lsn = session.create_slot(settings)?;
+            emit(out, &Line::SlotCreated { consistent_lsn })?;
+            consistent_lsn
+        }
+        (Some(confirmed), 0) => confirmed,
+        (None, _) => return Err(Refusal("slot_missing")),
+        (Some(confirmed), at) if confirmed > at => return Err(Refusal("slot_ahead")),
+        (Some(_), at) => at,
+    };
+    emit(out, &Line::SnapshotAt { lsn })?;
+    let table = session.published_table(settings)?;
+    let after = settings
+        .snapshot_after
+        .as_ref()
+        .map(|values| table.key_in_index_order(values))
+        .transpose()?;
+    session.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")?;
+    let limit = u64::from(settings.max_rows) + 1;
+    let mut rows = session.query(&table.select(after.as_deref(), ">", Some(limit)))?;
+    let complete = rows.len() as u64 <= u64::from(settings.max_rows);
+    rows.truncate(settings.max_rows as usize);
+    let again = match (&after, rows.is_empty()) {
+        (None, true) => return Err(Refusal("table_empty")),
+        (Some(after), true) => Some(session.query(&table.select(Some(after), "=", None))?),
+        _ => None,
+    };
+    session.query("COMMIT")?;
+    match again {
+        Some(found) if found.is_empty() => emit(
+            out,
+            &Line::Gone {
+                key: table.key_of(after.as_deref().unwrap_or_default()),
+            },
+        )?,
+        Some(found) => rows = found,
+        None => {}
+    }
+    for values in rows {
+        let (key, row) = table.row(values)?;
+        emit(out, &Line::Row { key, row })?;
+    }
+    emit(out, &Line::SnapshotEnd { complete })
+}
+
+/// The one table of the Source's publication, as a snapshot reads it.
+#[derive(Debug, PartialEq)]
+struct Table {
+    /// The relation to read, quoted: `ONLY "schema"."table"`, since an
+    /// inheritance child is not published with its parent, or a
+    /// partitioned table itself, whose partitions the publication streams
+    /// as the root.
+    name: String,
+    /// The published columns, in table order.
+    columns: Vec<String>,
+    /// The replica-identity columns, in index order.
+    key: Vec<String>,
+}
+
+impl Table {
+    /// `SELECT` the published columns of the rows whose key compares `op`
+    /// to `key` (all rows without one), in key order.
+    fn select(&self, key: Option<&[String]>, op: &str, limit: Option<u64>) -> String {
+        let list = |names: &[String]| names.iter().map(|n| identifier(n)).collect::<Vec<_>>();
+        let mut sql = format!(
+            "SELECT {} FROM {}",
+            list(&self.columns).join(", "),
+            self.name
+        );
+        if let Some(key) = key {
+            let values: Vec<String> = key.iter().map(|value| literal(value)).collect();
+            sql += &format!(
+                " WHERE ROW({}) {op} ROW({})",
+                list(&self.key).join(", "),
+                values.join(", ")
+            );
+        }
+        sql += &format!(" ORDER BY {}", list(&self.key).join(", "));
+        if let Some(limit) = limit {
+            sql += &format!(" LIMIT {limit}");
+        }
+        sql
+    }
+
+    /// Key values given in column-name order, reordered to index order.
+    fn key_in_index_order(&self, by_name: &[String]) -> Result<Vec<String>, Refusal> {
+        let mut names = self.key.clone();
+        names.sort();
+        if by_name.len() != names.len() {
+            return Err(Refusal("invalid_config"));
+        }
+        Ok(self
+            .key
+            .iter()
+            .filter_map(|column| {
+                names
+                    .iter()
+                    .position(|name| name == column)
+                    .map(|at| by_name[at].clone())
+            })
+            .collect())
+    }
+
+    /// The key columns mapped to `values`, given in index order.
+    fn key_of(&self, values: &[String]) -> BTreeMap<String, Option<String>> {
+        self.key
+            .iter()
+            .cloned()
+            .zip(values.iter().cloned().map(Some))
+            .collect()
+    }
+
+    /// One selected row as its key and its published columns.
+    fn row(&self, values: Vec<Option<String>>) -> Result<(Key, Key), Refusal> {
+        if values.len() != self.columns.len() {
+            return Err(Refusal("protocol_violation"));
+        }
+        let row: Key = self.columns.iter().cloned().zip(values).collect();
+        let key = self
+            .key
+            .iter()
+            .map(|column| (column.clone(), row.get(column).cloned().flatten()))
+            .collect();
+        Ok((key, row))
+    }
+}
+
+/// Column name to text value, `None` for a null.
+type Key = BTreeMap<String, Option<String>>;
+
+/// A name from the server's catalog as a quoted identifier.
+fn identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// A value as an escape-string literal, whatever
+/// `standard_conforming_strings` says; untyped, so it takes its column's
+/// type.
+fn literal(value: &str) -> String {
+    format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+}
+
 impl Session {
+    /// The publication's one table, its published columns and its
+    /// replica-identity key: the index's key columns, without a covering
+    /// index's `INCLUDE` columns, which the feed does not send. A row filter, or a replica identity that is
+    /// not a key (`full`, `nothing`), cannot be snapshot as the feed
+    /// streams it.
+    fn published_table(&mut self, settings: &Settings) -> Result<Table, Refusal> {
+        let publication = literal(&settings.publication);
+        let found = self.query(&format!(
+            "SELECT p.schemaname, p.tablename, p.rowfilter IS NULL, c.relreplident, \
+               c.relkind = 'p' \
+             FROM pg_catalog.pg_publication_tables p \
+             JOIN pg_catalog.pg_namespace n ON n.nspname = p.schemaname \
+             JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = p.tablename \
+             WHERE p.pubname = {publication}"
+        ))?;
+        let [row] = found.as_slice() else {
+            return Err(Refusal("publication_not_one_table"));
+        };
+        let (schema, table, partitioned) = match row.as_slice() {
+            [
+                Some(schema),
+                Some(table),
+                Some(unfiltered),
+                Some(identity),
+                Some(partitioned),
+            ] if unfiltered == "t" && matches!(identity.as_str(), "d" | "i") => {
+                (schema.clone(), table.clone(), partitioned == "t")
+            }
+            [_, _, Some(unfiltered), _, _] if unfiltered != "t" => {
+                return Err(Refusal("publication_row_filter_unsupported"));
+            }
+            _ => return Err(Refusal("replica_identity_unsupported")),
+        };
+        let columns = self.names(&format!(
+            "SELECT a FROM pg_catalog.pg_publication_tables p, unnest(p.attnames) AS a \
+             WHERE p.pubname = {publication}"
+        ))?;
+        let key = self.names(&format!(
+            "SELECT a.attname FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_catalog.pg_index i ON i.indrelid = c.oid AND CASE c.relreplident \
+               WHEN 'd' THEN i.indisprimary WHEN 'i' THEN i.indisreplident ELSE false END \
+             JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey) \
+             CROSS JOIN LATERAL (SELECT array_position(i.indkey::int2[], a.attnum) \
+               - array_lower(i.indkey::int2[], 1) AS position) k \
+             WHERE n.nspname = {} AND c.relname = {} AND k.position < i.indnkeyatts \
+             ORDER BY k.position",
+            literal(&schema),
+            literal(&table)
+        ))?;
+        if key.is_empty() || !key.iter().all(|column| columns.contains(column)) {
+            return Err(Refusal("replica_identity_unsupported"));
+        }
+        Ok(Table {
+            name: format!(
+                "{}{}.{}",
+                if partitioned { "" } else { "ONLY " },
+                identifier(&schema),
+                identifier(&table)
+            ),
+            columns,
+            key,
+        })
+    }
+
+    /// The first column of every row `sql` returns.
+    fn names(&mut self, sql: &str) -> Result<Vec<String>, Refusal> {
+        self.query(sql)?
+            .into_iter()
+            .map(|row| row.into_iter().next().flatten())
+            .collect::<Option<_>>()
+            .ok_or(Refusal("protocol_violation"))
+    }
+
     fn startup(&mut self, settings: &Settings) -> Result<(), Refusal> {
         let mut buf = BytesMut::new();
         frontend::startup_message(
@@ -648,7 +902,39 @@ mod tests {
             publication: publication.into(),
             resume_lsn: 0,
             max_commits: 1,
+            snapshot_lsn: 0,
+            snapshot_after: None,
+            max_rows: 0,
         }
+    }
+
+    fn table() -> Table {
+        Table {
+            name: r#"ONLY "public"."items""#.into(),
+            columns: vec!["region".into(), "id".into(), "name".into()],
+            key: vec!["region".into(), "id".into()],
+        }
+    }
+
+    /// A key read back from the cursor cannot break out of its literal,
+    /// whatever `standard_conforming_strings` says.
+    #[test]
+    fn a_snapshot_page_reads_after_the_key_in_index_order() {
+        let table = table();
+        let after = table
+            .key_in_index_order(&["7".into(), r"eu'\".into()])
+            .unwrap();
+        assert_eq!(after, [r"eu'\", "7"]);
+        assert_eq!(
+            table.select(Some(&after), ">", Some(3)),
+            r#"SELECT "region", "id", "name" FROM ONLY "public"."items" WHERE ROW("region", "id") > ROW(E'eu''\\', E'7') ORDER BY "region", "id" LIMIT 3"#
+        );
+        assert_eq!(
+            table.select(None, ">", None),
+            r#"SELECT "region", "id", "name" FROM ONLY "public"."items" ORDER BY "region", "id""#
+        );
+        assert_eq!(identifier(r#"a"b"#), r#""a""b""#);
+        assert!(table.key_in_index_order(&["7".into()]).is_err());
     }
 
     #[test]

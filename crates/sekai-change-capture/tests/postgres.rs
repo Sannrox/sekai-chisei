@@ -60,6 +60,9 @@ impl Server {
             publication: publication.into(),
             resume_lsn: 0,
             max_commits: 10,
+            snapshot_lsn: 0,
+            snapshot_after: None,
+            max_rows: 0,
         }
     }
 
@@ -82,10 +85,24 @@ impl Server {
 
     /// [`Server::page`], keeping a refusal for the caller.
     fn try_page(&self, settings: &Settings) -> Result<Vec<Line>, Refusal> {
+        self.run(settings, pg::changes)
+    }
+
+    /// One `snapshot` page, keeping a refusal for the caller.
+    fn snapshot(&self, settings: &Settings) -> Result<Vec<Line>, Refusal> {
+        self.run(settings, pg::snapshot)
+    }
+
+    /// Runs `mode` once, retried while a previous session holds the slot.
+    fn run(
+        &self,
+        settings: &Settings,
+        mode: fn(&mut pg::Session, &Settings, &mut Vec<u8>) -> Result<(), Refusal>,
+    ) -> Result<Vec<Line>, Refusal> {
         for _ in 0..50 {
             let mut out = Vec::new();
             let mut session = self.session(settings, &self.password()).unwrap();
-            match pg::changes(&mut session, settings, &mut out) {
+            match mode(&mut session, settings, &mut out) {
                 Err(Refusal("slot_in_use")) => std::thread::sleep(Duration::from_millis(100)),
                 result => {
                     result?;
@@ -306,6 +323,120 @@ fn postgres_changes_page_through_committed_transactions_once() {
     admin
         .batch_execute(&format!(
             "DROP PUBLICATION {publication}; DROP TABLE {table}"
+        ))
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL with wal_level=logical; run through scripts/postgres-conformance.sh"]
+fn postgres_snapshot_pages_read_the_table_in_key_order_after_the_slot() {
+    let server = Server::from_env();
+    let table = unique("cc_snap_items");
+    let publication = unique("cc_snap_pub");
+    let empty = unique("cc_snap_empty");
+    let empty_publication = unique("cc_snap_empty_pub");
+    let slot = unique("cc_snap_slot");
+    let mut admin = server.admin();
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (id int, name text, flag boolean, PRIMARY KEY (id) INCLUDE (name)); \
+             INSERT INTO {table} SELECT n, 'r' || n, n % 2 = 0 FROM generate_series(1, 5) n; \
+             CREATE TABLE {table}_child () INHERITS ({table}); \
+             INSERT INTO {table}_child VALUES (3, 'child', true); \
+             CREATE PUBLICATION {publication} FOR TABLE ONLY {table}; \
+             CREATE TABLE {empty} (id int PRIMARY KEY); \
+             CREATE PUBLICATION {empty_publication} FOR TABLE {empty}"
+        ))
+        .unwrap();
+    let mut settings = server.settings(&slot, &publication);
+    settings.max_rows = 2;
+    let ids = |lines: &[Line]| -> Vec<String> {
+        lines
+            .iter()
+            .filter_map(|line| match line {
+                Line::Row { key, .. } | Line::Gone { key } => key["id"].clone(),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // The first page creates the slot and reads after its position.
+    let first = server.snapshot(&settings).unwrap();
+    let [
+        Line::SlotCreated { consistent_lsn },
+        Line::SnapshotAt { lsn },
+        Line::Row { key, row },
+        Line::Row { .. },
+        Line::SnapshotEnd { complete: false },
+    ] = first.as_slice()
+    else {
+        panic!("{first:?}");
+    };
+    assert_eq!(consistent_lsn, lsn);
+    assert_eq!(ids(&first), ["1", "2"]);
+    // A covering index's included columns are not part of the identity.
+    assert_eq!(key.keys().collect::<Vec<_>>(), ["id"]);
+    // Values in the server's own text form, as the feed streams them.
+    assert_eq!(row["flag"].as_deref(), Some("f"));
+
+    settings.snapshot_lsn = *lsn;
+    settings.snapshot_after = Some(vec!["2".into()]);
+    let second = server.snapshot(&settings).unwrap();
+    // The unpublished inheritance child's row 3 is not read.
+    assert_eq!(ids(&second), ["3", "4"]);
+    assert_eq!(second.last(), Some(&Line::SnapshotEnd { complete: false }));
+
+    // Rows after the last key vanished: the page carries that key again,
+    // as gone once it is deleted too, and completes.
+    admin
+        .batch_execute(&format!("DELETE FROM {table} WHERE id >= 5"))
+        .unwrap();
+    settings.snapshot_after = Some(vec!["4".into()]);
+    let again = server.snapshot(&settings).unwrap();
+    assert!(
+        matches!(
+            again.as_slice(),
+            [
+                Line::SnapshotAt { .. },
+                Line::Row { .. },
+                Line::SnapshotEnd { complete: true }
+            ]
+        ),
+        "{again:?}"
+    );
+    admin
+        .batch_execute(&format!("DELETE FROM {table} WHERE id = 4"))
+        .unwrap();
+    let gone = server.snapshot(&settings).unwrap();
+    assert!(
+        matches!(
+            gone.as_slice(),
+            [
+                Line::SnapshotAt { .. },
+                Line::Gone { .. },
+                Line::SnapshotEnd { complete: true }
+            ]
+        ),
+        "{gone:?}"
+    );
+    assert_eq!(ids(&gone), ["4"]);
+
+    // A slot confirmed past the snapshot's position would skip changes.
+    let mut behind = settings.clone();
+    behind.snapshot_lsn = lsn - 1;
+    assert_eq!(server.snapshot(&behind), Err(Refusal("slot_ahead")));
+
+    // An empty table cannot finish a snapshot.
+    let mut nothing = server.settings(&unique("cc_snap_none"), &empty_publication);
+    nothing.max_rows = 2;
+    assert_eq!(server.snapshot(&nothing), Err(Refusal("table_empty")));
+
+    server.drop_slot(&slot);
+    server.drop_slot(&nothing.slot);
+    admin
+        .batch_execute(&format!(
+            "DROP PUBLICATION {publication}; DROP PUBLICATION {empty_publication}; \
+             DROP TABLE {table} CASCADE; DROP TABLE {empty}"
         ))
         .unwrap();
 }

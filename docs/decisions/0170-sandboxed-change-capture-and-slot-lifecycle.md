@@ -93,6 +93,37 @@ the slot. A Source's publication carries exactly one table, its record
 kind, on PostgreSQL 15 or newer, so every streamed transaction carries a
 record and the feed position always moves with a committed page.
 
+## Clarification (2026-11-26): the snapshot is complete after the slot's position
+
+ADR 0118's "a snapshot records the position it is consistent at" means,
+for this family, that the snapshot at position `P` is complete for every
+change after `P`; a point-in-time copy at `P` is not promised. A slot's
+exported snapshot lives only while one session stays open, and no session
+outlives one page: each page runs in a fresh child, a sync applies a
+bounded number of pages, and a takeover starts a new process.
+
+- The first snapshot page makes sure the slot exists and takes its
+  confirmed position as `P`. A slot the run just created sits at its
+  consistent point.
+- Each page reads the next rows in key order after the last key the plane
+  committed, in its own read-only transaction. The stored cursor is
+  `pg1s/<P>/<last key>`, the key in the record `external_id` encoding, so
+  it never contains `/`. A later page refuses a slot that is gone or
+  confirmed past `P`.
+- The last page hands off as the feed cursor `pg1/<P>` at offset 0, and
+  the feed replays every change committed after `P`.
+- Every row is a keyed upsert or a tombstone, so the plane ends in the
+  source's state even when a page reads rows changed after `P`, a key
+  moves across the scan position, or a row is deleted mid-snapshot. During
+  the hand-off a row can briefly show an older value again before the feed
+  brings it back to the latest one.
+- Restart, takeover and the page limit need only the cursor; no slot is
+  dropped or re-created to resume.
+- An empty table cannot finish a snapshot, since a page carries at least
+  one record. It is refused as `table_empty`, the run fails `unavailable`,
+  and the next sync tries again. When the rows after the last key vanish,
+  the page carries that key's row again, or its tombstone.
+
 ## Consequences
 
 - The sandbox's dependencies live only in the child crate; the runtime

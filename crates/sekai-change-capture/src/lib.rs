@@ -20,7 +20,7 @@
 //!
 //! - `self-test` applies the sandbox and proves it holds, writing a
 //!   [`self_test`] report;
-//! - `check` and `changes` run the PostgreSQL family ([`pg`]) inside the
+//! - `check`, `changes` and `snapshot` run the PostgreSQL family ([`pg`]) inside the
 //!   sandbox and write [`output`] lines; the start message then carries
 //!   [`pg::Settings`]. A refusal is a `refused` line and exit
 //!   [`EXIT_REFUSED`].
