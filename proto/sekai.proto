@@ -550,6 +550,40 @@ message GetObjectSourceRecordResponse {
   string payload_state = 8;
   string payload = 9;
 }
+
+// Experimental (#3472, ADR 0171): one object's series. The caller must be
+// able to read the `series` property on the object, as GetObject decides,
+// and read the property's samples dataset, including its markings and the
+// egress release of its sample columns.
+message ReadObjectSeriesRequest {
+  string object_id = 1;
+  // A property of type `series` on the object's kind.
+  string property = 2;
+  // The half-open range [start_ms, end_ms); start_ms must be below end_ms.
+  int64 start_ms = 3;
+  int64 end_ms = 4;
+  // Most points to return; at least 1, and above 10000 counts as 10000.
+  uint32 target_points = 5;
+}
+message SeriesSample {
+  int64 timestamp_ms = 1;
+  double value = 2;
+}
+// The samples in [start_ms, start_ms + bucket_width_ms).
+message SeriesBucket {
+  int64 start_ms = 1;
+  uint64 count = 2;
+  double min = 3;
+  double max = 4;
+  double mean = 5;
+}
+// Either `samples` (the range held at most target_points) or `buckets`
+// (one per non-empty bucket of bucket_width_ms), never both.
+message ReadObjectSeriesResponse {
+  repeated SeriesSample samples = 1;
+  repeated SeriesBucket buckets = 2;
+  int64 bucket_width_ms = 3;
+}
 message UpdateObjectRequest {
   Object object = 1;
   LeasePrecondition lease_precondition = 2;
@@ -6880,6 +6914,8 @@ service SekaiService {
   rpc CreateObject(CreateObjectRequest) returns (CreateObjectResponse);
   rpc GetObject(GetObjectRequest) returns (GetObjectResponse);
   rpc GetObjectSourceRecord(GetObjectSourceRecordRequest) returns (GetObjectSourceRecordResponse);
+  // Experimental (#3472): an object's series, raw or bucketed.
+  rpc ReadObjectSeries(ReadObjectSeriesRequest) returns (ReadObjectSeriesResponse);
   rpc UpdateObject(UpdateObjectRequest) returns (UpdateObjectResponse);
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
   rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);

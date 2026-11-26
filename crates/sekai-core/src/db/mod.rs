@@ -58,6 +58,7 @@ pub mod peer_import_store;
 pub mod postgres;
 pub mod postgres_receipt_chain;
 pub mod receipt_chain;
+pub mod series_samples;
 pub mod source_batch_dataset;
 pub mod source_batch_recovery;
 pub(crate) mod sqlite_manager;

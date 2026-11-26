@@ -303,6 +303,21 @@ impl SekaiDb {
                  WHERE dataset_id LIKE 'srcds:%';",
         )
         .map_err(|e| e.to_string())?;
+        // One series of a samples dataset by time (#3472, ADR 0171). Partial,
+        // so only rows with a series id pay for the entry, and guarded, so a
+        // malformed row never fails its insert; the series read repeats each
+        // expression and the predicate exactly.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dataset_rows_series
+                 ON sekai_dataset_rows(
+                     dataset_id,
+                     json_extract(data, '$.series_id'),
+                     CAST(json_extract(data, '$.timestamp') AS INTEGER)
+                 )
+                 WHERE json_valid(data) AND json_extract(data, '$.series_id') IS NOT NULL",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
         let stored: Option<String> = conn
             .query_row(
                 "SELECT columns FROM sekai_datasets WHERE id='llm_calls'",

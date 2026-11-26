@@ -80,6 +80,25 @@ impl RuntimeDb {
         }
     }
 
+    /// Samples of one series in `[start_ms, end_ms)`, oldest first (#3472).
+    pub fn series_samples(
+        &self,
+        dataset_id: &str,
+        series_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+        scan_cap: usize,
+    ) -> Result<crate::sekai::series::SeriesScan, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.series_samples(dataset_id, series_id, start_ms, end_ms, scan_cap)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.series_samples(dataset_id, series_id, start_ms, end_ms, scan_cap)
+            }),
+        }
+    }
+
     /// The dataset's newest version id; empty when it has none.
     pub fn latest_dataset_version_id(&self, dataset_id: &str) -> Result<String, String> {
         Ok(self

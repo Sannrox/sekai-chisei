@@ -66,6 +66,8 @@ mod object_change_subscription;
 mod object_comment_rpc;
 #[path = "object_mutation_lifecycle.rs"]
 mod object_mutation_lifecycle;
+#[path = "object_series_rpc.rs"]
+mod object_series_rpc;
 #[path = "object_set_input.rs"]
 mod object_set_input;
 #[path = "object_set_query.rs"]
@@ -318,6 +320,11 @@ impl SekaiService for SekaiServiceImpl {
         get_agent_autonomy => get_agent_autonomy_rpc(GetAgentAutonomyRequest) -> GetAgentAutonomyResponse;
         set_agent_autonomy => set_agent_autonomy_rpc(SetAgentAutonomyRequest) -> SetAgentAutonomyResponse;
         get_object_source_record => get_object_source_record_rpc(GetObjectSourceRecordRequest) -> GetObjectSourceRecordResponse;
+        read_object_series => read_object_series_rpc(ReadObjectSeriesRequest) -> ReadObjectSeriesResponse;
+        list_comment_mentions => list_comment_mentions_rpc(ListCommentMentionsRequest) -> ListCommentMentionsResponse;
+        list_object_comments => list_object_comments_rpc(ListObjectCommentsRequest) -> ListObjectCommentsResponse;
+        update_object_comment => update_object_comment_rpc(UpdateObjectCommentRequest) -> UpdateObjectCommentResponse;
+        create_object_comment => create_object_comment_rpc(CreateObjectCommentRequest) -> CreateObjectCommentResponse;
         list_model_versions => list_model_versions_rpc(ListModelVersionsRequest) -> ListModelVersionsResponse;
         get_transform_chain_run => get_transform_chain_run_rpc(GetTransformChainRunRequest) -> GetTransformChainRunResponse;
         list_transform_chains => list_transform_chains_rpc(ListTransformChainsRequest) -> ListTransformChainsResponse;
@@ -965,34 +972,6 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<ReadSyncDeltasRequest>,
     ) -> Result<Response<ReadSyncDeltasResponse>, Status> {
         sync_scope_rpc::read_sync_deltas(self, req).await
-    }
-
-    async fn create_object_comment(
-        &self,
-        req: Request<CreateObjectCommentRequest>,
-    ) -> Result<Response<CreateObjectCommentResponse>, Status> {
-        object_comment_rpc::create_object_comment(self, req).await
-    }
-
-    async fn update_object_comment(
-        &self,
-        req: Request<UpdateObjectCommentRequest>,
-    ) -> Result<Response<UpdateObjectCommentResponse>, Status> {
-        object_comment_rpc::update_object_comment(self, req).await
-    }
-
-    async fn list_object_comments(
-        &self,
-        req: Request<ListObjectCommentsRequest>,
-    ) -> Result<Response<ListObjectCommentsResponse>, Status> {
-        object_comment_rpc::list_object_comments(self, req).await
-    }
-
-    async fn list_comment_mentions(
-        &self,
-        req: Request<ListCommentMentionsRequest>,
-    ) -> Result<Response<ListCommentMentionsResponse>, Status> {
-        object_comment_rpc::list_comment_mentions(self, req).await
     }
 
     async fn register_catalog_entry(

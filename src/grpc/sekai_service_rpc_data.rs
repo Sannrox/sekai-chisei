@@ -557,6 +557,39 @@ pub(super) fn authorize_packaged_dataset(
     Ok(access.binding.map(|binding| binding.namespace))
 }
 
+/// The samples dataset of a series read (#3472, ADR 0171): it exists, the
+/// caller has read access to it, and may read every sample column. Every
+/// refusal, a missing dataset included, is the same `permission_denied`, so
+/// a refused caller learns nothing about the dataset or its samples.
+pub(super) fn authorize_series_dataset(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    dataset_id: &str,
+) -> Result<dataset::Dataset, Status> {
+    let denied = || Status::permission_denied("series dataset access denied");
+    let uniform = |status: Status| match status.code() {
+        tonic::Code::PermissionDenied | tonic::Code::NotFound => denied(),
+        _ => status,
+    };
+    let dataset = service
+        .db
+        .runtime()
+        .get_dataset(dataset_id)
+        .map_err(Status::internal)?
+        .ok_or_else(denied)?;
+    let access = authorize_dataset_access(service, principals, tenant_context, &dataset, false)
+        .map_err(uniform)?;
+    if let Some(readable) = readable_columns(service, &dataset, &access).map_err(uniform)?
+        && crate::sekai::series::SAMPLE_COLUMNS
+            .iter()
+            .any(|column| !readable.iter().any(|readable| readable == column))
+    {
+        return Err(denied());
+    }
+    Ok(dataset)
+}
+
 /// Drops the columns of snapshot rows outside `readable` (see [`readable_columns`]).
 fn hold_rows_to(rows: &mut [HashMap<String, String>], readable: Option<&[String]>) {
     if let Some(readable) = readable {

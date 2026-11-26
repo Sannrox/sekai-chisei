@@ -179,14 +179,15 @@ fn comment_status(error: CommentError) -> Status {
     }
 }
 
-pub(super) async fn create_object_comment(
-    service: &SekaiServiceImpl,
-    req: Request<CreateObjectCommentRequest>,
-) -> Result<Response<CreateObjectCommentResponse>, Status> {
-    let owned = service.clone();
-    service
-        .spawn_db(move || create_object_comment_blocking(&owned, req))
-        .await
+impl SekaiServiceImpl {
+    pub(super) async fn create_object_comment_rpc(
+        &self,
+        req: Request<CreateObjectCommentRequest>,
+    ) -> Result<Response<CreateObjectCommentResponse>, Status> {
+        let owned = self.clone();
+        self.spawn_db(move || create_object_comment_blocking(&owned, req))
+            .await
+    }
 }
 
 fn create_object_comment_blocking(
@@ -234,14 +235,15 @@ fn create_object_comment_blocking(
     }))
 }
 
-pub(super) async fn update_object_comment(
-    service: &SekaiServiceImpl,
-    req: Request<UpdateObjectCommentRequest>,
-) -> Result<Response<UpdateObjectCommentResponse>, Status> {
-    let owned = service.clone();
-    service
-        .spawn_db(move || update_object_comment_blocking(&owned, req))
-        .await
+impl SekaiServiceImpl {
+    pub(super) async fn update_object_comment_rpc(
+        &self,
+        req: Request<UpdateObjectCommentRequest>,
+    ) -> Result<Response<UpdateObjectCommentResponse>, Status> {
+        let owned = self.clone();
+        self.spawn_db(move || update_object_comment_blocking(&owned, req))
+            .await
+    }
 }
 
 fn update_object_comment_blocking(
@@ -305,14 +307,15 @@ fn update_object_comment_blocking(
     }))
 }
 
-pub(super) async fn list_object_comments(
-    service: &SekaiServiceImpl,
-    req: Request<ListObjectCommentsRequest>,
-) -> Result<Response<ListObjectCommentsResponse>, Status> {
-    let owned = service.clone();
-    service
-        .spawn_db(move || list_object_comments_blocking(&owned, req))
-        .await
+impl SekaiServiceImpl {
+    pub(super) async fn list_object_comments_rpc(
+        &self,
+        req: Request<ListObjectCommentsRequest>,
+    ) -> Result<Response<ListObjectCommentsResponse>, Status> {
+        let owned = self.clone();
+        self.spawn_db(move || list_object_comments_blocking(&owned, req))
+            .await
+    }
 }
 
 fn list_object_comments_blocking(
@@ -343,14 +346,15 @@ fn list_object_comments_blocking(
     }))
 }
 
-pub(super) async fn list_comment_mentions(
-    service: &SekaiServiceImpl,
-    req: Request<ListCommentMentionsRequest>,
-) -> Result<Response<ListCommentMentionsResponse>, Status> {
-    let owned = service.clone();
-    service
-        .spawn_db(move || list_comment_mentions_blocking(&owned, req))
-        .await
+impl SekaiServiceImpl {
+    pub(super) async fn list_comment_mentions_rpc(
+        &self,
+        req: Request<ListCommentMentionsRequest>,
+    ) -> Result<Response<ListCommentMentionsResponse>, Status> {
+        let owned = self.clone();
+        self.spawn_db(move || list_comment_mentions_blocking(&owned, req))
+            .await
+    }
 }
 
 fn list_comment_mentions_blocking(
@@ -445,18 +449,15 @@ mod tests {
         author: &str,
         mentions: &[&str],
     ) -> Result<ObjectComment, Status> {
-        create_object_comment(
-            svc,
-            as_principal(
-                CreateObjectCommentRequest {
-                    object_id: "doc".into(),
-                    property: String::new(),
-                    body: "numbers look off".into(),
-                    mentions: mentions.iter().map(|m| m.to_string()).collect(),
-                },
-                author,
-            ),
-        )
+        svc.create_object_comment_rpc(as_principal(
+            CreateObjectCommentRequest {
+                object_id: "doc".into(),
+                property: String::new(),
+                body: "numbers look off".into(),
+                mentions: mentions.iter().map(|m| m.to_string()).collect(),
+            },
+            author,
+        ))
         .await
         .map(|response| response.into_inner().comment.unwrap())
     }
@@ -465,30 +466,24 @@ mod tests {
         svc: &SekaiServiceImpl,
         principal: &str,
     ) -> Result<ListObjectCommentsResponse, Status> {
-        list_object_comments(
-            svc,
-            as_principal(
-                ListObjectCommentsRequest {
-                    object_id: "doc".into(),
-                    include_resolved: true,
-                },
-                principal,
-            ),
-        )
+        svc.list_object_comments_rpc(as_principal(
+            ListObjectCommentsRequest {
+                object_id: "doc".into(),
+                include_resolved: true,
+            },
+            principal,
+        ))
         .await
         .map(Response::into_inner)
     }
 
     async fn mentions(svc: &SekaiServiceImpl, principal: &str) -> Vec<String> {
-        list_comment_mentions(
-            svc,
-            as_principal(
-                ListCommentMentionsRequest {
-                    namespace: "acme".into(),
-                },
-                principal,
-            ),
-        )
+        svc.list_comment_mentions_rpc(as_principal(
+            ListCommentMentionsRequest {
+                namespace: "acme".into(),
+            },
+            principal,
+        ))
         .await
         .unwrap()
         .into_inner()
@@ -568,19 +563,16 @@ mod tests {
         let svc = fixture();
         let created = comment(&svc, "alice", &[]).await.unwrap();
         let update = |principal: &str, body: Option<&str>, resolved: Option<bool>, expected| {
-            update_object_comment(
-                &svc,
-                as_principal(
-                    UpdateObjectCommentRequest {
-                        comment_id: created.comment_id.clone(),
-                        body: body.map(Into::into),
-                        mentions: Vec::new(),
-                        resolved,
-                        expected_updated_at_ms: expected,
-                    },
-                    principal,
-                ),
-            )
+            svc.update_object_comment_rpc(as_principal(
+                UpdateObjectCommentRequest {
+                    comment_id: created.comment_id.clone(),
+                    body: body.map(Into::into),
+                    mentions: Vec::new(),
+                    resolved,
+                    expected_updated_at_ms: expected,
+                },
+                principal,
+            ))
         };
         let not_author = update("bob", Some("edited"), None, created.updated_at_ms)
             .await
@@ -617,19 +609,17 @@ mod tests {
         assert!(history.iter().any(|c| c.field == "properties.body"
             && c.old_value == "numbers look off"
             && c.changed_by == "alice"));
-        let open = list_object_comments(
-            &svc,
-            as_principal(
+        let open = svc
+            .list_object_comments_rpc(as_principal(
                 ListObjectCommentsRequest {
                     object_id: "doc".into(),
                     include_resolved: false,
                 },
                 "alice",
-            ),
-        )
-        .await
-        .unwrap()
-        .into_inner();
+            ))
+            .await
+            .unwrap()
+            .into_inner();
         assert!(open.comments.is_empty());
         assert_eq!(open.total, 1);
     }

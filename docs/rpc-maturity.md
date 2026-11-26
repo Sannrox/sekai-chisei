@@ -175,6 +175,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.CreateObject` | `sekai.graph` | yes | sdk, host, cli | `stable` |
 | `SekaiService.GetObject` | `sekai.graph` | yes | host, example | `stable` |
 | `SekaiService.GetObjectSourceRecord` | `sekai.graph, sekai.object-sync` | yes | none | `experimental` |
+| `SekaiService.ReadObjectSeries` | `sekai.datasets, sekai.graph` | yes | none | `experimental` |
 | `SekaiService.UpdateObject` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.DeleteObject` | `sekai.graph` | yes | none | `stable` |
 | `SekaiService.ListObjects` | `sekai.graph` | yes | none | `stable` |

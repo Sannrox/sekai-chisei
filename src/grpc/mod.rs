@@ -375,6 +375,8 @@ fn rpc_namespace_action(method: &str) -> crate::enterprise::NamespaceAction {
                 // Federated aggregates (#1997) write only receipts; the
                 // caller needs read on the requesting namespace.
                 | "FederatedAggregate"
+                // The series read (#3472) writes nothing.
+                | "ReadObjectSeries"
         )
     {
         crate::enterprise::NamespaceAction::Write
@@ -936,6 +938,9 @@ fn enterprise_namespace_method(method: &str) -> bool {
             // The source record (#3271) reads through GetObject's visibility
             // and payload withholding.
             | "GetObjectSourceRecord"
+            // The series read (#3472) reads the object through GetObject and
+            // authorizes the samples dataset in the handler.
+            | "ReadObjectSeries"
             | "UpdateObject"
             | "DeleteObject"
             | "ListObjects"
@@ -3697,13 +3702,17 @@ mod tests {
             "QueryObjectPolicyAudit",
             "DryRunActionPolicy",
             "GetObjectSourceRecord",
+            "ReadObjectSeries",
         ] {
             assert!(enterprise_namespace_method(method), "{method}");
         }
-        assert_eq!(
-            rpc_namespace_action("GetObjectSourceRecord"),
-            crate::enterprise::NamespaceAction::Read
-        );
+        for method in ["GetObjectSourceRecord", "ReadObjectSeries"] {
+            assert_eq!(
+                rpc_namespace_action(method),
+                crate::enterprise::NamespaceAction::Read,
+                "{method}"
+            );
+        }
         assert_eq!(
             rpc_namespace_action("DryRunActionPolicy"),
             crate::enterprise::NamespaceAction::Read
