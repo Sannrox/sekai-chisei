@@ -161,6 +161,7 @@ TransportFailure
 ValueShapeCode
 ValueShapeFinding
 ValueShapeSupport
+WalStatus
 assert_change_capture
 assert_cross_page_identity
 assert_deterministic_batch
@@ -305,9 +306,11 @@ connector::Connector::deliver(&mut self,&ExportArtifact<'_>) -> Result<(),Connec
 connector::Connector::discover(&mut self) -> Result<SourceDiscovery,ConnectorFailure>
 connector::Connector::read_changes(&mut self,&str,u64,usize) -> Result<ChangeFeedPage,ConnectorFailure>
 connector::Connector::read_changes_from(&mut self,&str,&str,u64,usize) -> Result<ChangeFeedPage,ConnectorFailure>
+connector::Connector::read_changes_with_plane(&mut self,&str,&str,u64,usize,&mut dyn PlaneView) -> Result<ChangeFeedPage,ConnectorFailure>
 connector::Connector::read_page(&mut self,Option<&str>,usize) -> Result<SnapshotRead,ConnectorFailure>
 connector::Connector::read_page_with_plane(&mut self,Option<&str>,usize,&mut dyn PlaneView) -> Result<SnapshotRead,ConnectorFailure>
 connector::Connector::read_snapshot_page(&mut self,Option<&str>,usize) -> Result<GenerationSnapshotPage,ConnectorFailure>
+connector::Connector::read_snapshot_page_with_plane(&mut self,Option<&str>,usize,&mut dyn PlaneView) -> Result<GenerationSnapshotPage,ConnectorFailure>
 connector::Connector::sample_rows(&mut self,&str) -> Result<DiscoverySample,ConnectorFailure>
 connector::ConnectorFailure
 connector::ConnectorFailure::AuthFailed
@@ -367,6 +370,9 @@ connector::Operation::from_wire_name(&str) -> Option<Self>
 connector::Operation::wire_name(self) -> &str
 connector::POSTGRES_CAPTURE_CONNECTOR: ConnectorType
 connector::PlaneView
+connector::PlaneView::created_slots(&self) -> &[String]
+connector::PlaneView::note(&mut self,SyncNote) -> ()
+connector::PlaneView::record_created_slot(&mut self,&str) -> Result<(),PlaneViewError>
 connector::PlaneView::record_versions(&mut self,KeyRange<'_>,usize) -> Result<Vec<RecordVersion>,PlaneViewError>
 connector::PlaneViewError
 connector::PlaneViewError::FenceLost
@@ -875,5 +881,3 @@ source_batch_uses_delivery
 source_id
 sync_github_record
 translate_github_fixture
-
-

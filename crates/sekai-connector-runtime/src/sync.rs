@@ -243,23 +243,28 @@ impl Connectors {
     }
 
     /// Reads one page of an ordered type's snapshot after
-    /// `committed_cursor` (ADR 0023). Blocking.
+    /// `committed_cursor` (ADR 0023), with a view of what the plane holds
+    /// for the Source. Blocking.
     pub fn read_snapshot_page(
         &self,
         prepared: &Prepared,
         committed_cursor: Option<&str>,
         max_records: usize,
+        plane: &mut dyn PlaneView,
     ) -> Result<GenerationSnapshotPage, SyncFailure> {
         if !prepared.connector.supports(Operation::ReadChanges) {
             return Err(SyncFailure::Unsupported);
         }
-        Ok(self
-            .open(prepared)?
-            .read_snapshot_page(committed_cursor, max_records)?)
+        Ok(self.open(prepared)?.read_snapshot_page_with_plane(
+            committed_cursor,
+            max_records,
+            plane,
+        )?)
     }
 
     /// Reads one ordered change page after the plane's `committed_offset`
-    /// in `source_feed_epoch`, from its `committed_cursor`. Blocking.
+    /// in `source_feed_epoch`, from its `committed_cursor`, with a view of
+    /// what the plane holds for the Source. Blocking.
     pub fn read_changes(
         &self,
         prepared: &Prepared,
@@ -267,15 +272,17 @@ impl Connectors {
         source_feed_epoch: &str,
         committed_offset: u64,
         max_records: usize,
+        plane: &mut dyn PlaneView,
     ) -> Result<ChangeFeedPage, SyncFailure> {
         if !prepared.connector.supports(Operation::ReadChanges) {
             return Err(SyncFailure::Unsupported);
         }
-        Ok(self.open(prepared)?.read_changes_from(
+        Ok(self.open(prepared)?.read_changes_with_plane(
             committed_cursor,
             source_feed_epoch,
             committed_offset,
             max_records,
+            plane,
         )?)
     }
 

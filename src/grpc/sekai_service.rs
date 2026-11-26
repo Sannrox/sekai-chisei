@@ -312,6 +312,7 @@ impl SekaiService for SekaiServiceImpl {
         install_namespace_package => install_namespace_package_rpc(InstallNamespacePackageRequest) -> InstallNamespacePackageResponse;
         get_namespace_package_installation => get_namespace_package_installation_rpc(GetNamespacePackageInstallationRequest) -> GetNamespacePackageInstallationResponse;
         list_source_record_versions => list_source_record_versions_rpc(ListSourceRecordVersionsRequest) -> ListSourceRecordVersionsResponse;
+        record_source_created_slot => record_source_created_slot_rpc(RecordSourceCreatedSlotRequest) -> RecordSourceCreatedSlotResponse;
         list_claimable_work => list_claimable_work_rpc(ListClaimableWorkRequest) -> ListClaimableWorkResponse;
         claim_work => claim_work_rpc(ClaimWorkRequest) -> ClaimWorkResponse;
         heartbeat_work_claim => heartbeat_work_claim_rpc(HeartbeatWorkClaimRequest) -> HeartbeatWorkClaimResponse;

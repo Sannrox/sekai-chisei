@@ -456,6 +456,15 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "RecordSourceCreatedSlot",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "none",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "RequestSourceDiscovery",
       "storage_path": "sekai.object-sync",
       "real_backend": "yes",

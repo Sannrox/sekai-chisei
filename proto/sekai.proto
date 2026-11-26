@@ -1953,6 +1953,23 @@ message SourceRecordVersion {
 message ListSourceRecordVersionsResponse {
   repeated SourceRecordVersion records = 1;
 }
+// Experimental (#3083, ADR 0170). Records slot as a replication slot the
+// claimed Source's runtime may create, under the claim's fence, before
+// the runtime creates it. Recording a slot again changes nothing. slot is
+// 1 to 63 lowercase letters, digits and underscores; a Source records at
+// most 16, and one more is refused as FAILED_PRECONDITION.
+message RecordSourceCreatedSlotRequest {
+  string namespace = 1;
+  string source_id = 2;
+  string runtime_id = 3;
+  int64 claim_generation = 4;
+  string fencing_token = 5;
+  string slot = 6;
+}
+// The Source's recorded slots, as ConnectorSourceSync.created_slots.
+message RecordSourceCreatedSlotResponse {
+  repeated string created_slots = 1;
+}
 // A claimable or claimed Source discovery: the request with its claim and
 // the Source as the claim granted it.
 message SourceDiscoveryWork {
@@ -2148,9 +2165,19 @@ message SourceSyncNote {
     int64 offset = 2;
     string reason = 3;
   }
+  // The source keeps bytes of log for the replication slot, from its
+  // restart position to the server's current position, measured on the
+  // sync's last page (#3083). wal_status is reserved, extended, unreserved
+  // or lost. A sync carries at most one per slot.
+  message RetainedLog {
+    string slot = 1;
+    int64 bytes = 2;
+    string wal_status = 3;
+  }
   oneof note {
     OffsetGap offset_gap = 1;
     SkippedRecord skipped_record = 2;
+    RetainedLog retained_log = 3;
   }
 }
 // Experimental (ADR 0163). The notes of one source sync: at most 64, and
@@ -6547,6 +6574,10 @@ message ConnectorSourceSync {
   // Experimental (ADR 0163). The notes the runtime reported on the last
   // finished sync; absent when it reported none.
   SourceSyncNotes last_notes = 8;
+  // Experimental (#3083, ADR 0170). The replication slots a runtime
+  // recorded before it may create them, in the order recorded. The plane
+  // only adds to it; nothing removes a slot or drops it at the source.
+  repeated string created_slots = 9;
 }
 // Experimental (ADR 0148). A Source: the governed record of one
 // integration. source and source_instance are the tokens its batches carry;
@@ -7003,6 +7034,10 @@ service SekaiService {
   // sync claim may read its records' versions; a stale fence is refused.
   rpc ListSourceRecordVersions(ListSourceRecordVersionsRequest)
       returns (ListSourceRecordVersionsResponse);
+  // Experimental (#3083): only the runtime holding the Source's live sync
+  // claim may record a slot it may create; a stale fence is refused.
+  rpc RecordSourceCreatedSlot(RecordSourceCreatedSlotRequest)
+      returns (RecordSourceCreatedSlotResponse);
   // Experimental (#3091): discover a registered Source where its credential
   // lives. Both need a namespace administrator. A connector runtime claims
   // the request as WORK_KIND_SOURCE_DISCOVERY work. Asking again while the

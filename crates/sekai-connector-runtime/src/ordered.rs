@@ -10,6 +10,12 @@
 //! connector from the committed offset. A gap or a lost feed moves the
 //! generation to recovery-required, and the next page starts the next
 //! generation's snapshot; nothing else resets the offset.
+//!
+//! Every page reads with one view of the plane under the sync's claim
+//! ([`ClaimedPlane`]): the replication slots the plane records for the
+//! Source, and a fenced call to record one (#3083). The notes the
+//! connector reports through it go with the sync's acknowledgement, also
+//! when a later page fails.
 
 use sekai_client::protocol::sekai::{
     self as pb, ApplySourceBatchRequest, ApplySourceBatchResponse, ConnectorSource,
@@ -23,7 +29,10 @@ use sekai_source_sdk::{
 };
 use std::sync::Arc;
 
-use crate::pages::{MAX_PAGES, plane_failure, to_proto};
+use sekai_client::claim::WorkFence;
+use sekai_source_sdk::SyncNotes;
+
+use crate::pages::{ClaimedPlane, MAX_PAGES, plane_failure, to_proto};
 use crate::runtime::Runtime;
 use crate::sync::{Prepared, SyncFailure, blocking};
 
@@ -201,12 +210,47 @@ impl Runtime {
     /// Applies the Source's snapshot pages, then its change pages, from
     /// the plane's state until the feed is caught up or [`MAX_PAGES`] have
     /// applied. A refused batch fails the sync as invalid unless the plane
-    /// moved the generation to recovery, which the next page starts.
+    /// moved the generation to recovery, which the next page starts. The
+    /// connector's notes are gathered into `notes`; an invalid one fails
+    /// the sync as invalid.
     pub(crate) async fn sync_ordered(
         &self,
         index: usize,
         source: &ConnectorSource,
+        fence: &WorkFence,
         prepared: Prepared,
+        notes: &mut SyncNotes,
+    ) -> Result<(), SyncFailure> {
+        let created_slots = source
+            .sync
+            .as_ref()
+            .map(|sync| sync.created_slots.clone())
+            .unwrap_or_default();
+        let plane = ClaimedPlane::new(
+            &self.clients[index],
+            &source.namespace,
+            fence,
+            created_slots,
+        )?;
+        let mut held = Some(plane);
+        let outcome = self.ordered_pages(index, source, prepared, &mut held).await;
+        let noted = held.map_or(Ok(()), |plane| {
+            plane
+                .notes
+                .into_iter()
+                .try_for_each(|note| notes.push(note).map_err(|_| SyncFailure::Invalid))
+        });
+        outcome.and(noted)
+    }
+
+    /// The pages of [`Runtime::sync_ordered`], each read with the view in
+    /// `held`, which a blocking read takes and hands back.
+    async fn ordered_pages(
+        &self,
+        index: usize,
+        source: &ConnectorSource,
+        prepared: Prepared,
+        held: &mut Option<ClaimedPlane>,
     ) -> Result<(), SyncFailure> {
         let type_digest = match prepared.config.get("type_digest") {
             Some(ConfigValue::Text(digest)) if !digest.is_empty() => digest.clone(),
@@ -227,18 +271,23 @@ impl Runtime {
                 return Err(SyncFailure::Unavailable);
             }
             let (connectors, reading) = (self.connectors.clone(), prepared.clone());
-            let step = match Phase::of(&state)? {
+            let phase = Phase::of(&state)?;
+            let mut plane = held.take().ok_or(SyncFailure::Invalid)?;
+            let step = match phase {
                 Phase::Snapshot { generation, cursor } => {
                     let after = cursor.clone();
-                    let page = blocking(move || {
-                        connectors.read_snapshot_page(
+                    let (page, plane) = blocking(move || {
+                        let page = connectors.read_snapshot_page(
                             &reading,
                             after.as_deref(),
                             MAX_SOURCE_BATCH_RECORDS,
-                        )
+                            &mut plane,
+                        );
+                        Ok((page, plane))
                     })
                     .await?;
-                    snapshot_step(generation, cursor, page)?
+                    *held = Some(plane);
+                    snapshot_step(generation, cursor, page?)?
                 }
                 Phase::Feed {
                     generation,
@@ -247,17 +296,20 @@ impl Runtime {
                     cursor,
                 } => {
                     let (reading_epoch, after) = (epoch.clone(), cursor.clone());
-                    let page = blocking(move || {
-                        connectors.read_changes(
+                    let (page, plane) = blocking(move || {
+                        let page = connectors.read_changes(
                             &reading,
                             &after,
                             &reading_epoch,
                             offset,
                             MAX_SOURCE_BATCH_RECORDS,
-                        )
+                            &mut plane,
+                        );
+                        Ok((page, plane))
                     })
                     .await?;
-                    feed_step(generation, epoch, offset, cursor, page)?
+                    *held = Some(plane);
+                    feed_step(generation, epoch, offset, cursor, page?)?
                 }
             };
             let Step::Apply {

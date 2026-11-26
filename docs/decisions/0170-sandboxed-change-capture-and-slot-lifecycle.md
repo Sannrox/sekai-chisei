@@ -124,6 +124,43 @@ bounded number of pages, and a takeover starts a new process.
   and the next sync tries again. When the rows after the last key vanish,
   the page carries that key's row again, or its tombstone.
 
+## Clarification (2026-11-26): the plane records a slot before it is created
+
+Point 8's record lives in the plane, not in the runtime's memory, and is
+written before the slot exists (#3083). Otherwise a runtime that dies, or
+a page the plane fails to commit, between creating the slot and committing
+the first page would leave a slot the next first sync must refuse.
+
+- Each Source keeps a set of slot names a runtime may have created. Only
+  the runtime holding the Source's live sync claim adds to it, under the
+  claim's fence; adding a name again changes nothing, and nothing removes
+  one. Source reads show it as `created_slots`.
+- A first snapshot, with no committed cursor, creates only a recorded
+  slot. A missing unrecorded slot comes back from the child as
+  `slot_missing`; the runtime records the name and runs the page again.
+  A slot created by someone else in between is refused as
+  `slot_conflict`. A recorded slot that exists is used.
+- An existing slot the plane does not record is refused as
+  `slot_ahead_of_snapshot` and is never dropped or re-created. This
+  replaces "unless the runtime created it in the same first sync" in the
+  first clarification: the record, not the sync, decides.
+- A crash at any point leaves at most a recorded name with no slot, which
+  the next sync creates. A recovery snapshot has a committed cursor and
+  uses or creates its slot as before.
+- Every page measures the log the slot retains, the server's current
+  position minus the slot's restart position, with the server's
+  `wal_status`. The runtime sends the last value with the sync's
+  acknowledgement as the ADR 0163 note `retained_log`, whether the sync
+  completed or failed. A disabled Source keeps showing the last value
+  measured, stamped with that sync's finish; the value stops updating
+  while the Source is disabled. A server that cannot measure, such as a
+  standby, reports no note and the page reads on.
+- An older plane refuses the unknown note, and the runtime acknowledges
+  again without notes. The plane stores the note apart from the notes an
+  older plane decodes, so such a plane still reads the Source.
+- Dropping a recorded slot when its Source is deleted needs Source
+  deletion, which does not exist yet; it stays outside this decision.
+
 ## Consequences
 
 - The sandbox's dependencies live only in the child crate; the runtime

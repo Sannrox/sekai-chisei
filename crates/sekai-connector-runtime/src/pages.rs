@@ -17,7 +17,8 @@ use sekai_client::claim::{SOURCE_RECORDS_UNKEYED, WorkFence};
 use sekai_client::protocol::sekai::{
     self as pb, ApplySourceBatchRequest, ApplySourceBatchResponse, ConnectorSource,
     GetSourceSyncStateRequest, GetSourceSyncStateResponse, ListSourceRecordVersionsRequest,
-    ListSourceRecordVersionsResponse,
+    ListSourceRecordVersionsResponse, RecordSourceCreatedSlotRequest,
+    RecordSourceCreatedSlotResponse,
 };
 use sekai_client::{CallOptions, CoreLoopClient, GrpcTransport};
 use sekai_client::{SdkError, SdkErrorCode};
@@ -78,7 +79,9 @@ impl Runtime {
         notes: &mut SyncNotes,
     ) -> Result<(), SyncFailure> {
         if prepared.connector.supports(Operation::ReadChanges) {
-            return self.sync_ordered(index, source, prepared).await;
+            return self
+                .sync_ordered(index, source, fence, prepared, notes)
+                .await;
         }
         if !prepared.connector.supports(Operation::ReadPage) {
             return Err(SyncFailure::Unsupported);
@@ -126,7 +129,7 @@ impl Runtime {
                 .filter(|cursor| !cursor.is_empty());
             let (connectors, reading, after) =
                 (self.connectors.clone(), prepared.clone(), cursor.clone());
-            let mut plane = ClaimedPlane::new(client, &adapter.namespace, fence)?;
+            let mut plane = ClaimedPlane::new(client, &adapter.namespace, fence, Vec::new())?;
             let page = match blocking(move || {
                 connectors.read_page_with_plane(
                     &reading,
@@ -218,20 +221,25 @@ impl Runtime {
 }
 
 /// The plane's view of the claimed Source for a connector's blocking page
-/// read: each call is one `ListSourceRecordVersions` under the sync's
-/// fence, run on the async runtime the sync came from.
-struct ClaimedPlane {
+/// read: each read or record is one call under the sync's fence, run on
+/// the async runtime the sync came from. It starts with the slots the
+/// claim granted the Source with, and gathers the notes the connector
+/// reports, for the sync's acknowledgement.
+pub(crate) struct ClaimedPlane {
     client: CoreLoopClient<GrpcTransport>,
     runtime: tokio::runtime::Handle,
     namespace: String,
     fence: WorkFence,
+    created_slots: Vec<String>,
+    pub(crate) notes: Vec<SyncNote>,
 }
 
 impl ClaimedPlane {
-    fn new(
+    pub(crate) fn new(
         client: &CoreLoopClient<GrpcTransport>,
         namespace: &str,
         fence: &WorkFence,
+        created_slots: Vec<String>,
     ) -> Result<Self, SyncFailure> {
         Ok(Self {
             client: CoreLoopClient::new(client.config().clone(), client.transport().clone())
@@ -239,6 +247,8 @@ impl ClaimedPlane {
             runtime: tokio::runtime::Handle::current(),
             namespace: namespace.into(),
             fence: fence.clone(),
+            created_slots,
+            notes: Vec::new(),
         })
     }
 }
@@ -278,6 +288,40 @@ impl PlaneView for ClaimedPlane {
             })
             .collect())
     }
+
+    fn created_slots(&self) -> &[String] {
+        &self.created_slots
+    }
+
+    fn record_created_slot(&mut self, slot: &str) -> Result<(), PlaneViewError> {
+        let request = RecordSourceCreatedSlotRequest {
+            namespace: self.namespace.clone(),
+            source_id: self.fence.work_id.clone(),
+            runtime_id: self.fence.runtime_id.clone(),
+            claim_generation: self.fence.generation,
+            fencing_token: self.fence.fencing_token.clone(),
+            slot: slot.into(),
+        };
+        let response: RecordSourceCreatedSlotResponse = self
+            .runtime
+            .block_on(self.client.raw().unary(
+                "/sekai.SekaiService/RecordSourceCreatedSlot",
+                request,
+                CallOptions::new(),
+            ))
+            .map_err(|error| match error.code {
+                // A plane that predates the call cannot record the slot,
+                // so the slot is never created.
+                SdkErrorCode::Unimplemented => PlaneViewError::Unavailable,
+                _ => plane_view_error(error),
+            })?;
+        self.created_slots = response.created_slots;
+        Ok(())
+    }
+
+    fn note(&mut self, note: SyncNote) {
+        self.notes.push(note);
+    }
 }
 
 /// A refused read as the view's error. Any other precondition is the fence.
@@ -304,14 +348,14 @@ pub(crate) fn plane_failure(error: SdkError) -> SyncFailure {
 
 /// A sync's notes on the wire. A note kind the wire predates is left out.
 pub(crate) fn notes_to_proto(notes: &SyncNotes) -> pb::SourceSyncNotes {
-    use pb::source_sync_note::{Note, OffsetGap, SkippedRecord};
+    use pb::source_sync_note::{Note, OffsetGap, RetainedLog, SkippedRecord};
     pb::SourceSyncNotes {
         notes: notes
             .notes()
             .iter()
             .filter_map(|note| {
-                let note = match *note {
-                    SyncNote::OffsetGap {
+                let note = match note {
+                    &SyncNote::OffsetGap {
                         partition,
                         from_offset,
                         to_offset,
@@ -320,7 +364,7 @@ pub(crate) fn notes_to_proto(notes: &SyncNotes) -> pb::SourceSyncNotes {
                         from_offset,
                         to_offset,
                     }),
-                    SyncNote::SkippedRecord {
+                    &SyncNote::SkippedRecord {
                         partition,
                         offset,
                         reason,
@@ -328,6 +372,15 @@ pub(crate) fn notes_to_proto(notes: &SyncNotes) -> pb::SourceSyncNotes {
                         partition,
                         offset,
                         reason: reason.wire_name().into(),
+                    }),
+                    SyncNote::RetainedLog {
+                        slot,
+                        bytes,
+                        wal_status,
+                    } => Note::RetainedLog(RetainedLog {
+                        slot: slot.clone(),
+                        bytes: *bytes,
+                        wal_status: wal_status.wire_name().into(),
                     }),
                     _ => return None,
                 };

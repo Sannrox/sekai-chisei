@@ -167,6 +167,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.ListSources` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.DisableSource` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.ListSourceRecordVersions` | `sekai.object-sync` | yes | none | `experimental` |
+| `SekaiService.RecordSourceCreatedSlot` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.RequestSourceDiscovery` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.GetSourceDiscovery` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.GenerateDefinitionChangeBundle` | `sekai.definition-branch, sekai.graph` | yes | none | `experimental` |

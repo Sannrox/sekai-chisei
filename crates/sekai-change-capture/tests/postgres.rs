@@ -63,6 +63,8 @@ impl Server {
             snapshot_lsn: 0,
             snapshot_after: None,
             max_rows: 0,
+            // As the runtime runs it once the plane records the slot.
+            slot_recorded: true,
         }
     }
 
@@ -93,8 +95,21 @@ impl Server {
         self.run(settings, pg::snapshot)
     }
 
-    /// Runs `mode` once, retried while a previous session holds the slot.
+    /// Runs `mode` once, retried while a previous session holds the slot,
+    /// without the retained-log lines, which [`Server::run_measured`]
+    /// keeps.
     fn run(
+        &self,
+        settings: &Settings,
+        mode: fn(&mut pg::Session, &Settings, &mut Vec<u8>) -> Result<(), Refusal>,
+    ) -> Result<Vec<Line>, Refusal> {
+        let mut lines = self.run_measured(settings, mode)?;
+        lines.retain(|line| !matches!(line, Line::RetainedLog { .. }));
+        Ok(lines)
+    }
+
+    /// [`Server::run`] with every line.
+    fn run_measured(
         &self,
         settings: &Settings,
         mode: fn(&mut pg::Session, &Settings, &mut Vec<u8>) -> Result<(), Refusal>,
@@ -437,6 +452,70 @@ fn postgres_snapshot_pages_read_the_table_in_key_order_after_the_slot() {
         .batch_execute(&format!(
             "DROP PUBLICATION {publication}; DROP PUBLICATION {empty_publication}; \
              DROP TABLE {table} CASCADE; DROP TABLE {empty}"
+        ))
+        .unwrap();
+}
+
+/// A new snapshot creates only a slot the plane records (#3083): it names
+/// a missing unrecorded slot and creates nothing, refuses an existing
+/// unrecorded one, and measures the log a slot retains on every page.
+#[test]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL with wal_level=logical; run through scripts/postgres-conformance.sh"]
+fn postgres_snapshot_creates_only_a_recorded_slot_and_measures_its_log() {
+    let server = Server::from_env();
+    let table = unique("cc_rec_items");
+    let publication = unique("cc_rec_pub");
+    let slot = unique("cc_rec_slot");
+    let mut admin = server.admin();
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (id int PRIMARY KEY); INSERT INTO {table} VALUES (1); \
+             CREATE PUBLICATION {publication} FOR TABLE {table}"
+        ))
+        .unwrap();
+    let slots = |admin: &mut postgres::Client| -> i64 {
+        admin
+            .query_one(
+                "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .unwrap()
+            .get(0)
+    };
+    let mut settings = server.settings(&slot, &publication);
+    settings.max_rows = 10;
+    settings.slot_recorded = false;
+    assert_eq!(server.snapshot(&settings), Ok(vec![Line::SlotMissing]));
+    assert_eq!(slots(&mut admin), 0, "an unrecorded slot is never created");
+
+    settings.slot_recorded = true;
+    let created = server.run_measured(&settings, pg::snapshot).unwrap();
+    let [
+        Line::SlotCreated { .. },
+        Line::RetainedLog { bytes, wal_status },
+        Line::SnapshotAt { .. },
+        Line::Row { .. },
+        Line::SnapshotEnd { complete: true },
+    ] = created.as_slice()
+    else {
+        panic!("{created:?}");
+    };
+    assert!(*bytes >= 0);
+    assert_eq!(wal_status, "reserved");
+
+    // The same slot, existing but no longer recorded, is refused and left
+    // in place.
+    settings.slot_recorded = false;
+    assert_eq!(
+        server.snapshot(&settings),
+        Err(Refusal("slot_ahead_of_snapshot"))
+    );
+    assert_eq!(slots(&mut admin), 1);
+
+    server.drop_slot(&slot);
+    admin
+        .batch_execute(&format!(
+            "DROP PUBLICATION {publication}; DROP TABLE {table}"
         ))
         .unwrap();
 }

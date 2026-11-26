@@ -26,9 +26,12 @@ The CLI reads through `GetSourceHealth` on a running plane with
 A disclosed report also carries `sync_notes`, the bounded notes the connector
 runtime reported on the last finished sync of the one Source that owns the
 `source_instance`: skipped offset ranges and skipped records by partition and
-offset, at most 64 plus an overflow count, never record content
+offset, and the log a replication slot retains (`retained_log`), at most 64
+plus an overflow count, never record content
 ([ADR 0163](decisions/0163-source-sync-notes.md)). `GetSource` returns the same
-notes as `sync.last_notes`.
+notes as `sync.last_notes`. A disabled Source keeps showing the notes of its
+last finished sync, so a capture slot's retained log stays visible while the
+Source no longer syncs.
 
 [Ontology health](ontology-health.md) scores the namespace's visible sources
 as its `source` part.

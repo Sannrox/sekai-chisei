@@ -683,6 +683,21 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "RecordSourceCreatedSlot",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/source_sync.rs",
+        "docs/decisions/0170-sandboxed-change-capture-and-slot-lifecycle.md"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "RequestSourceDiscovery",
       "kind": "persistent",
       "surfaces": [

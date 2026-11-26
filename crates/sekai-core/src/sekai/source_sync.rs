@@ -60,9 +60,20 @@ pub struct SyncState {
     /// What the runtime noted on the bucket it finished last, read through
     /// [`SyncState::current_notes`].
     pub last_notes: StoredSyncNotes,
+    /// The replication slots a runtime recorded before it may create them
+    /// (#3083, ADR 0170), in the order recorded. Only added to: the
+    /// runtime creates only a recorded slot and refuses an unrecorded one
+    /// that already exists.
+    pub created_slots: Vec<String>,
 }
 
-pub use sekai_types::source_sync_note::{MAX_SYNC_NOTES, SkipReason, SyncNote, SyncNotes};
+pub use sekai_types::source_sync_note::{
+    MAX_SYNC_NOTES, SkipReason, SyncNote, SyncNotes, WalStatus, is_slot_name,
+};
+
+/// The most slots one Source records; a Source names one slot, so more
+/// means its configured slot changed that many times.
+pub const MAX_CREATED_SLOTS: usize = 16;
 
 /// Notes as stored with the sync outcome, stamped with the time of the
 /// finish that wrote them.
@@ -74,25 +85,60 @@ pub struct StoredSyncNotes {
 }
 
 impl StoredSyncNotes {
-    /// The stored column: empty for no notes.
-    pub fn encode(&self) -> String {
-        if self.notes.is_empty() {
-            String::new()
-        } else {
-            serde_json::to_string(self).unwrap_or_default()
-        }
+    /// The stored columns, each empty for no notes: the notes every plane
+    /// since ADR 0163 decodes, with the overflow count, and the measured
+    /// notes (#3083), which an older plane would refuse to decode and so
+    /// never reads.
+    pub fn encode(&self) -> (String, String) {
+        let (measured, positions): (Vec<_>, Vec<_>) = self
+            .notes
+            .notes()
+            .iter()
+            .cloned()
+            .partition(|note| matches!(note, SyncNote::RetainedLog { .. }));
+        let column = |notes: Vec<SyncNote>, overflow| {
+            SyncNotes::new(notes, overflow)
+                .ok()
+                .filter(|notes| !notes.is_empty())
+                .and_then(|notes| {
+                    serde_json::to_string(&Self {
+                        at_ms: self.at_ms,
+                        notes,
+                    })
+                    .ok()
+                })
+                .unwrap_or_default()
+        };
+        (
+            column(positions, self.notes.overflow()),
+            column(measured, 0),
+        )
     }
 
-    pub fn decode(column: &str) -> Result<Self, String> {
-        if column.is_empty() {
-            return Ok(Self::default());
+    /// The notes of both columns. A column an older plane left behind
+    /// carries an earlier stamp than the other: only the newer stamp's
+    /// notes are read, so a finish never shows another finish's notes.
+    pub fn decode(positions: &str, measured: &str) -> Result<Self, String> {
+        let column = |text: &str| -> Result<Self, String> {
+            if text.is_empty() {
+                return Ok(Self::default());
+            }
+            serde_json::from_str(text).map_err(|error| format!("decode source sync notes: {error}"))
+        };
+        let (positions, measured) = (column(positions)?, column(measured)?);
+        let at_ms = positions.at_ms.max(measured.at_ms);
+        let mut notes = Vec::new();
+        let mut overflow = 0;
+        for part in [positions, measured] {
+            if part.at_ms == at_ms {
+                notes.extend_from_slice(part.notes.notes());
+                overflow += part.notes.overflow();
+            }
         }
-        let stored: Self = serde_json::from_str(column)
-            .map_err(|error| format!("decode source sync notes: {error}"))?;
         // Re-validates, so a hand-edited row cannot exceed the bound.
         Ok(Self {
-            at_ms: stored.at_ms,
-            notes: SyncNotes::new(stored.notes.notes().to_vec(), stored.notes.overflow())?,
+            at_ms,
+            notes: SyncNotes::new(notes, overflow)?,
         })
     }
 }
@@ -164,6 +210,10 @@ pub enum SyncError {
     /// A live record of the Source carries no object key, so a read by
     /// key cannot be complete (ADR 0167).
     UnkeyedRecords,
+    /// The slot name is not 1 to 63 lowercase letters, digits and `_`.
+    InvalidSlot,
+    /// The Source already records [`MAX_CREATED_SLOTS`] other slots.
+    SlotLimit,
     Store(String),
 }
 
@@ -175,6 +225,12 @@ impl std::fmt::Display for SyncError {
             Self::Owner => formatter.write_str("claim owner is required"),
             Self::Claim(error) => error.fmt(formatter),
             Self::UnkeyedRecords => formatter.write_str("a live source record has no object key"),
+            Self::InvalidSlot => formatter
+                .write_str("a slot name is 1 to 63 lowercase letters, digits and underscores"),
+            Self::SlotLimit => write!(
+                formatter,
+                "a source records at most {MAX_CREATED_SLOTS} created slots"
+            ),
             Self::Store(error) => formatter.write_str(error),
         }
     }
@@ -436,6 +492,40 @@ pub fn acknowledge(
     })
 }
 
+/// Records `slot` as one the Source's runtime may create, under the live
+/// sync claim `fence` (#3083, ADR 0170), and returns the recorded slots.
+/// The runtime records before it creates, so a crash leaves at most a
+/// recorded slot that does not exist yet, which the next sync creates.
+/// Recording a slot again changes nothing; nothing removes one.
+pub fn record_created_slot(
+    db: &RuntimeDb,
+    namespace: &str,
+    source_id: &str,
+    fence: Fence<'_>,
+    slot: &str,
+    now_ms: i64,
+) -> Result<Vec<String>, SyncError> {
+    if !is_slot_name(slot) {
+        return Err(SyncError::InvalidSlot);
+    }
+    let source = db.edit_source_sync(namespace, source_id, |source| {
+        let hold = source.sync_hold();
+        let sync = &mut source.sync;
+        sync.claim
+            .require_live(hold, fence, now_ms)
+            .map_err(SyncError::Claim)?;
+        if sync.created_slots.iter().any(|recorded| recorded == slot) {
+            return Ok(());
+        }
+        if sync.created_slots.len() >= MAX_CREATED_SLOTS {
+            return Err(SyncError::SlotLimit);
+        }
+        sync.created_slots.push(slot.into());
+        Ok(())
+    })?;
+    Ok(source.sync.created_slots)
+}
+
 /// At most `limit` (capped at the batch record cap) live records of the
 /// Source, in byte order of object key and then external id, read only
 /// under its live sync claim (ADR 0167). A stale fence is
@@ -554,12 +644,43 @@ mod tests {
         .unwrap();
         let mut sync = SyncState::default();
         sync.finish(SyncOutcome::Completed, notes.clone(), 100);
-        let stored = StoredSyncNotes::decode(&sync.last_notes.encode()).unwrap();
+        let (positions, measured) = sync.last_notes.encode();
+        let stored = StoredSyncNotes::decode(&positions, &measured).unwrap();
         assert_eq!(stored, sync.last_notes);
         assert_eq!(sync.current_notes(), Some(&notes));
         // What an older plane writes: a later outcome, the column untouched.
         sync.last_failure_at_ms = 200;
         assert_eq!(sync.current_notes(), None);
+    }
+
+    /// A plane that predates measured notes rewrites only the first column
+    /// on its finish; the retained log of an earlier finish must not read
+    /// as that finish's.
+    #[test]
+    fn measured_notes_from_an_earlier_finish_are_not_merged() {
+        let retained = SyncNote::RetainedLog {
+            slot: "s".into(),
+            bytes: 7,
+            wal_status: WalStatus::Reserved,
+        };
+        let skipped = SyncNote::SkippedRecord {
+            partition: 0,
+            offset: 1,
+            reason: SkipReason::NotJson,
+        };
+        let earlier = StoredSyncNotes {
+            at_ms: 100,
+            notes: SyncNotes::new(vec![skipped.clone(), retained.clone()], 2).unwrap(),
+        };
+        let (positions, measured) = earlier.encode();
+        assert!(!positions.contains("retained_log"));
+        assert_eq!(StoredSyncNotes::decode(&positions, &measured), Ok(earlier));
+        let later = StoredSyncNotes {
+            at_ms: 200,
+            notes: SyncNotes::new(vec![skipped], 0).unwrap(),
+        };
+        let (older_plane, _) = later.encode();
+        assert_eq!(StoredSyncNotes::decode(&older_plane, &measured), Ok(later));
     }
 
     /// The source_sync kind on either backend: schedule, placement, crash
@@ -624,14 +745,38 @@ mod tests {
             Err(SyncError::Claim(ClaimError::FenceLost))
         );
 
+        // Only the current claim records a slot it may create; recording
+        // it again changes nothing.
+        assert_eq!(
+            record_created_slot(db, ns, "repo", fence(&crashed), "slot_a", now + TTL + 2),
+            Err(SyncError::Claim(ClaimError::FenceLost))
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                record_created_slot(db, ns, "repo", fence(&current), "slot_a", now + TTL + 2),
+                Ok(vec!["slot_a".to_string()])
+            );
+        }
+        assert_eq!(
+            record_created_slot(db, ns, "repo", fence(&current), "Slot-A", now + TTL + 2),
+            Err(SyncError::InvalidSlot)
+        );
+
         // The current claim completes with notes, which the row keeps; its
         // retry, even with other notes, changes nothing.
         let notes = SyncNotes::new(
-            vec![SyncNote::OffsetGap {
-                partition: 2,
-                from_offset: 10,
-                to_offset: 40,
-            }],
+            vec![
+                SyncNote::OffsetGap {
+                    partition: 2,
+                    from_offset: 10,
+                    to_offset: 40,
+                },
+                SyncNote::RetainedLog {
+                    slot: "slot_a".into(),
+                    bytes: 4096,
+                    wal_status: WalStatus::Extended,
+                },
+            ],
             3,
         )
         .unwrap();
@@ -646,6 +791,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(done.sync.current_notes(), Some(&notes));
+        assert_eq!(done.sync.created_slots, ["slot_a"]);
         assert_eq!(db.get_source(ns, "repo").unwrap(), Some(done.clone()));
         assert_eq!(
             (
