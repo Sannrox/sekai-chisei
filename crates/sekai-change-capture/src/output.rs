@@ -7,6 +7,7 @@
 //! {"kind":"change","commit_lsn":40,"index":0,"relation":"public.items","op":"insert","key":{"id":"1"},"row":{"id":"1","name":"a"},"unchanged":[]}
 //! {"kind":"truncate","commit_lsn":40,"index":1,"relations":["public.items"]}
 //! {"kind":"commit","commit_lsn":40,"end_lsn":48}
+//! {"kind":"caught_up","wal_end":56}
 //! {"kind":"refused","reason":"unknown_relation"}
 //! ```
 
@@ -46,7 +47,19 @@ pub enum Line {
         commit_lsn: u64,
         end_lsn: u64,
     },
-    /// The child stopped: the stream sent something it refuses.
+    /// `changes` created the Source's missing slot; its stream starts at
+    /// `consistent_lsn`.
+    SlotCreated {
+        consistent_lsn: u64,
+    },
+    /// `changes` ends its page: the stream was idle outside a transaction
+    /// with the server at `wal_end`.
+    CaughtUp {
+        wal_end: u64,
+    },
+    /// `check` found the database ready to capture.
+    Checked,
+    /// The child stopped: the database or the stream refused, by name.
     Refused {
         reason: String,
     },

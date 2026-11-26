@@ -16,12 +16,17 @@
 //! fails closed: the child exits [`EXIT_UNAVAILABLE`] with a named reason
 //! and never runs unsandboxed.
 //!
-//! Modes: `self-test` applies the sandbox and proves it holds, writing a
-//! [`self_test`] report. The capture families are later modes; the
-//! [`replication`] decoder and the [`output`] line protocol they will use
-//! are pure functions here, not yet wired to a mode.
+//! Modes:
+//!
+//! - `self-test` applies the sandbox and proves it holds, writing a
+//!   [`self_test`] report;
+//! - `check` and `changes` run the PostgreSQL family ([`pg`]) inside the
+//!   sandbox and write [`output`] lines; the start message then carries
+//!   [`pg::Settings`]. A refusal is a `refused` line and exit
+//!   [`EXIT_REFUSED`].
 
 pub mod output;
+pub mod pg;
 pub mod replication;
 pub mod sandbox;
 pub mod self_test;
@@ -31,7 +36,7 @@ use serde::Deserialize;
 /// The largest start message the child reads.
 pub const MAX_START_BYTES: u64 = 1024 * 1024;
 
-/// Exit status: the sandbox was applied and held.
+/// Exit status: the sandbox was applied and held, and the mode finished.
 pub const EXIT_OK: i32 = 0;
 /// Exit status: a self-test check found the sandbox not holding.
 pub const EXIT_BROKEN: i32 = 1;
@@ -39,6 +44,9 @@ pub const EXIT_BROKEN: i32 = 1;
 pub const EXIT_USAGE: i32 = 2;
 /// Exit status: the host cannot apply the sandbox.
 pub const EXIT_UNAVAILABLE: i32 = 3;
+/// Exit status: the database or the stream refused; the last line names
+/// the reason.
+pub const EXIT_REFUSED: i32 = 4;
 
 /// What the runtime sends on stdin, once.
 #[derive(Deserialize)]
@@ -50,6 +58,9 @@ pub struct Start {
     /// system trust roots. Nothing else is readable, and nothing writable.
     #[serde(default)]
     pub read_paths: Vec<String>,
+    /// The database to capture from, for `check` and `changes`.
+    #[serde(default)]
+    pub postgres: Option<pg::Settings>,
 }
 
 impl Start {
