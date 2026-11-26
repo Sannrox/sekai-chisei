@@ -94,6 +94,7 @@ start_container() {
       chown postgres:postgres /tmp/pg_hba.conf &&
       exec docker-entrypoint.sh postgres \
         -c ssl=on \
+        -c wal_level=logical \
         -c ssl_cert_file=/tmp/server.crt \
         -c ssl_key_file=/tmp/server.key \
         -c hba_file=/tmp/pg_hba.conf' >/dev/null
@@ -169,4 +170,7 @@ SEKAI_TEST_POSTGRES_CHISEI_URL="$base/sekai_lib_chisei" \
 # The connector runtime's relational type delivers into a table of its own.
 SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
   cargo test --locked -p sekai-connector-runtime --lib -- --ignored --test-threads=1 postgres || status=$?
+# The change-capture child reads the log through its own replication slots.
+SEKAI_TEST_POSTGRES_URL="$base/sekai_lib" \
+  cargo test --locked -p sekai-change-capture -- --ignored --test-threads=1 postgres || status=$?
 exit "$status"

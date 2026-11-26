@@ -68,6 +68,19 @@ on 2026-11-25.
    slot, and Source health reports the log the slot retains, so the cost
    on the source database is visible rather than silent.
 
+## Clarification (2026-11-26): a pre-existing slot at the first sync
+
+Point 7's "an existing slot is used" holds once the Source has synced.
+At the first sync, a slot the runtime did not just create may already be
+past the snapshot the sync copies, so the changes between them would be
+lost without notice. `check` therefore refuses an operator-named slot that
+already exists before the first sync as "slot ahead of the snapshot",
+unless the runtime created it in the same first sync. The runtime never
+drops or re-creates that slot to get past the refusal; the operator drops
+it or names another. The refusal lives with the first-sync logic, which
+knows whether a sync has completed; the change-capture child alone does
+not.
+
 ## Consequences
 
 - The sandbox's dependencies live only in the child crate; the runtime

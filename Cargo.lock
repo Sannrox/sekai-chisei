@@ -2959,8 +2959,13 @@ dependencies = [
 name = "sekai-change-capture"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "landlock",
  "libc",
+ "native-tls",
+ "postgres",
+ "postgres-native-tls",
+ "postgres-protocol",
  "serde",
  "serde_json",
 ]
