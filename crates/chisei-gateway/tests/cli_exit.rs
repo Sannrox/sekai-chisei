@@ -94,8 +94,11 @@ fn refresh_against_a_listener_that_never_responds_times_out() {
             || lowered.contains("timeout"),
         "expected a timeout error, got {err}"
     );
+    // Wall time includes spawning the debug binary. cargo test-all contention
+    // has exceeded 5s while the request still timed out (#3530). Stay well
+    // below the 120s default request timeout so a missing timeout still fails.
     assert!(
-        elapsed < Duration::from_secs(5),
+        elapsed < Duration::from_secs(30),
         "refresh hung for {elapsed:?} instead of giving up within the request timeout"
     );
 }
