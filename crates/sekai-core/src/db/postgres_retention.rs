@@ -1489,11 +1489,13 @@ fn append_subject_erasure_decision(
 
 /// Columns that keep a subject as a retained identity under a documented
 /// basis, like audit actors (ADR 0157, #3444): a turn's agent principal and
-/// its requester. Erasure leaves them and the residue scan skips them, as
-/// SQLite does.
+/// its requester, and an interactive turn's member (ADR 0173). Erasure
+/// leaves them and the residue scan skips them, as SQLite does.
 const RETAINED_IDENTITY_COLUMNS: &[(&str, &str)] = &[
     ("sekai_agent_turn", "principal_id"),
     ("sekai_agent_turn", "admitted_by"),
+    ("sekai_interactive_agent_turn", "member_id"),
+    ("sekai_interactive_agent_turn", "admitted_by"),
 ];
 
 fn unsupported_subject_location(

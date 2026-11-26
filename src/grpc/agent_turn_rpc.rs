@@ -8,6 +8,7 @@ use super::*;
 use crate::runtime_token::RuntimeTokenClaims;
 use crate::sekai::agent_turn::transcript;
 use crate::sekai::agent_turn::{self, Cause, Outcome, TurnError, Wake};
+use crate::sekai::interactive_agent_turn;
 use std::collections::HashSet;
 
 /// Namespace-invariant object-access residual for one working-memory list.
@@ -53,6 +54,38 @@ fn to_proto(turn: agent_turn::AgentTurn) -> AgentTurn {
         parked_action_instance_id: turn.parked_action_id,
         park_count: turn.park_count,
         transcript: None,
+        definition_revision_digest: String::new(),
+        agent_member: String::new(),
+        trace_id: String::new(),
+    }
+}
+
+/// An interactive turn on the wire (ADR 0173): no instance, and the member
+/// as the principal it acts as.
+fn interactive_to_proto(turn: interactive_agent_turn::InteractiveAgentTurn) -> AgentTurn {
+    AgentTurn {
+        turn_id: turn.turn_id,
+        namespace: turn.namespace,
+        instance_id: String::new(),
+        principal_id: turn.member_id,
+        cause: interactive_agent_turn::CAUSE.into(),
+        cause_ref: turn.request_id,
+        due_at_ms: turn.due_at_ms,
+        admitted_by: turn.admitted_by,
+        status: turn.status,
+        claim_owner: turn.claim_owner,
+        claim_generation: turn.claim_generation,
+        fencing_token: turn.fencing_token,
+        claim_expires_at_ms: turn.claim_expires_at_ms,
+        created_at_ms: turn.created_at_ms,
+        finished_at_ms: turn.finished_at_ms,
+        reason: turn.reason,
+        parked_action_instance_id: turn.parked_action_id,
+        park_count: turn.park_count,
+        transcript: None,
+        definition_revision_digest: turn.definition_revision_digest,
+        agent_member: turn.agent_member,
+        trace_id: turn.trace_id,
     }
 }
 
@@ -219,6 +252,9 @@ fn entry_to_proto(entry: agent_turn::InstanceEntry) -> AgentTurn {
             parked_action_instance_id: String::new(),
             park_count: 0,
             transcript: None,
+            definition_revision_digest: String::new(),
+            agent_member: String::new(),
+            trace_id: String::new(),
         },
     }
 }
@@ -473,6 +509,56 @@ impl SekaiServiceImpl {
         .map_err(turn_status)?;
         Ok(Response::new(WakeSiteAgentInstanceResponse {
             turn: Some(to_proto(turn)),
+        }))
+    }
+
+    /// Admits an interactive turn acting as the caller (ADR 0173). Only a
+    /// member admits, for themself: an agent, a registered service
+    /// principal, a machine credential, a runtime token or a delegated
+    /// caller is refused, so agent autonomy grants never attach to the turn.
+    pub(super) async fn admit_interactive_agent_turn_rpc(
+        &self,
+        req: Request<AdmitInteractiveAgentTurnRequest>,
+    ) -> Result<Response<AdmitInteractiveAgentTurnResponse>, Status> {
+        let principals = caller_principals(&req);
+        require_authenticated(&principals)?;
+        let [member] = principals.as_slice() else {
+            return Err(Status::permission_denied(
+                "an interactive turn acts as one member",
+            ));
+        };
+        let member = member.clone();
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        if req.extensions().get::<RuntimeTokenClaims>().is_some()
+            || freeze_actor_is_agent(self.db.runtime(), &member, tenant_context.as_ref())?
+        {
+            return Err(Status::permission_denied(
+                "only a member admits an interactive turn, for themself",
+            ));
+        }
+        let inner = req.into_inner();
+        enforce_namespace_tenant_context(
+            self.db.runtime(),
+            tenant_context.as_ref(),
+            &inner.namespace,
+            true,
+        )?;
+        check_team_namespace(self.db.runtime(), &principals, &inner.namespace, true)?;
+        let turn = interactive_agent_turn::admit(
+            self.db.runtime(),
+            interactive_agent_turn::Admission {
+                namespace: inner.namespace,
+                member_id: member,
+                definition_revision_digest: inner.definition_revision_digest,
+                agent_member: inner.agent_member,
+                request_id: inner.request_id,
+                trace_id: inner.trace_id,
+            },
+            now_millis(),
+        )
+        .map_err(turn_status)?;
+        Ok(Response::new(AdmitInteractiveAgentTurnResponse {
+            turn: Some(interactive_to_proto(turn)),
         }))
     }
 

@@ -300,6 +300,7 @@ impl SekaiService for SekaiServiceImpl {
         delete_media => delete_media_rpc(DeleteMediaRequest) -> DeleteMediaResponse;
         read_media => read_media_rpc(ReadMediaRequest) -> ReadMediaResponse;
         wake_site_agent_instance => wake_site_agent_instance_rpc(WakeSiteAgentInstanceRequest) -> WakeSiteAgentInstanceResponse;
+        admit_interactive_agent_turn => admit_interactive_agent_turn_rpc(AdmitInteractiveAgentTurnRequest) -> AdmitInteractiveAgentTurnResponse;
         list_site_agent_instance_turns => list_site_agent_instance_turns_rpc(ListSiteAgentInstanceTurnsRequest) -> ListSiteAgentInstanceTurnsResponse;
         list_claimable_agent_turns => list_claimable_agent_turns_rpc(ListClaimableAgentTurnsRequest) -> ListClaimableAgentTurnsResponse;
         claim_agent_turn => claim_agent_turn_rpc(ClaimAgentTurnRequest) -> ClaimAgentTurnResponse;

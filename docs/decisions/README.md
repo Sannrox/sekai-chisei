@@ -198,5 +198,6 @@ Routine implementation detail stays in its Issue and pull request.
 - [ADR 0170: Sandboxed change capture and the replication slot lifecycle](0170-sandboxed-change-capture-and-slot-lifecycle.md)
 - [ADR 0171: A series read needs the property and the samples dataset](0171-a-series-read-needs-the-property-and-the-samples-dataset.md)
 - [ADR 0172: A dataset version records a change, and its content is computed](0172-dataset-versions-record-changes.md)
+- [ADR 0173: Interactive agent turns act as the requesting member](0173-interactive-agent-turns-act-as-the-requesting-member.md)
 - [ADR 0174: The object log serves object-set reads, and the relational projection is removed after a fallback window](0174-object-log-serves-object-set-reads.md)
 <!-- adr-index:end -->

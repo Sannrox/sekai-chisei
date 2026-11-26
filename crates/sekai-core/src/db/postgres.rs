@@ -270,6 +270,8 @@ const NAMESPACE_PACKAGE_INSTALLATIONS_SCHEMA: &str =
     include_str!("postgres/0186_namespace_package_installations.sql");
 const DATASET_SERIES_INDEX_SCHEMA: &str = include_str!("postgres/0187_dataset_series_index.sql");
 const DATASET_ROW_SPANS_SCHEMA: &str = include_str!("postgres/0188_dataset_row_spans.sql");
+const INTERACTIVE_AGENT_TURNS_SCHEMA: &str =
+    include_str!("postgres/0191_interactive_agent_turns.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1371,6 +1373,12 @@ const MIGRATIONS: &[Migration] = &[
         "chisei_eval_recorded_datasets",
         "",
         MigrationOwner::Chisei,
+    ),
+    mig(
+        191,
+        "interactive_agent_turns",
+        INTERACTIVE_AGENT_TURNS_SCHEMA,
+        MigrationOwner::Sekai,
     ),
 ];
 
