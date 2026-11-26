@@ -352,6 +352,7 @@ async fn run(case: &Case, ops: usize, tally: &mut Tally) -> Result<(), Mismatch>
             hidden: write.hidden,
             props: write.props.clone().into_iter().collect(),
             schema_version: 1,
+            source_version: 0,
         });
         let done = index + 1;
         if done % CHECKPOINT_EVERY != 0 && done != ops {

@@ -5293,6 +5293,7 @@ mod tests {
                     hidden: false,
                     props: std::collections::HashMap::from([("region".into(), region.into())]),
                     schema_version: 1,
+                    source_version: 0,
                 },
                 mikura::ObjectRecord {
                     action_id: None,
@@ -5303,6 +5304,7 @@ mod tests {
                     hidden: true,
                     props: std::collections::HashMap::from([("region".into(), "eu".into())]),
                     schema_version: 1,
+                    source_version: 0,
                 },
                 mikura::ObjectRecord {
                     action_id: None,
@@ -5313,6 +5315,7 @@ mod tests {
                     hidden: false,
                     props: std::collections::HashMap::from([("customer_id".into(), "c1".into())]),
                     schema_version: 1,
+                    source_version: 0,
                 },
                 mikura::ObjectRecord {
                     action_id: None,
@@ -5326,6 +5329,7 @@ mod tests {
                         ("amount".into(), "10".into()),
                     ]),
                     schema_version: 1,
+                    source_version: 0,
                 },
                 mikura::ObjectRecord {
                     action_id: None,
@@ -5339,6 +5343,7 @@ mod tests {
                         ("amount".into(), "99".into()),
                     ]),
                     schema_version: 1,
+                    source_version: 0,
                 },
             ],
         )

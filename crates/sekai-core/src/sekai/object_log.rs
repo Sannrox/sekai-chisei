@@ -435,19 +435,6 @@ pub fn map_evaluate_request(
         .last()
         .map(|hop| hop.far_kind.clone())
         .unwrap_or_else(|| descriptor.kind.clone());
-    // mikura v0.6.0 answers a zero-hop, unfiltered, one-property breakdown of
-    // the root's own measure from commit-time count and sum rollups, leaving
-    // min, max and the avg divisor unset. Those answers cannot be compared.
-    let rollup_breakdown = hops.is_empty()
-        && predicate.is_none()
-        && group_by.len() == 1
-        && sum_kind == descriptor.kind
-        && group_by[0] != sum_property;
-    if rollup_breakdown && matches!(function.as_str(), "min" | "max" | "avg") {
-        return Err(ObjectLogCompareError::Unsupported(
-            "the object-log answers a one-property root breakdown without min, max, or avg",
-        ));
-    }
     // SQL groups by root property; the log's breakdown does the same. Count
     // and sum without grouping keep the plain top-level response.
     let breakdown = (uses_breakdown || !group_by.is_empty()).then(|| Breakdown {
@@ -2005,6 +1992,7 @@ fn object_record(object: &Object) -> ObjectRecord {
         action_id: None,
         props: object.properties.clone(),
         schema_version: 1,
+        source_version: 0,
     }
 }
 
@@ -2229,6 +2217,7 @@ mod tests {
                 hidden: true,
                 props: HashMap::from([("region".into(), "us".into())]),
                 schema_version: 1,
+                source_version: 0,
             }],
         )
         .unwrap();
@@ -2426,6 +2415,7 @@ mod tests {
                     hidden: false,
                     props: HashMap::from([("n".into(), generation.to_string())]),
                     schema_version: 1,
+                    source_version: 0,
                 }],
             )
             .unwrap();
@@ -2765,6 +2755,7 @@ mod tests {
                     props: HashMap::from([("region".into(), "eu".into())]),
 
                     schema_version: 1,
+                    source_version: 0,
                 },
                 ObjectRecord {
                     action_id: None,
@@ -2777,6 +2768,7 @@ mod tests {
                     props: HashMap::from([("customer_id".into(), "c1".into())]),
 
                     schema_version: 1,
+                    source_version: 0,
                 },
                 ObjectRecord {
                     action_id: None,
@@ -2792,6 +2784,7 @@ mod tests {
                     ]),
 
                     schema_version: 1,
+                    source_version: 0,
                 },
                 ObjectRecord {
                     action_id: None,
@@ -2807,6 +2800,7 @@ mod tests {
                     ]),
 
                     schema_version: 1,
+                    source_version: 0,
                 },
             ],
         )
@@ -2879,6 +2873,7 @@ mod tests {
                 ]),
 
                 schema_version: 1,
+                source_version: 0,
             }],
         )
         .unwrap();
@@ -3048,6 +3043,7 @@ mod tests {
             hidden: false,
             props,
             schema_version: 1,
+            source_version: 0,
         }
     }
 
@@ -3090,6 +3086,7 @@ mod tests {
                     hidden: false,
                     props,
                     schema_version: 1,
+                    source_version: 0,
                 }],
             )
             .unwrap();
@@ -3241,6 +3238,7 @@ mod tests {
                 hidden: false,
                 props: HashMap::new(),
                 schema_version: 1,
+                source_version: 0,
             }],
         )
         .unwrap();
@@ -3359,16 +3357,7 @@ mod tests {
                     group_by: group_by.into(),
                 };
                 let compared = compare_shop(&log, &aggregation, &orders, shop_view());
-                // The object log answers this shape from count and sum
-                // rollups (#3496), so the canary skips min, max, and avg.
-                if matches!(function, "min" | "max" | "avg") {
-                    assert!(
-                        matches!(compared, Err(ObjectLogCompareError::Unsupported(_))),
-                        "{group_by} {function}: {compared:?}"
-                    );
-                } else {
-                    compared.unwrap_or_else(|error| panic!("{group_by} {function}: {error:?}"));
-                }
+                compared.unwrap_or_else(|error| panic!("{group_by} {function}: {error:?}"));
             }
         }
 
@@ -3483,6 +3472,7 @@ mod tests {
                     hidden: false,
                     props: HashMap::from([("amount".into(), "9223372036854775807".into())]),
                     schema_version: 1,
+                    source_version: 0,
                 },
                 ObjectRecord {
                     action_id: None,
@@ -3493,6 +3483,7 @@ mod tests {
                     hidden: false,
                     props: HashMap::from([("amount".into(), "1".into())]),
                     schema_version: 1,
+                    source_version: 0,
                 },
             ],
         )
@@ -3769,6 +3760,7 @@ mod tests {
                 ]),
 
                 schema_version: 1,
+                source_version: 0,
             }],
         )
         .unwrap();
@@ -3800,6 +3792,7 @@ mod tests {
                 .collect(),
 
             schema_version: 1,
+            source_version: 0,
         };
         BatchIngest::run(
             &mut store,

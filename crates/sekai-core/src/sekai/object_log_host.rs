@@ -524,6 +524,7 @@ mod tests {
             action_id: None,
             props: HashMap::from([("region".into(), region.into())]),
             schema_version: 1,
+            source_version: 0,
         }
     }
 
