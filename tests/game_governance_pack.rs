@@ -369,6 +369,7 @@ impl GovernedGame {
             .decide_action_instance(bearer(
                 &self.tokens[role],
                 DecideActionInstanceRequest {
+                    expected_effect_digest: String::new(),
                     instance_id: instance_id.into(),
                     decision: "grant".into(),
                     reason: "approved".into(),

@@ -366,6 +366,7 @@ pub(super) async fn decide_action_instance(
     // principals, and the reserved operator names cannot decide.
     let decider = credentialed_decider(&req, &principals).ok_or_else(access_denied)?;
     let principals = vec![decider.clone()];
+    let policy_context = principal_policy_context(&req);
     let inner = req.into_inner();
     let instance = service
         .db
@@ -390,9 +391,37 @@ pub(super) async fn decide_action_instance(
     // namespace-admin fallback checks its own standing below.
     let decider_is_namespace_admin =
         authorize_source_type_namespace_admin(service, &principals, &instance.namespace).is_ok();
+    // A grant bound to a predicted effect (#3085) must still match it: a
+    // stale digest refuses by name and decides nothing. A denial writes
+    // nothing, so its digest is not checked.
+    let expected_effect_digest = if inner.decision == crate::sekai::action_instance::DECISION_GRANT
+    {
+        inner.expected_effect_digest.trim()
+    } else {
+        ""
+    };
+    if !expected_effect_digest.is_empty() {
+        let current = super::action_instance_effect_rpc::current_instance_effect(
+            service,
+            &principals,
+            tenant_context.as_ref(),
+            &policy_context,
+            &instance,
+        )
+        .map_err(|status| match status.code() {
+            tonic::Code::Internal => status,
+            _ => access_denied(),
+        })?;
+        if current.effect_digest != expected_effect_digest {
+            return Err(Status::failed_precondition(
+                "action_effect_changed: the predicted effect changed since it was read",
+            ));
+        }
+    }
     let outcome = ActionInstanceAdmission::new(service.db.runtime(), None)
         .with_tenant(acting_tenant(tenant_context.as_ref()))
         .with_machine_credential(freeze_machine_credential(tenant_context.as_ref()))
+        .with_effect_digest(expected_effect_digest)
         .decide(
             ActionInstanceDecisionRequest {
                 instance_id: inner.instance_id,

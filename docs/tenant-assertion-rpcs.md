@@ -175,6 +175,15 @@ subject), and the subject is recorded as the reporter
 stays experimental. `tenant_assertion_appends_reported_usage_for_its_principal`
 covers it through the token interceptor.
 
+## Added in #3085
+
+| RPC | Namespace from | Space action |
+| --- | --- | --- |
+| `PreviewActionInstanceEffect` | stored instance | read |
+
+The handler enforces the tenant on the instance's namespace and applies the
+reads of `GetActionInstance`. It stays experimental.
+
 ## Not available to tenant credentials
 
 `CloseDefinitionProposal` stays with unscoped credentials

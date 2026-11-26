@@ -41139,3 +41139,6 @@ mod agent_turn_transcript_rpc_tests;
 
 #[path = "recorded_eval_dataset_tests.rs"]
 mod recorded_eval_dataset_tests;
+
+#[path = "action_instance_effect_tests.rs"]
+mod action_instance_effect_tests;
