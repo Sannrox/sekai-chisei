@@ -45,6 +45,7 @@ pub mod model_platform_store;
 pub mod model_stage_review_store;
 pub mod model_stage_store;
 pub mod model_version_store;
+pub mod namespace_package_store;
 pub mod namespace_snapshot_store;
 pub mod object_log_ingest;
 pub mod object_security;

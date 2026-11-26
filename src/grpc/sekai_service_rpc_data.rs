@@ -448,7 +448,7 @@ struct DatasetAuthorization {
 /// that object; a dataset with no live binding object has no namespace and
 /// is refused, as are guests, here as well as at the interceptor.
 /// Tenant-free callers keep the principal checks.
-fn authorize_dataset(
+pub(super) fn authorize_dataset(
     service: &SekaiServiceImpl,
     principals: &[String],
     tenant_context: Option<&crate::enterprise::AuthenticatedContext>,

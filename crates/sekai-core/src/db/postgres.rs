@@ -266,6 +266,8 @@ const TRANSFORM_QUOTA_HOLD_COMPUTE_SECONDS_SCHEMA: &str =
     include_str!("postgres/0184_transform_quota_hold_compute_seconds.sql");
 const TRANSFORM_WORK_QUEUE_SCOPE_SCHEMA: &str =
     include_str!("postgres/0185_transform_work_queue_scope.sql");
+const NAMESPACE_PACKAGE_INSTALLATIONS_SCHEMA: &str =
+    include_str!("postgres/0186_namespace_package_installations.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1341,6 +1343,12 @@ const MIGRATIONS: &[Migration] = &[
         185,
         "transform_work_queue_scope",
         TRANSFORM_WORK_QUEUE_SCOPE_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        186,
+        "namespace_package_installations",
+        NAMESPACE_PACKAGE_INSTALLATIONS_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

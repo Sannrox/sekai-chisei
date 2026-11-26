@@ -4,6 +4,31 @@
 use super::*;
 
 impl RuntimeDb {
+    pub fn get_namespace_package_installation(
+        &self,
+        namespace: &str,
+        package_name: &str,
+    ) -> Result<Option<crate::sekai::namespace_package::NamespacePackageInstallation>, String> {
+        match self {
+            Self::Sqlite(db) => db.get_namespace_package_installation(namespace, package_name),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.get_namespace_package_installation(namespace, package_name)
+            }),
+        }
+    }
+
+    pub fn put_namespace_package_installation(
+        &self,
+        installation: &crate::sekai::namespace_package::NamespacePackageInstallation,
+    ) -> Result<crate::sekai::namespace_package::NamespacePackageInstallation, String> {
+        match self {
+            Self::Sqlite(db) => db.put_namespace_package_installation(installation),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.put_namespace_package_installation(installation)
+            }),
+        }
+    }
+
     pub fn get_client_package(
         &self,
         namespace: &str,

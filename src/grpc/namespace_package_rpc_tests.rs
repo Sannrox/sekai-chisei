@@ -1,8 +1,10 @@
 //! Namespace packages (#3093) through the gRPC service: the export lists
 //! what the caller may read with digests, counts the rest by kind, carries no
-//! data, and refuses a selected dataset it cannot package by name.
+//! data, and refuses a selected dataset it cannot package by name. Install
+//! checks everything before its first write, reproduces the digests once the
+//! definitions proposal merges, and changes nothing the second time.
 
-use super::namespace_package_rpc::export_namespace_package_as;
+use super::namespace_package_rpc::{export_namespace_package_as, install_namespace_package_with};
 use super::rpc_definition_package::{PackageSigner, package_keyring_from_json};
 use super::*;
 use crate::sekai::namespace_package::{
@@ -10,6 +12,7 @@ use crate::sekai::namespace_package::{
 };
 
 const NAMESPACE: &str = "pkg-ns";
+const TARGET: &str = "pkg-target";
 
 fn signer() -> PackageSigner {
     PackageSigner {
@@ -177,4 +180,284 @@ async fn a_dataset_the_caller_cannot_package_is_refused_by_name() {
 
     let refused = export(&svc, "Desk", &[]).unwrap_err();
     assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+}
+
+fn keyring() -> crate::shomei::TrustedKeyring {
+    let public_key: String = signer()
+        .key
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    package_keyring_from_json(&format!(
+        r#"[{{"identity":"plane-a","key_id":"k1","public_key":"{public_key}"}}]"#
+    ))
+    .unwrap()
+}
+
+/// An object in [`TARGET`] for installed datasets to bind to.
+fn target_object(svc: &SekaiServiceImpl, id: &str) {
+    svc.db
+        .runtime()
+        .create_object(&crate::domain::Object {
+            id: id.into(),
+            kind: "widget".into(),
+            name: "binding".into(),
+            namespace: TARGET.into(),
+            external_id: String::new(),
+            properties: HashMap::new(),
+            created: 1,
+            updated: 1,
+        })
+        .unwrap();
+}
+
+fn install(
+    svc: &SekaiServiceImpl,
+    envelope_json: &str,
+    datasets: &[(&str, &str, &str)],
+) -> Result<NamespacePackageInstallation, Status> {
+    install_namespace_package_with(
+        svc,
+        with_named_principal(
+            InstallNamespacePackageRequest {
+                namespace: TARGET.into(),
+                envelope_json: envelope_json.into(),
+                datasets: datasets
+                    .iter()
+                    .map(|(entry, dataset_id, object_id)| {
+                        (
+                            entry.to_string(),
+                            NamespacePackageDatasetTarget {
+                                dataset_id: dataset_id.to_string(),
+                                object_id: object_id.to_string(),
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            "root",
+        ),
+        &keyring(),
+    )
+    .map(|response| response.into_inner().installation.unwrap())
+}
+
+async fn installation(
+    svc: &SekaiServiceImpl,
+    package_name: &str,
+) -> Result<NamespacePackageInstallation, Status> {
+    svc.get_namespace_package_installation(with_named_principal(
+        GetNamespacePackageInstallationRequest {
+            namespace: TARGET.into(),
+            package_name: package_name.into(),
+        },
+        "root",
+    ))
+    .await
+    .map(|response| response.into_inner().installation.unwrap())
+}
+
+#[tokio::test]
+async fn install_reproduces_the_package_once_its_definitions_merge_and_only_once() {
+    let svc = service();
+    fixture(&svc).await;
+    let exported = export(&svc, "support-desk", &["tickets"]).unwrap();
+    target_object(&svc, "desk-binding");
+
+    let installed = install(
+        &svc,
+        &exported.envelope_json,
+        &[("tickets", "desk-tickets", "desk-binding")],
+    )
+    .unwrap();
+    assert_eq!(installed.status, "pending_definitions");
+    assert_eq!(installed.package_digest, exported.package_digest);
+    assert_eq!(installed.source_namespace, NAMESPACE);
+    // The dataset is created bound in the target, with the schema digest and
+    // no rows.
+    let dataset = svc
+        .db
+        .runtime()
+        .get_dataset("desk-tickets")
+        .unwrap()
+        .unwrap();
+    assert_eq!(dataset.object_id, "desk-binding");
+    let source = svc.db.runtime().get_dataset("tickets").unwrap().unwrap();
+    assert_eq!(
+        package_domain::DatasetDocument::of(&dataset).schema_digest(),
+        package_domain::DatasetDocument::of(&source).schema_digest()
+    );
+    assert!(
+        svc.db
+            .runtime()
+            .query_rows("desk-tickets", &Default::default())
+            .unwrap()
+            .is_empty()
+    );
+
+    // The definitions go through the target's normal review.
+    let proposal = svc
+        .db
+        .runtime()
+        .get_definition_proposal(TARGET, &installed.proposal_id)
+        .unwrap()
+        .unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: TARGET.into(),
+            proposal_id: installed.proposal_id.clone(),
+            idempotency_key: "install-approve".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: TARGET.into(),
+            proposal_id: installed.proposal_id.clone(),
+            expected_published_digest: proposal.base_digest,
+            idempotency_key: "install-merge".into(),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    let merged = installation(&svc, "support-desk").await.unwrap();
+    assert_eq!(merged.status, "installed");
+
+    // The same package again changes nothing.
+    let again = install(
+        &svc,
+        &exported.envelope_json,
+        &[("tickets", "desk-tickets", "desk-binding")],
+    )
+    .unwrap();
+    assert_eq!(again, merged);
+}
+
+#[tokio::test]
+async fn install_refuses_a_tampered_or_unmapped_package_before_any_write() {
+    let svc = service();
+    fixture(&svc).await;
+    let exported = export(&svc, "support-desk", &["tickets"]).unwrap();
+    target_object(&svc, "desk-binding");
+    let mapped = [("tickets", "desk-tickets", "desk-binding")];
+
+    let tampered = exported.envelope_json.replace("Ticket", "Tickey");
+    assert_ne!(tampered, exported.envelope_json);
+    let refused = install(&svc, &tampered, &mapped).unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        refused
+            .message()
+            .starts_with(package_domain::REFUSAL_TAMPERED),
+        "{}",
+        refused.message()
+    );
+    let refused = install(&svc, &exported.envelope_json, &[]).unwrap_err();
+    assert_eq!(
+        refused.message(),
+        "entry dataset_version/tickets is not mapped to a dataset"
+    );
+    let refused = install(
+        &svc,
+        &exported.envelope_json,
+        &[mapped[0], ("other", "x", "desk-binding")],
+    )
+    .unwrap_err();
+    assert_eq!(
+        refused.message(),
+        "package has no entry dataset_version/other"
+    );
+    let refused = install(
+        &svc,
+        &exported.envelope_json,
+        &[("tickets", "desk-tickets", "tickets-binding")],
+    )
+    .unwrap_err();
+    assert!(
+        refused.message().contains("dataset_version/tickets"),
+        "{}",
+        refused.message()
+    );
+
+    // None of them wrote anything.
+    assert_eq!(
+        installation(&svc, "support-desk").await.unwrap_err().code(),
+        tonic::Code::NotFound
+    );
+    assert!(
+        svc.db
+            .runtime()
+            .get_dataset("desk-tickets")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        svc.db
+            .runtime()
+            .get_published_definition_revision(TARGET)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn an_input_installs_only_when_mapped_to_a_dataset_of_its_schema() {
+    let svc = service();
+    fixture(&svc).await;
+    let source = svc.db.runtime().get_dataset("tickets").unwrap().unwrap();
+    let package = package_domain::build_namespace_package(
+        "with-input",
+        1,
+        &crate::sekai::definition_package::build_package(Vec::<(String, String, String)>::new())
+            .unwrap(),
+        &[],
+        std::slice::from_ref(&source),
+        Default::default(),
+    )
+    .unwrap();
+    let envelope = package_domain::sign_namespace_package(
+        package,
+        crate::sekai::definition_package::PackageProvenance {
+            source_namespace: NAMESPACE.into(),
+            source_revision_digest: String::new(),
+            exported_at_ms: 1,
+        },
+        "plane-a",
+        "k1",
+        &signer().key,
+    )
+    .unwrap();
+    let envelope_json = serde_json::to_string(&envelope).unwrap();
+    // Same shape under another name, and a different shape, both in TARGET.
+    bound_dataset(&svc, "local-tickets", TARGET, "root");
+    target_object(&svc, "other-binding");
+    svc.db
+        .runtime()
+        .create_dataset(&crate::sekai::dataset::Dataset {
+            id: "other-shape".into(),
+            name: "other".into(),
+            columns: Vec::new(),
+            object_id: "other-binding".into(),
+            created: 1,
+            partition_keys: vec![],
+        })
+        .unwrap();
+
+    let refused = install(&svc, &envelope_json, &[("tickets", "other-shape", "")]).unwrap_err();
+    assert_eq!(
+        refused.message(),
+        "entry dataset_version/tickets: dataset other-shape does not match its schema"
+    );
+    let installed = install(&svc, &envelope_json, &[("tickets", "local-tickets", "")]).unwrap();
+    // No definitions to review, so it is installed at once.
+    assert_eq!(installed.status, "installed");
+    assert!(installed.proposal_id.is_empty());
+    assert_eq!(installed.resources.len(), 1);
+    assert_eq!(installed.resources[0].role, "input");
+    assert_eq!(installed.resources[0].resource_id, "local-tickets");
 }

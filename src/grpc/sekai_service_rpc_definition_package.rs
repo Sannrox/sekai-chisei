@@ -91,7 +91,7 @@ pub(super) fn package_keyring_from_json(json: &str) -> Result<TrustedKeyring, St
     Ok(keyring)
 }
 
-fn package_keyring_from_env() -> Result<TrustedKeyring, Status> {
+pub(super) fn package_keyring_from_env() -> Result<TrustedKeyring, Status> {
     let path = std::env::var(TRUSTED_KEYS_ENV).map_err(|_| {
         Status::failed_precondition(format!(
             "{}: definition package import requires {TRUSTED_KEYS_ENV}",
@@ -238,26 +238,7 @@ pub(super) fn import_definition_package_with(
     // Verification and every check precede the first write, the genesis seed.
     let envelope: PackageEnvelope = package_domain::verify_envelope(&input.envelope_json, keyring)
         .map_err(Status::failed_precondition)?;
-    let members = envelope
-        .package
-        .members
-        .iter()
-        .map(|member| {
-            definition_branch_domain::DefinitionMemberInput {
-                member_kind: member.kind.clone(),
-                member_id: member.id.clone(),
-                definition_json: member.definition_json.clone(),
-                member_digest: String::new(),
-            }
-            .prepare(&input.namespace)
-            .map_err(|error| {
-                Status::failed_precondition(format!(
-                    "{REFUSAL_INCOMPATIBLE}: member {}/{}: {error}",
-                    member.kind, member.id
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let members = prepare_package_members(&input.namespace, &envelope.package)?;
     let opened = open_import_proposal(
         service,
         &principals,
@@ -286,24 +267,50 @@ pub(super) fn import_definition_package_with(
     }))
 }
 
+/// A verified package's members, prepared for `namespace`.
+pub(super) fn prepare_package_members(
+    namespace: &str,
+    package: &package_domain::DefinitionPackage,
+) -> Result<Vec<definition_branch_domain::DefinitionMember>, Status> {
+    package
+        .members
+        .iter()
+        .map(|member| {
+            definition_branch_domain::DefinitionMemberInput {
+                member_kind: member.kind.clone(),
+                member_id: member.id.clone(),
+                definition_json: member.definition_json.clone(),
+                member_digest: String::new(),
+            }
+            .prepare(namespace)
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "{REFUSAL_INCOMPATIBLE}: member {}/{}: {error}",
+                    member.kind, member.id
+                ))
+            })
+        })
+        .collect()
+}
+
 /// Where an import comes from and the identifiers of the proposal it opens.
-struct ImportSource {
-    branch_id: String,
-    proposal_id: String,
+pub(super) struct ImportSource {
+    pub(super) branch_id: String,
+    pub(super) proposal_id: String,
     /// A signed package's digest, or empty for a file tree.
-    package_digest: String,
+    pub(super) package_digest: String,
     /// A file tree's commit, or empty for a signed package.
-    commit: String,
-    idempotency_key: String,
+    pub(super) commit: String,
+    pub(super) idempotency_key: String,
     /// The published head the caller planned against, when it planned:
     /// `Some("")` for a namespace that had published nothing. A package
     /// import (`None`) applies to whatever head is current.
-    expected_published_digest: Option<String>,
+    pub(super) expected_published_digest: Option<String>,
 }
 
 /// The proposal an import opened, with the revisions it compares.
-struct OpenedImport {
-    proposal: definition_proposal_domain::DefinitionProposal,
+pub(super) struct OpenedImport {
+    pub(super) proposal: definition_proposal_domain::DefinitionProposal,
     preview: definition_diff_domain::DefinitionRevisionDiff,
     compatibility: definition_diff_domain::DefinitionRevisionCompatibility,
 }
@@ -311,7 +318,7 @@ struct OpenedImport {
 /// Open a branch and proposal whose candidate holds exactly `members` on top
 /// of the published head. Every authorization and importability check runs
 /// before the first write, so a refused import creates no branch.
-fn open_import_proposal(
+pub(super) fn open_import_proposal(
     service: &SekaiServiceImpl,
     principals: &[String],
     namespace: &str,

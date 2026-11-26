@@ -1014,6 +1014,10 @@ fn enterprise_namespace_method(method: &str) -> bool {
             // Namespace packages (#3093) read like a definition export and
             // check dataset grants in the handler.
             | "ExportNamespacePackage"
+            // Install checks namespace write and the dataset and member
+            // grants in the handler; the read checks namespace read.
+            | "InstallNamespacePackage"
+            | "GetNamespacePackageInstallation"
             | "ImportDefinitionPackage"
             | "ImportDefinitionTree"
             | "GetGovernedFactVersion"
@@ -3782,6 +3786,8 @@ mod tests {
             "SetDefinitionBranchArchived",
             "ExportDefinitionPackage",
             "ExportNamespacePackage",
+            "InstallNamespacePackage",
+            "GetNamespacePackageInstallation",
             "ImportDefinitionPackage",
             "ImportDefinitionTree",
         ] {

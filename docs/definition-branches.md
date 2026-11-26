@@ -264,7 +264,27 @@ package.
 - The package digest covers the whole manifest and is signed with the
   definition package key above. Verification refuses with
   `namespace_package_unverified`, `namespace_package_tampered`, or
-  `namespace_package_incompatible`, naming the entry. Install comes later.
+  `namespace_package_incompatible`, naming the entry.
+
+`InstallNamespacePackage` (experimental) installs a package into a namespace
+the caller may write. Every check comes before the first write:
+
+- the signature against the package keyring (`SEKAI_DEFINITION_PACKAGE_*`)
+  and every digest;
+- one target per dataset entry in `datasets`, keyed by entry id. An output
+  names a new dataset id and an object in the namespace to bind it to. An
+  input names an existing dataset bound in the namespace whose columns and
+  partition keys match the entry's schema digest. An unmapped entry, a
+  target with no entry, or a mismatched input is refused by name;
+- the namespace holds no published definitions.
+
+The definitions then open as proposal `package/<name>/v<version>`, which goes
+through the namespace's normal review. The output datasets are created
+without rows. `GetNamespacePackageInstallation` reports the installation as
+`pending_definitions` until that proposal merges, then `installed`, or
+`diverged` when the merged definitions do not reproduce the ontology digest.
+Installing the same package again returns the same installation; another
+version of an installed package is refused until upgrade ships.
 
 `CompareDefinitionRevisions` takes two revision digests in one namespace. It
 reauthorizes every member on both revisions, then reports added, removed, and
