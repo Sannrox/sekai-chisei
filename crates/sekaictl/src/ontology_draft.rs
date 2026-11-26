@@ -55,6 +55,8 @@ pub struct DraftOutcome {
     pub changes: Vec<SourceChange>,
     /// Decisions whose subject the source no longer has. They stay in the file.
     pub stale: Vec<Decision>,
+    /// The governed call behind `--describe`, when it ran.
+    pub described: Option<crate::ontology_describe::DescribeRecord>,
 }
 
 /// One review decision in `draft-decisions.json`. Subjects name the source
@@ -224,18 +226,41 @@ impl fmt::Display for SourceChange {
     }
 }
 
+/// How `sekaictl ontology draft` runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DraftOptions<'a> {
+    /// The namespace whose lattice marks sensitive columns and in which the
+    /// `describe` call is governed.
+    pub namespace: Option<&'a str>,
+    /// Permits redrafting an existing draft.
+    pub update: bool,
+    /// Proposes descriptions and alternative names through one governed
+    /// model call before anything is written.
+    pub describe: bool,
+}
+
 /// Loads a discovery file, optionally the namespace lattice for sensitive
-/// columns, and writes the tree. `update` permits redrafting an existing draft.
+/// columns, optionally proposes text, and writes the tree. Without
+/// `describe` no model is called.
 pub async fn run(
     target: &str,
     discovery_path: &Path,
     out: &Path,
-    namespace: Option<&str>,
-    update: bool,
+    options: DraftOptions<'_>,
 ) -> Result<DraftOutcome, BoxErr> {
     let discovery = load_discovery(discovery_path).map_err(std::io::Error::other)?;
+    let describe_namespace = match (options.describe, options.namespace) {
+        (true, None) => {
+            return Err(std::io::Error::other(
+                "--describe needs --namespace: the model call is governed in that namespace",
+            )
+            .into());
+        }
+        (true, Some(namespace)) => Some(namespace),
+        (false, _) => None,
+    };
     let marking = if needs_marking(&discovery) {
-        let namespace = namespace.ok_or_else(|| {
+        let namespace = options.namespace.ok_or_else(|| {
             std::io::Error::other(
                 "--namespace is required when the discovery flags possibly_sensitive columns",
             )
@@ -248,7 +273,25 @@ pub async fn run(
     } else {
         None
     };
-    Ok(draft_into(out, &discovery, marking.as_deref(), update).map_err(std::io::Error::other)?)
+    let decisions = load_decisions(out).map_err(std::io::Error::other)?;
+    let mut draft =
+        draft_tree(&discovery, marking.as_deref(), &decisions).map_err(std::io::Error::other)?;
+    let mut described = None;
+    if let Some(namespace) = describe_namespace {
+        // Refuse a write the draft would refuse anyway before spending a call.
+        if out.join(LAYOUT_FILE).exists() && !options.update {
+            return Err(std::io::Error::other(format!(
+                "{} already holds a definition tree; pass --update to redraft it",
+                out.display()
+            ))
+            .into());
+        }
+        described = Some(crate::ontology_describe::describe(target, namespace, &mut draft).await?);
+    }
+    let mut outcome = write_outcome(out, &discovery, &decisions, &draft, options.update)
+        .map_err(std::io::Error::other)?;
+    outcome.described = described;
+    Ok(outcome)
 }
 
 /// Drafts into `out`, honoring the decisions already in it. Rerunning after an
@@ -262,7 +305,17 @@ pub fn draft_into(
 ) -> Result<DraftOutcome, String> {
     let decisions = load_decisions(out)?;
     let draft = draft_tree(discovery, most_restrictive_marking, &decisions)?;
-    let (removed, changes) = write_draft(out, &draft, update)?;
+    write_outcome(out, discovery, &decisions, &draft, update)
+}
+
+fn write_outcome(
+    out: &Path,
+    discovery: &SourceDiscovery,
+    decisions: &[Decision],
+    draft: &Draft,
+    update: bool,
+) -> Result<DraftOutcome, String> {
+    let (removed, changes) = write_draft(out, draft, update)?;
     Ok(DraftOutcome {
         files: draft.tree.len(),
         removed,
@@ -272,6 +325,7 @@ pub fn draft_into(
             .filter(|decision| !subject_exists(discovery, decision))
             .cloned()
             .collect(),
+        described: None,
     })
 }
 
