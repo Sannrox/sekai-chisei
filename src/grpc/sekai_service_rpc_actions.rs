@@ -179,15 +179,11 @@ pub(super) async fn submit_action_instance(
         .unwrap_or_default();
     // A turn token submits only while its turn is claimed (ADR 0142), and
     // its admission commits only while that claim still holds.
-    service.authorize_turn_submission(&req, req.get_ref().namespace.trim())?;
-    let agent_turn = req
-        .extensions()
-        .get::<RuntimeTokenClaims>()
-        .filter(|claims| claims.is_turn())
-        .map(|claims| crate::sekai::action_instance::AgentTurnFence {
-            turn_id: claims.turn_id.clone(),
-            claim_generation: claims.claim_generation,
-        });
+    let agent_turn = service.authorize_turn_submission(
+        &req,
+        req.get_ref().namespace.trim(),
+        req.get_ref().type_id.trim(),
+    )?;
     let mut inner = req.into_inner();
     let namespace = inner.namespace.trim().to_string();
     if namespace.is_empty() {

@@ -546,6 +546,23 @@ pub(super) fn to_proto_action_instance(
         }),
         erased_properties: domain.erased_properties.clone(),
         erased_request_digest: domain.erased_request_digest.clone(),
+        agent_turn: domain.agent_turn.as_ref().map(|turn| {
+            let interactive = turn.interactive.clone();
+            crate::grpc::pb::sekai::ActionAgentTurn {
+                turn_id: turn.turn_id.clone(),
+                definition_revision_digest: interactive
+                    .as_ref()
+                    .map(|receipt| receipt.definition_revision_digest.clone())
+                    .unwrap_or_default(),
+                agent_member: interactive
+                    .as_ref()
+                    .map(|receipt| receipt.agent_member.clone())
+                    .unwrap_or_default(),
+                trace_id: interactive
+                    .map(|receipt| receipt.trace_id)
+                    .unwrap_or_default(),
+            }
+        }),
     }
 }
 fn to_proto_offline_submission(

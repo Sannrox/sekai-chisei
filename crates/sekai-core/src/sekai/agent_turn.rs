@@ -2134,6 +2134,7 @@ mod tests {
         action.agent_turn = Some(crate::sekai::action_instance::AgentTurnFence {
             turn_id: turn.turn_id.clone(),
             claim_generation: u64::try_from(turn.claim_generation).unwrap(),
+            interactive: None,
         });
         db.put_action_instance(&action).unwrap();
         action.instance_id

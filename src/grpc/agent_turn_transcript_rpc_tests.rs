@@ -108,6 +108,7 @@ async fn claimed_turn() -> (SekaiServiceImpl, AgentTurn) {
                 turn_id: woken.turn_id,
                 ttl_ms: 60_000,
                 accepts_continuation: true,
+                accepts_interactive: false,
             },
             "local",
         ))

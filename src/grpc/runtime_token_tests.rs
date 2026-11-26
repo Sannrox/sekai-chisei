@@ -446,6 +446,7 @@ async fn claim_turn(
         turn_id: turn_id.into(),
         ttl_ms: 60_000,
         accepts_continuation: true,
+        accepts_interactive: false,
     });
     let mut context = tenant_context(&format!("tenant-{suffix}"));
     context.principal.subject = TURN_WORKER.into();
@@ -772,6 +773,7 @@ async fn a_credential_admin_must_not_claim_its_own_instance() {
                 turn_id: turn_id.clone(),
                 ttl_ms: 60_000,
                 accepts_continuation: true,
+                accepts_interactive: false,
             });
             let mut context = tenant_context("tenant-a");
             context.principal.subject = TURN_WORKER.into();
@@ -847,7 +849,8 @@ async fn a_turn_token_submits_only_for_its_live_claim() {
         let request = with_token(&plane, &token, "SubmitActionInstance", ());
         plane
             .service
-            .authorize_turn_submission(&request, namespace)
+            .authorize_turn_submission(&request, namespace, "Ticket.inspect")
+            .map(|_| ())
             .map_err(|status| status.code())
     };
     assert_eq!(submission("ns-a"), Ok(()));
@@ -928,6 +931,7 @@ async fn a_parked_turn_resumes_with_its_continuation_once_decided() {
         agent_turn: Some(crate::sekai::action_instance::AgentTurnFence {
             turn_id: turn_id.clone(),
             claim_generation: u64::try_from(turn.claim_generation).unwrap(),
+            interactive: None,
         }),
         instance_id: "parked-a".into(),
         namespace: "ns-a".into(),
@@ -1003,6 +1007,7 @@ async fn a_parked_turn_resumes_with_its_continuation_once_decided() {
         turn_id: turn_id.clone(),
         ttl_ms: 60_000,
         accepts_continuation: true,
+        accepts_interactive: false,
     });
     let mut context = tenant_context("tenant-a");
     context.principal.subject = TURN_WORKER.into();
@@ -1067,6 +1072,7 @@ async fn a_parked_turn_resumes_with_its_continuation_once_decided() {
             namespace: "ns-a".into(),
             limit: 10,
             accepts_continuation,
+            accepts_interactive: false,
         });
         let mut context = tenant_context("tenant-a");
         context.principal.subject = TURN_WORKER.into();
@@ -1088,6 +1094,7 @@ async fn a_parked_turn_resumes_with_its_continuation_once_decided() {
         turn_id: turn_id.clone(),
         ttl_ms: 60_000,
         accepts_continuation: false,
+        accepts_interactive: false,
     });
     let mut context = tenant_context("tenant-a");
     context.principal.subject = TURN_WORKER.into();
@@ -1258,6 +1265,7 @@ async fn an_agent_turn_claimed_on_either_family_is_acknowledged_on_the_other() {
         options: Some(claim_work_request::Options::AgentTurn(
             AgentTurnWorkOptions {
                 accepts_continuation: true,
+                accepts_interactive: false,
             },
         )),
         ..Default::default()

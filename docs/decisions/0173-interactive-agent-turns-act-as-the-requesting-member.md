@@ -81,9 +81,10 @@ would also retire such a row as "site agent instance is gone".
    record, the storage and the admission call; admitted turns stay pending
    because no claim path reads the table. The next slice adds the opt-in
    claim and listing, the member-subject token, the Action type bound,
-   receipt attributes and the freeze test. Tool-binding approval and
-   turn-token reads follow. Until a slice lands, its calls are unavailable
-   on interactive turns.
+   receipt attributes (`ActionInstance.agent_turn`) and the freeze test.
+   Parking, tool-binding approval and turn-token reads (transcript and
+   working memory) follow. Until a slice lands, its calls are refused on
+   interactive turns.
 
 ## Alternatives considered
 

@@ -523,6 +523,7 @@ async fn claim_turn(
             turn_id: turn_id.into(),
             ttl_ms: 60_000,
             accepts_continuation: true,
+            accepts_interactive: false,
         },
     )?;
     plane
@@ -568,6 +569,7 @@ async fn a_registered_turn_worker_works_turns_in_its_namespaces_only() {
                     namespace: IN_SCOPE.into(),
                     limit: 10,
                     accepts_continuation: true,
+                    accepts_interactive: false,
                 },
             )
             .unwrap(),
@@ -666,6 +668,7 @@ async fn a_turn_worker_must_not_be_the_instance_principal() {
                     turn_id: String::new(),
                     ttl_ms: 60_000,
                     accepts_continuation: true,
+                    accepts_interactive: false,
                 },
             )
             .unwrap(),

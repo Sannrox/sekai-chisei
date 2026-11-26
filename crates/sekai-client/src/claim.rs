@@ -883,6 +883,11 @@ impl<'a> RuntimeClaimClient<'a> {
                                 Some(list_claimable_work_request::Options::AgentTurn(options))
                                     if options.accepts_continuation
                             ),
+                            accepts_interactive: matches!(
+                                options,
+                                Some(list_claimable_work_request::Options::AgentTurn(options))
+                                    if options.accepts_interactive
+                            ),
                         },
                         true,
                     )
@@ -953,6 +958,11 @@ impl<'a> RuntimeClaimClient<'a> {
                             options,
                             Some(claim_work_request::Options::AgentTurn(options))
                                 if options.accepts_continuation
+                        ),
+                        accepts_interactive: matches!(
+                            options,
+                            Some(claim_work_request::Options::AgentTurn(options))
+                                if options.accepts_interactive
                         ),
                     },
                     false,
@@ -1600,6 +1610,7 @@ fn unexpected_response() -> RuntimeClaimError {
 fn turn_options() -> AgentTurnWorkOptions {
     AgentTurnWorkOptions {
         accepts_continuation: true,
+        accepts_interactive: false,
     }
 }
 

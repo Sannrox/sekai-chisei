@@ -38356,6 +38356,7 @@ async fn agent_turns_wake_claim_and_ack_over_the_wire() {
                 namespace: "ops".into(),
                 limit: 10,
                 accepts_continuation: false,
+                accepts_interactive: false,
             },
             "local",
         ))
@@ -38372,6 +38373,7 @@ async fn agent_turns_wake_claim_and_ack_over_the_wire() {
                 turn_id: turn.turn_id.clone(),
                 ttl_ms: 60_000,
                 accepts_continuation: true,
+                accepts_interactive: false,
             },
             "local",
         ))
@@ -38456,6 +38458,7 @@ async fn site_agent_instance_turns_list_refusals_and_hide_like_missing() {
                 turn_id,
                 ttl_ms: 60_000,
                 accepts_continuation: true,
+                accepts_interactive: false,
             },
             "local",
         ))
@@ -39300,6 +39303,7 @@ async fn transform_ticks_admit_due_agent_schedule_wakes() {
                 namespace: "ops".into(),
                 limit: 10,
                 accepts_continuation: false,
+                accepts_interactive: false,
             },
             "local",
         ))
