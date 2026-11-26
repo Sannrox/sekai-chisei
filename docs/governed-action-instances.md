@@ -20,6 +20,7 @@ receipt / harvest spine.
 | Object-bound describe | `DescribeObjectAction` |
 | Object-bound preview | `PreviewObjectAction` |
 | Read by id or key | `GetActionInstance` |
+| Predicted effect of a parked instance | `PreviewActionInstanceEffect` |
 | List | `ListActionInstances` |
 
 ## Describe and preview
@@ -317,6 +318,28 @@ marking clearance, entitlement and review-queue placement. Those checks
 replace the namespace read check, as they do for a decision. An instance
 the caller may not decide is absent, and a caller who may decide nothing
 gets an empty list.
+
+`PreviewActionInstanceEffect` (#3085, experimental) shows an approver what a
+grant would write before deciding. It runs the parked instance through the
+`PreviewObjectAction` path as one plan step and applies nothing. The response
+names the target object, the revision it was predicted against, the outcome,
+and the effect (`PlanStepEffect`: mutation and changed properties). A changed
+property the reader may not see, through property grants, restricted
+classification or egress, is left out of `changed_properties` and counted in
+`withheld_properties`. `effect_digest` covers the instance, the object
+revision and the full effect, withheld properties included; it changes only
+when the write would. The caller needs the read a `GetActionInstance` needs;
+an instance that is not parked is refused with `FailedPrecondition`.
+
+`DecideActionInstance` takes that digest as `expected_effect_digest`. On a
+grant the server predicts the effect again; if the digest differs, the grant
+is refused with `FailedPrecondition` and a message starting
+`action_effect_changed`, and the instance stays parked. A matching grant
+records the digest on the receipt's `approval_decided` event and in the
+admission decision's evidence as `effect_digest`. A denial writes nothing, so
+its digest is ignored. An empty digest decides as before: a grant against a
+target that changed since the park ends the instance `denied` with
+`stale_on_resume`, where a stale digest leaves it parked for a fresh read.
 
 `ListActionInstances` lists newest first. `created_from_ms` and
 `created_before_ms` select instances created in `[from, before)` (#2122);

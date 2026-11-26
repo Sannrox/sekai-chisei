@@ -1061,6 +1061,7 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "DecidePlanReview"
             | "ExecuteActionPlan"
             | "GetActionInstance"
+            | "PreviewActionInstanceEffect"
             | "ListActionInstances"
             | "ListPendingDecisions"
             | "GetActionEffect"

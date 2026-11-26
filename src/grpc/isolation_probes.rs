@@ -304,6 +304,7 @@ async fn isolation_probe_1140_only_one_credentialed_subject_decides() {
         instance_id: parked.instance_id.clone(),
         decision: "grant".into(),
         reason: "probe".into(),
+        ..Default::default()
     };
 
     // Comma-listed principals and a self-asserted identity cannot decide.

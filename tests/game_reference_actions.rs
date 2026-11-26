@@ -258,6 +258,7 @@ async fn game_fleet_actions_follow_their_policies() {
         bearer(
             &admiral,
             DecideActionInstanceRequest {
+                expected_effect_digest: String::new(),
                 instance_id: instance_id.into(),
                 decision: "grant".into(),
                 reason: "approved".into(),

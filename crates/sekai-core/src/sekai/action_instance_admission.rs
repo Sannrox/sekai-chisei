@@ -206,6 +206,8 @@ struct ApprovalRecord<'r> {
     decider: &'r str,
     decision: &'r str,
     reason: &'r str,
+    /// The predicted effect the approver saw (#3085); empty when none.
+    effect_digest: &'r str,
 }
 
 pub struct ActionInstanceAdmission<'a> {
@@ -215,6 +217,7 @@ pub struct ActionInstanceAdmission<'a> {
     tenant: &'a str,
     machine_credential: bool,
     budget_refused: bool,
+    effect_digest: &'a str,
 }
 
 impl<'a> ActionInstanceAdmission<'a> {
@@ -226,6 +229,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             tenant: "",
             machine_credential: false,
             budget_refused: false,
+            effect_digest: "",
         }
     }
 
@@ -249,6 +253,14 @@ impl<'a> ActionInstanceAdmission<'a> {
 
     pub fn with_machine_credential(mut self, machine_credential: bool) -> Self {
         self.machine_credential = machine_credential;
+        self
+    }
+
+    /// The predicted effect the approver saw before deciding (#3085). A
+    /// decision records it on its approval receipt event and audit evidence.
+    /// The caller checks it is current; the decision only records it.
+    pub fn with_effect_digest(mut self, effect_digest: &'a str) -> Self {
+        self.effect_digest = effect_digest;
         self
     }
 
@@ -1198,6 +1210,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             decider,
             decision,
             reason: &request.reason,
+            effect_digest: self.effect_digest,
         };
         if decision == DECISION_DENY {
             return self.finish_denied(instance, "denied_by_approver", &approval, now);
@@ -1676,6 +1689,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                                     decider: "review.queue",
                                     decision: DECISION_DENY,
                                     reason: "sla",
+                                    effect_digest: "",
                                 };
                                 self.finish_denied(next, "review_sla_expired", &approval, now)?;
                                 denied += 1;
@@ -1702,6 +1716,7 @@ impl<'a> ActionInstanceAdmission<'a> {
                                 decider: "review.queue",
                                 decision: DECISION_DENY,
                                 reason: "sla",
+                                effect_digest: "",
                             };
                             self.finish_denied(next, "review_sla_expired", &approval, now)?;
                             denied += 1;
@@ -2194,6 +2209,9 @@ impl<'a> ActionInstanceAdmission<'a> {
             if !approval.reason.trim().is_empty() {
                 attributes.insert("reason".into(), approval.reason.trim().to_string());
             }
+            if !approval.effect_digest.is_empty() {
+                attributes.insert("effect_digest".into(), approval.effect_digest.to_string());
+            }
             if !stored.review.queue_id.is_empty() {
                 attributes.insert("queue_id".into(), stored.review.queue_id.clone());
             }
@@ -2597,6 +2615,11 @@ impl ActionInstanceAdmission<'_> {
                 .get("reason")
                 .map(String::as_str)
                 .unwrap_or_default(),
+            effect_digest: approved
+                .attributes
+                .get("effect_digest")
+                .map(String::as_str)
+                .unwrap_or_default(),
         };
         let now = approved.timestamp_ms;
         let decision = admission_decision(stored, &approved.actor, admitted, Some(&approval), now);
@@ -2697,6 +2720,9 @@ fn admission_decision(
     if let Some(approval) = approval {
         evidence.insert("approver".into(), approval.decider.to_string());
         evidence.insert("approval_decision".into(), approval.decision.to_string());
+        if !approval.effect_digest.is_empty() {
+            evidence.insert("effect_digest".into(), approval.effect_digest.to_string());
+        }
     }
     let step = if approval.is_some() {
         "decide"

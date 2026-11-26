@@ -4130,11 +4130,43 @@ message DecideActionInstanceRequest {
   string decision = 2;
   // Optional approver note, recorded in audit. Not parameter data.
   string reason = 3;
+  // The effect_digest from PreviewActionInstanceEffect the approver saw
+  // (#3085). On a grant it must still be the current one, or the grant is
+  // refused with action_effect_changed and nothing is decided; the decision
+  // receipt records it. Empty decides as before, without the check.
+  string expected_effect_digest = 4;
 }
 message DecideActionInstanceResponse {
   ActionInstance instance = 1;
   // True when this decision was already recorded; nothing changed.
   bool replay = 2;
+}
+// The predicted effect of a parked Action instance (#3085): what the
+// PreviewObjectAction path predicts its write to the target object would be,
+// for an approver. Applies nothing and records nothing. Needs the same
+// namespace and instance read as GetActionInstance and read on the target.
+message PreviewActionInstanceEffectRequest {
+  string instance_id = 1;
+}
+message PreviewActionInstanceEffectResponse {
+  string instance_id = 1;
+  string object_id = 2;
+  // The target revision the prediction was made against.
+  string object_revision = 3;
+  // A PreviewObjectAction outcome: valid, invalid, stale, or unavailable
+  // when the target is gone.
+  string outcome = 4;
+  string reason_code = 5;
+  string failing_criterion = 6;
+  // The write, when one is predicted. changed_properties names only the
+  // properties the caller may read.
+  PlanStepEffect effect = 7;
+  // Changed properties left out of effect because the caller may not read
+  // them.
+  uint32 withheld_properties = 8;
+  // Covers the instance, the object revision and the whole effect,
+  // withheld properties included. Pass it to DecideActionInstance.
+  string effect_digest = 9;
 }
 // Object-change automation binding (#1092, ADR 0090). binding_json is the
 // sekai.action-binding/v1 document: namespace, kind, ops, pinned type and
@@ -7215,6 +7247,8 @@ service SekaiService {
   // Governed ActionInstance admission (#397).
   rpc SubmitActionInstance(SubmitActionInstanceRequest) returns (SubmitActionInstanceResponse);
   rpc DecideActionInstance(DecideActionInstanceRequest) returns (DecideActionInstanceResponse);
+  // Experimental: the predicted effect of a parked instance (#3085).
+  rpc PreviewActionInstanceEffect(PreviewActionInstanceEffectRequest) returns (PreviewActionInstanceEffectResponse);
   // Action bindings (ADR 0090, `sekai.action-binding/v1`): stable (#3036).
   rpc PutActionBinding(PutActionBindingRequest) returns (PutActionBindingResponse);
   rpc RunActionBinding(RunActionBindingRequest) returns (RunActionBindingResponse);

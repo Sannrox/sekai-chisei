@@ -36,6 +36,8 @@ use data_export_rpc::{
     EXPORT_BATCH, ExportCaller, ExportStream, ExportWriter, PreparedExport, export_grantee,
     run_export,
 };
+#[path = "action_instance_effect_rpc.rs"]
+mod action_instance_effect_rpc;
 #[path = "dataset_rollback_rpc.rs"]
 mod dataset_rollback_rpc;
 #[path = "definition_bundle_apply_rpc.rs"]
@@ -1207,6 +1209,13 @@ impl SekaiService for SekaiServiceImpl {
         req: Request<DecideActionInstanceRequest>,
     ) -> Result<Response<DecideActionInstanceResponse>, Status> {
         rpc_actions::decide_action_instance(self, req).await
+    }
+
+    async fn preview_action_instance_effect(
+        &self,
+        req: Request<PreviewActionInstanceEffectRequest>,
+    ) -> Result<Response<PreviewActionInstanceEffectResponse>, Status> {
+        action_instance_effect_rpc::preview_action_instance_effect(self, req).await
     }
 
     async fn describe_object_action(

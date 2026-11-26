@@ -371,6 +371,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.SetGovernedActionTypeEnabled` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.SubmitActionInstance` | `sekai.audit` | yes | host, example | `stable` |
 | `SekaiService.DecideActionInstance` | `sekai.audit` | yes | host, example | `stable` |
+| `SekaiService.PreviewActionInstanceEffect` | `sekai.audit` | yes | none | `experimental` |
 | `SekaiService.PutActionBinding` | `sekai.audit` | yes | sdk | `stable` |
 | `SekaiService.RunActionBinding` | `sekai.audit` | yes | sdk | `stable` |
 | `SekaiService.GetActionBinding` | `sekai.audit` | yes | sdk | `stable` |

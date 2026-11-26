@@ -101,6 +101,7 @@ async fn pending_actions_and_plans_are_what_their_decide_rpcs_accept() {
                 instance_id: instance_id.clone(),
                 decision: "deny".into(),
                 reason: String::new(),
+                ..Default::default()
             },
             principal,
         ))
@@ -402,6 +403,7 @@ async fn a_foreign_tenant_namespace_lists_nothing() {
         instance_id: "parked-denied".into(),
         decision: "deny".into(),
         reason: String::new(),
+        ..Default::default()
     });
     decide
         .metadata_mut()

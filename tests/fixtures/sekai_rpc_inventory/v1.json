@@ -3637,6 +3637,18 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "PreviewActionInstanceEffect",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/action_plan.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "DescribeObjectAction",
       "kind": "query",
       "surfaces": [],

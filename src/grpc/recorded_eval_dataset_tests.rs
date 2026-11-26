@@ -29,6 +29,7 @@ async fn decide(svc: &SekaiServiceImpl, instance_id: &str, decision: &str) {
             instance_id: instance_id.into(),
             decision: decision.into(),
             reason: String::new(),
+            ..Default::default()
         },
         "alice",
     ))

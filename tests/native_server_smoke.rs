@@ -1126,6 +1126,7 @@ async fn spawned_binary_parks_an_action_until_a_named_approver_grants_it() {
     // The operator socket's self-asserted identity cannot approve (#1140).
     let local = sekai
         .decide_action_instance(DecideActionInstanceRequest {
+            expected_effect_digest: String::new(),
             instance_id: parked.instance_id.clone(),
             decision: "grant".into(),
             reason: String::new(),
@@ -1140,6 +1141,7 @@ async fn spawned_binary_parks_an_action_until_a_named_approver_grants_it() {
             .decide_action_instance(bearer(
                 token,
                 DecideActionInstanceRequest {
+                    expected_effect_digest: String::new(),
                     instance_id: parked.instance_id.clone(),
                     decision: "grant".into(),
                     reason: String::new(),
@@ -1155,6 +1157,7 @@ async fn spawned_binary_parks_an_action_until_a_named_approver_grants_it() {
         .decide_action_instance(bearer(
             &approver,
             DecideActionInstanceRequest {
+                expected_effect_digest: String::new(),
                 instance_id: parked.instance_id.clone(),
                 decision: "grant".into(),
                 reason: "verified".into(),
@@ -1384,6 +1387,7 @@ async fn dataset_commit_binding_smoke(require_approval: bool) {
             .decide_action_instance(bearer(
                 &approver,
                 DecideActionInstanceRequest {
+                    expected_effect_digest: String::new(),
                     instance_id: submission.instance_id.clone(),
                     decision: "grant".into(),
                     reason: "reviewed".into(),
