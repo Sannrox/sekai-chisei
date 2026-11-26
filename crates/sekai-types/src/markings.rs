@@ -292,7 +292,7 @@ pub fn principal_authority_from_profile(
 
 /// Trusted local service principals receive the top of the lattice and any purpose.
 pub fn trusted_service_authority(principal: &str) -> Option<PrincipalAuthority> {
-    if matches!(principal, "root" | "local" | "chisei-gateway") {
+    if matches!(principal, "root" | "local") {
         Some(PrincipalAuthority {
             principal: principal.into(),
             classification_ceiling: Some(EvidenceClassification::Restricted),
@@ -307,7 +307,7 @@ pub fn trusted_service_authority(principal: &str) -> Option<PrincipalAuthority> 
 
 /// Whether a trusted principal bypasses purpose allow-lists.
 pub fn is_trusted_service_principal(principal: &str) -> bool {
-    matches!(principal, "root" | "local" | "chisei-gateway")
+    matches!(principal, "root" | "local")
 }
 
 /// Evaluate whether `authority` may read an object with `object_marking`.

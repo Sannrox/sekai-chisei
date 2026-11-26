@@ -112,7 +112,7 @@ Deep link: `/console/n/{namespace}/ops/{operation_id}`.
 - Side panel exposes authorized JSON only; credential-like attribute keys are
   scrubbed. Omitted references from retention remain explicit.
 - Visibility matches `GetOperationReceipt`: initiating actor, or bootstrap
-  principals `root` / `local` / `chisei-gateway`.
+  principals `root` / `local`.
 - Cross-namespace IDs return **403** without disclosing foreign receipt content.
 - Initial fixture-sized load budget: **2s** (`WORKSPACE_INITIAL_LOAD_BUDGET_MS`).
 - List home caps at **50** operations over the last **7 days**.

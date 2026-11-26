@@ -887,7 +887,7 @@ enum IdentitySource {
 }
 
 /// Principal names that authorization checks treat as built-in identities.
-const RESERVED_PRINCIPALS: [&str; 4] = ["root", "local", "anonymous", "chisei-gateway"];
+const RESERVED_PRINCIPALS: [&str; 3] = ["root", "local", "anonymous"];
 
 fn valid_single_principal(principal: &str) -> bool {
     !principal.is_empty() && principal.trim() == principal && !principal.contains(',')
@@ -1470,11 +1470,6 @@ pub fn run_for_plane(
         let credential_store = Arc::new(PrincipalCredentialStore::new());
         credential_store.load(&active_credentials);
 
-        if let Some(socket_path) = config.sekai_socket.as_deref()
-            && plane.serves_sekai()
-        {
-            ensure_local_gateway_credential(socket_path, &db)?;
-        }
         let assertion_authority = config
             .assertion_authority()
             .map_err(std::io::Error::other)?
@@ -1649,46 +1644,6 @@ pub fn run_for_plane(
         )
         .await
     })
-}
-
-fn ensure_local_gateway_credential(
-    socket_path: &str,
-    db: &RuntimeDb,
-) -> Result<(), std::io::Error> {
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let token_path = format!("{socket_path}.gateway-token");
-    if let Ok(token) = std::fs::read_to_string(&token_path) {
-        let token = token.trim();
-        if !token.is_empty()
-            && db
-                .get_principal_credential(&hash_gateway_key(token))
-                .map_err(std::io::Error::other)?
-                .is_some_and(|credential| credential.principal == "chisei-gateway")
-        {
-            return Ok(());
-        }
-    }
-
-    if let Some(parent) = std::path::Path::new(&token_path).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let token = format!("sekai-gateway-{}", uuid::Uuid::new_v4().simple());
-    db.rotate_principal_credential("chisei-gateway", &hash_gateway_key(&token))
-        .map_err(std::io::Error::other)?;
-    let temporary = format!("{token_path}.tmp-{}", uuid::Uuid::new_v4().simple());
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options.open(&temporary)?;
-    file.write_all(token.as_bytes())?;
-    file.sync_all()?;
-    std::fs::rename(temporary, token_path)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2961,15 +2916,12 @@ mod tests {
 
     #[test]
     fn run_returns_setup_errors_before_the_server_future_is_polled() {
-        let parent_file = tempfile::NamedTempFile::new().unwrap();
         let mut config = base_config();
-        config.sekai_socket = Some(
-            parent_file
-                .path()
-                .join("sekai.sock")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        // Partial assertion config fails in the sync setup closure, before
+        // the returned server future is polled.
+        config.assertion_issuer = Some("https://issuer.test".into());
+        config.assertion_audience = None;
+        config.assertion_hmac_key = None;
         let stores = Arc::new(CombinedStoreLayout::from_backend(
             crate::runtime_backend::RuntimeBackend::from_sqlite_with_enterprise_extension(
                 ":memory:", None,
@@ -4104,27 +4056,6 @@ mod tests {
         let error = interceptor.call(request).unwrap_err();
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         assert_eq!(error.message(), "caller-selected tenant header");
-    }
-
-    #[test]
-    fn local_gateway_credential_is_persisted_for_uds_authentication() {
-        let db = in_memory_db();
-        let socket_path = std::env::temp_dir().join(format!(
-            "sekai-gateway-credential-{}.sock",
-            uuid::Uuid::new_v4()
-        ));
-        let socket_path = socket_path.to_string_lossy().to_string();
-        let token_path = format!("{socket_path}.gateway-token");
-
-        ensure_local_gateway_credential(&socket_path, &db).unwrap();
-        let token = std::fs::read_to_string(&token_path).unwrap();
-        let credential = db
-            .get_principal_credential(&hash_gateway_key(token.trim()))
-            .unwrap()
-            .unwrap();
-        assert_eq!(credential.principal, "chisei-gateway");
-
-        std::fs::remove_file(token_path).unwrap();
     }
 
     #[test]

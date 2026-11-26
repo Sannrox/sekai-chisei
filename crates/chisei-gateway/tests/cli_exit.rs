@@ -24,14 +24,6 @@ fn stderr(output: &Output) -> String {
 
 #[test]
 fn early_exit_paths_keep_their_codes_and_messages() {
-    let report = gateway(&["report", "--help"]);
-    assert!(report.status.success(), "{report:?}");
-    assert!(
-        stdout(&report).contains("Usage: chisei-gateway report"),
-        "{}",
-        stdout(&report)
-    );
-
     let refresh = gateway(&["refresh", "--help"]);
     assert!(refresh.status.success(), "{refresh:?}");
     assert!(

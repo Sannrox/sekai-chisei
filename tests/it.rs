@@ -152,7 +152,6 @@ mod game_demo_report;
 mod game_governance_pack;
 mod game_reference_actions;
 mod gateway_admin_setup;
-mod gateway_control_plane;
 mod gateway_http_smoke;
 mod gateway_log_reader;
 mod governed_fact_backend_conformance;

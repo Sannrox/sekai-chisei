@@ -4,25 +4,25 @@
 //! `examples/game-ontology/policy-pack-v1.json` and `routing-v2.json` are
 //! versioned with the `game-ontology/v1` package. Each test applies them to
 //! the shipped binary through its public surfaces, the operator CLI and gRPC,
-//! and shows one allowed and one refused case for one rule. Routing decisions
-//! go through `DecideGatewayExecution`, which never calls a provider.
+//! and shows one allowed and one refused case for one rule. Model-call routing
+//! is the gateway's own policy; these tests cover the pack through operator
+//! CLI, Action admission, and budget reads.
 #![cfg(unix)]
 
 use sekai_chisei::grpc::client::GatewayClient;
 use sekai_chisei::grpc::pb::chisei::chisei_service_client::ChiseiServiceClient;
 use sekai_chisei::grpc::pb::chisei::{
-    ActionClaimRef, BudgetScopeUsage, DecideGatewayExecutionRequest,
-    DecideGatewayExecutionResponse, GetBudgetUsageRequest, GetBudgetUsageResponse,
-    RecordUsageRequest, SetBudgetLimitRequest, SetBudgetWorkUnitDefaultRequest,
-    SetModelFamilyEnablementRequest, SetNamespacePolicyRequest,
+    BudgetScopeUsage, GetBudgetUsageRequest, GetBudgetUsageResponse, RecordUsageRequest,
+    SetBudgetLimitRequest, SetBudgetWorkUnitDefaultRequest, SetModelFamilyEnablementRequest,
+    SetNamespacePolicyRequest,
 };
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
-    ActionApprovalRequirement, ActionInstance, ClaimWorkRequest, ClassificationIncomparablePair,
+    ActionApprovalRequirement, ActionInstance, ClassificationIncomparablePair,
     ClassificationLattice, ClassificationParentEdge, CreateObjectRequest,
     DecideActionInstanceRequest, EnsureTeamNamespaceRequest, GetActionInstanceRequest,
-    GetObjectRequest, ListActionEffectsRequest, ListActionInstancesRequest, Object,
-    PutClassificationLatticeRequest, SubmitActionInstanceRequest, WorkKind, claim_work_response,
+    GetObjectRequest, ListActionInstancesRequest, Object, PutClassificationLatticeRequest,
+    SubmitActionInstanceRequest,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -668,46 +668,6 @@ impl RoutedGame {
             .unwrap_or_else(|error| panic!("turn default: {error}\n{}", self.game.server.logs()));
     }
 
-    /// Asks for the expensive model, citing `claim` when the call serves
-    /// claimed Action work.
-    async fn decide(
-        &self,
-        label: &str,
-        turn: &str,
-        tokens: i32,
-        claim: Option<ActionClaimRef>,
-        route_override: &str,
-    ) -> DecideGatewayExecutionResponse {
-        let namespace = self.namespace();
-        self.chisei
-            .clone()
-            .decide_gateway_execution(DecideGatewayExecutionRequest {
-                contract_version: "gateway.decide/v2".into(),
-                namespace: namespace.clone(),
-                requested_model: "gpt-5.5".into(),
-                operation_class: "chat".into(),
-                correlation_operation_id: format!("{label}-{turn}-{tokens}"),
-                correlation_attempt: 1,
-                estimated_tokens: tokens,
-                // A cheap-eligible class with local fallback offered: a hard
-                // stop must still refuse instead of degrading.
-                task_class: "bulk".into(),
-                preferred_runtime: "openai".into(),
-                project: namespace,
-                agent: PLAYER.into(),
-                work_unit: turn.into(),
-                local_free_available: true,
-                user_id: PLAYER.into(),
-                expected_calls: 1,
-                action_claim: claim,
-                route_override: route_override.into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap_or_else(|error| panic!("decide: {error}\n{}", self.game.server.logs()))
-            .into_inner()
-    }
-
     async fn spend(&self, turn: &str, metric: &str, amount: i32) {
         self.chisei
             .clone()
@@ -722,143 +682,6 @@ impl RoutedGame {
             })
             .await
             .unwrap_or_else(|error| panic!("record usage: {error}\n{}", self.game.server.logs()));
-    }
-
-    /// The admiral grants an invasion; the game runtime claims its runtime
-    /// dispatch, the high-impact work a model call may cite.
-    async fn claim_invasion(&self, key: &str) -> ActionClaimRef {
-        let logs = || self.game.server.logs();
-        let parked = self
-            .game
-            .submit(
-                "game.planet.invade",
-                key,
-                json!({"object_id": "p-rival", "occupied_by": "commander"}),
-            )
-            .await;
-        let granted = self
-            .game
-            .decide("admiral", &parked.instance_id)
-            .await
-            .unwrap_or_else(|error| panic!("grant: {error}\n{}", logs()));
-        assert_eq!(granted.status, "admitted", "{granted:?}");
-        let mut sekai = self.game.sekai.clone();
-        let effect = sekai
-            .list_action_effects(ListActionEffectsRequest {
-                instance_id: granted.instance_id.clone(),
-                ..Default::default()
-            })
-            .await
-            .unwrap_or_else(|error| panic!("effects: {error}\n{}", logs()))
-            .into_inner()
-            .effects
-            .into_iter()
-            .find(|effect| effect.kind == "runtime_dispatch")
-            .expect("invasion runtime dispatch");
-        let Some(claim_work_response::Payload::Action(claimed)) = sekai
-            .claim_work(ClaimWorkRequest {
-                kind: WorkKind::Action.into(),
-                work_id: effect.effect_id,
-                runtime_id: "default".into(),
-                request_id: format!("claim-{key}"),
-                ttl_ms: 60_000,
-                ..Default::default()
-            })
-            .await
-            .unwrap_or_else(|error| panic!("claim: {error}\n{}", logs()))
-            .into_inner()
-            .payload
-        else {
-            panic!("claimed Action work");
-        };
-        let claimed = claimed.effect.expect("claimed effect");
-        ActionClaimRef {
-            effect_id: claimed.effect_id,
-            claim_generation: claimed.claim_generation,
-            fencing_token: claimed.claim_fencing_token,
-        }
-    }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn routine_decisions_route_local_and_only_claimed_high_impact_work_routes_expensive() {
-    let game = RoutedGame::start().await;
-    let local = |decision: &DecideGatewayExecutionResponse| {
-        decision.admitted
-            && decision.resolved_runtime == "native"
-            && decision.resolved_model.ends_with("native-default")
-    };
-
-    // A decision step serves no Action yet: asking for the expensive model
-    // gets the local one.
-    let routine = game.decide("routine", "turn-1", 100, None, "").await;
-    assert!(local(&routine), "{routine:?}");
-    // Allowed: a call serving the granted invasion's claimed work.
-    let claim = game.claim_invasion("invade-routed").await;
-    let high_impact = game
-        .decide("claimed", "turn-1", 100, Some(claim.clone()), "")
-        .await;
-    assert!(high_impact.admitted, "{high_impact:?}");
-    assert_eq!(
-        (
-            high_impact.resolved_runtime.as_str(),
-            high_impact.resolved_model.as_str()
-        ),
-        ("openai", "gpt-5.5")
-    );
-    // A claim the caller cannot prove is unclassified, and a route override
-    // cannot pin the expensive model past the rule.
-    let forged = ActionClaimRef {
-        fencing_token: "forged".into(),
-        ..claim
-    };
-    let unproven = game.decide("forged", "turn-1", 100, Some(forged), "").await;
-    assert!(local(&unproven), "{unproven:?}");
-    let pinned = game
-        .decide("pinned", "turn-1", 100, None, "openai/gpt-5.5")
-        .await;
-    assert!(!pinned.admitted, "{pinned:?}");
-    assert_eq!(pinned.deny_reason, "policy_denied", "{pinned:?}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn turn_budgets_cap_tokens_and_model_calls() {
-    let game = RoutedGame::start().await;
-
-    // Refused: turn 1's tokens and turn 2's model calls are spent.
-    game.spend("turn-1", "tokens", 4000).await;
-    let tokens_out = game.decide("routine", "turn-1", 100, None, "").await;
-    assert!(!tokens_out.admitted, "{tokens_out:?}");
-    assert_eq!(tokens_out.deny_reason, "budget_denied");
-    assert!(
-        tokens_out.budget_scope.ends_with("work_unit:turn-1"),
-        "{tokens_out:?}"
-    );
-    game.spend("turn-2", "requests", 6).await;
-    let calls_out = game.decide("routine", "turn-2", 100, None, "").await;
-    assert!(!calls_out.admitted, "{calls_out:?}");
-    assert_eq!(calls_out.deny_reason, "budget_denied");
-
-    // Allowed: the next turn starts with fresh turn budgets.
-    let next = game.decide("routine", "turn-3", 100, None, "").await;
-    assert!(next.admitted, "{next:?}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_exhausted_day_budget_is_a_hard_stop() {
-    let game = RoutedGame::start().await;
-    let allowed = game.decide("routine", "turn-1", 100, None, "").await;
-    assert!(allowed.admitted, "{allowed:?}");
-
-    // Refused: once the day's tokens are spent, a fresh turn stops, for the
-    // expensive model too, with no fallback to a local-free model.
-    game.spend("turn-1", "tokens", 40_000).await;
-    let claim = game.claim_invasion("invade-day").await;
-    for (label, claim) in [("routine", None), ("claimed", Some(claim))] {
-        let stopped = game.decide(label, "turn-2", 100, claim, "").await;
-        assert!(!stopped.admitted, "{label}: {stopped:?}");
-        assert_eq!(stopped.deny_reason, "budget_denied", "{label}");
-        assert_eq!(stopped.budget_scope, format!("agent:{PLAYER}"), "{label}");
     }
 }
 
@@ -887,15 +710,8 @@ fn level(
 async fn budget_usage_reads_model_spend_per_scope_level() {
     let game = RoutedGame::start().await;
 
-    // A decision charges nothing; settled usage does. The refused decision
-    // asks for more than the turn has left and charges nothing either.
-    let admitted = game.decide("routine", "turn-1", 100, None, "").await;
-    assert!(admitted.admitted, "{admitted:?}");
     game.spend("turn-1", "tokens", 3900).await;
     game.spend("turn-1", "requests", 1).await;
-    let refused = game.decide("routine", "turn-1", 200, None, "").await;
-    assert!(!refused.admitted, "{refused:?}");
-    assert_eq!(refused.deny_reason, "budget_denied");
 
     let request = GetBudgetUsageRequest {
         project: game.namespace(),

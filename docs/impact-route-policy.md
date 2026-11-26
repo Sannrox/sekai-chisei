@@ -41,7 +41,7 @@ family enablement).
 ## Which entry applies
 
 The caller never declares a class. A model call may cite an Action Work claim
-(`ExecutionInput.action_claim` or `DecideGatewayExecutionRequest.action_claim`).
+(`ExecutionInput.action_claim`).
 When that claim is live and held by the calling principal in the call's
 namespace, the call takes the claimed Action type's `impact_class` (see
 [Governed Action types](governed-action-types.md)). Everything else is

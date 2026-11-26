@@ -37,7 +37,6 @@ impl RuntimeDb {
     }
 
     pub fn get_object(&self, id: &str) -> Result<Option<Object>, String> {
-        #[cfg(any(test, feature = "gateway-test-support"))]
         source_batch_auth_counters::OBJECT_LOOKUPS.with(|c| c.set(c.get() + 1));
         match self {
             Self::Sqlite(db) => db.get_object(id),
@@ -46,7 +45,6 @@ impl RuntimeDb {
     }
 
     pub fn list_objects_by_ids(&self, ids: &[String]) -> Result<Vec<Object>, String> {
-        #[cfg(any(test, feature = "gateway-test-support"))]
         if !ids.is_empty() {
             source_batch_auth_counters::OBJECT_LOOKUPS.with(|c| c.set(c.get() + 1));
         }
@@ -375,7 +373,6 @@ impl RuntimeDb {
         namespace: &str,
         external_ids: &[String],
     ) -> Result<Vec<Object>, String> {
-        #[cfg(any(test, feature = "gateway-test-support"))]
         if !external_ids.is_empty() {
             source_batch_auth_counters::LOOKUP_QUERIES.with(|c| c.set(c.get() + 1));
         }

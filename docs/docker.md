@@ -22,28 +22,24 @@ report `<crate version>-dev` and commit `unknown`, so commits never force rebuil
 ```bash
 export CHISEI_GATEWAY_ADMIN_TOKEN="$(openssl rand -hex 32)"
 export OPENAI_API_KEY='<your-openai-key>'
-export GATEWAY_KEYS='sekai-docker-demo=demo:default'
 export GATEWAY_KEY='sekai-docker-demo'
 ./build/release-images.sh
 docker compose --env-file _output/compose.env up
 ```
 
-The exported `GATEWAY_KEYS` value must be a gateway allowlist map (`key=agent:project`).
-A client request must include one of these keys via `Authorization: Bearer <key>` or
+Compose sets `CHISEI_GATEWAY_POLICY_PATH=/data/chisei-gateway-policy.json`. Write
+that file (or run `sekaictl launch`, which writes it) before serving traffic.
+A client request must include a policy key via `Authorization: Bearer <key>` or
 `x-api-key: <key>`.
 
-Compose publishes the gateway on a non-loopback bind (`0.0.0.0:8080`). The gateway
-always fails closed when live governance is unavailable, and startup refuses an
-exposed bind without at least one `GATEWAY_KEYS` entry.
+Compose publishes the gateway on a non-loopback bind (`0.0.0.0:8080`). Startup
+refuses an exposed bind with auth passthrough enabled, and a missing or invalid
+policy denies every request with zero provider contact. `GATEWAY_KEYS` is refused.
 
 `CHISEI_GATEWAY_ADMIN_TOKEN` protects the admin refresh endpoint (`/_chisei/admin/refresh`).
 
-Use `sekaictl admin gateway setup` (see below) to seed control-plane policy, budgets, and
-durable virtual keys for your environment. Compose `GATEWAY_KEYS` is the minimum
-allowlist required for the published bind; setup is still recommended for rotation
-and full governance.
-
-Gateway traffic is served at `http://localhost:8080` by default and talks to the server through the shared UDS.
+Gateway traffic is served at `http://localhost:8080` by default. The gateway
+never calls the control plane.
 
 For an end-to-end container smoke check (requires provider credentials, e.g. `OPENAI_API_KEY`):
 
@@ -114,14 +110,14 @@ require TLS; the optional CA path only extends trust for a private test CA.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SEKAI_CREDENTIAL` | unset | Client-side bearer used by the gateway for TCP gRPC; create it as a durable principal credential before switching transports |
-| `GATEWAY_BIND` | `127.0.0.1:8788` (image/local); compose uses `0.0.0.0:8080` | Gateway bind address. Non-loopback binds require non-empty `GATEWAY_KEYS` |
+| `SEKAI_CREDENTIAL` | unset | Client-side bearer used by `sekaictl` and native clients for TCP gRPC; create it as a durable principal credential before switching transports |
+| `GATEWAY_BIND` | `127.0.0.1:8788` (image/local); compose uses `0.0.0.0:8080` | Gateway bind address. Non-loopback binds require a valid policy and must not enable auth passthrough |
+| `CHISEI_GATEWAY_POLICY_PATH` | compose sets `/data/chisei-gateway-policy.json` | Gateway-owned egress policy. Required. `GATEWAY_KEYS` is refused |
 | `SEKAI_DATA_DIR` | `/data` (image) | With no store variable, Combined opens `/data/sekai.db` and `/data/chisei.db`. |
 | `SEKAI_DB_PATH` | unset in the image; compose sets `/data/sekai.db` | Combined Sekai SQLite dest. Must be paired with `CHISEI_DB_PATH`. |
 | `CHISEI_DB_PATH` | unset in the image; compose sets `/data/chisei.db` | Combined Chisei SQLite dest. Must be paired with `SEKAI_DB_PATH`. |
 | `DB_PATH`, `DATABASE_URL`, `SEKAI_SHARED_STORE` | unset | Retired single-store variables. Boot refuses any of them with guidance; move an old single file with `sekaictl admin store relocate` (see [store relocation](store-relocation.md)). |
-| `SEKAI_SOCKET` | `/data/sekai.sock` | Unix socket path for control plane transport |
-| `CHISEI_GRPC_URL` | unset | Optional TCP override; when unset, the gateway uses the image's explicit `SEKAI_SOCKET=/data/sekai.sock` setting |
+| `SEKAI_SOCKET` | `/data/sekai.sock` | Unix socket path for control plane transport (`sekaictl` and native clients) |
 | `OPENAI_API_KEY` | unset | API key for OpenAI upstream |
 | `ANTHROPIC_API_KEY` | unset | API key for Anthropic upstream |
 | `CHISEI_GATEWAY_ADMIN_TOKEN` | unset | Enables and protects `/_chisei/admin/refresh`; must be at least 32 bytes, and unset disables the endpoint |
@@ -147,18 +143,19 @@ The default setup uses:
 - Combined dest-pair files at `/data/sekai.db` and `/data/chisei.db`
 - object log at `/data/objects.mikura`
 - server socket at `/data/sekai.sock`
-- gateway target also set to `/data/sekai.sock` via `SEKAI_SOCKET`
+- gateway policy at `/data/chisei-gateway-policy.json`
 
-No server gRPC port is published in this mode.
+No server gRPC port is published in this mode. The gateway never calls the
+control plane.
 
-For TCP transport, first create a durable principal credential while the shared
-UDS is available. Set that value as `SEKAI_CREDENTIAL` on the gateway, point it
-at `CHISEI_GRPC_URL=http://server:50051`, and publish `50051` in compose (see
+For TCP transport for `sekaictl` and native clients, first create a durable
+principal credential while the shared UDS is available. Set that value as
+`SEKAI_CREDENTIAL` on the client, point it at
+`CHISEI_GRPC_URL=http://server:50051`, and publish `50051` in compose (see
 comments in `docker-compose.yml`). The server detects active credentials in its
 database and enables authenticated TCP. Public `0.0.0.0` TCP also requires
 `SEKAI_TLS_CERT` and `SEKAI_TLS_KEY`, or an explicit
-`SEKAI_ALLOW_PLAINTEXT=1` for a trusted plaintext deployment (set it on the
-gateway too, or it refuses to send the credential over `http://`), or an explicit
+`SEKAI_ALLOW_PLAINTEXT=1` for a trusted plaintext deployment, or an explicit
 loopback `SEKAI_BIND`. Set `SEKAI_TLS_CLIENT_CA` when that TLS listener must
 require a client certificate; missing or unreadable files fail closed at
 startup.
@@ -174,5 +171,5 @@ docker compose --env-file _output/compose.env run --rm gateway sekaictl admin ga
 - Generate an attribution/report from shared state:
 
 ```bash
-docker compose --env-file _output/compose.env run --rm gateway chisei-gateway report --by work-unit --since 24h
+docker compose --env-file _output/compose.env run --rm server sekai-chisei gateway-report --egress
 ```

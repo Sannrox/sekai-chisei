@@ -8,7 +8,6 @@ repository = "https://github.com/Sannrox/sekai-chisei"
 
 [features]
 default = []
-gateway-test-support = []
 
 [dependencies]
 base64 = "0.23"

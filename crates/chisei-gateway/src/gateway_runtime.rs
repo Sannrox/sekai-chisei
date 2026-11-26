@@ -1,27 +1,14 @@
 use super::*;
 
-pub(super) fn required_control_plane_target(
-    chisei_grpc_url: Option<String>,
-    sekai_socket: Option<String>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    chisei_grpc_url
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| sekai_socket.filter(|value| !value.trim().is_empty()))
-        .ok_or_else(|| "CHISEI_GRPC_URL or SEKAI_SOCKET is required for chisei-gateway".into())
-}
 pub(super) fn validate_gateway_security(
     bind_addr: SocketAddr,
     gateway_keys: &HashMap<String, GatewayIdentity>,
     allow_auth_passthrough: bool,
     admin_token: Option<&str>,
-    policy_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if policy_mode && !gateway_keys.is_empty() {
-        return Err(format!("GATEWAY_KEYS cannot be combined with {POLICY_PATH_ENV}; name principals and keys in the policy").into());
-    }
-    if policy_mode && allow_auth_passthrough {
+    if !gateway_keys.is_empty() {
         return Err(format!(
-            "CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH cannot be combined with {POLICY_PATH_ENV}"
+            "GATEWAY_KEYS cannot be combined with {POLICY_PATH_ENV}; name principals and keys in the policy"
         )
         .into());
     }
@@ -34,17 +21,10 @@ pub(super) fn validate_gateway_security(
         .into());
     }
 
-    if !bind_addr.ip().is_loopback() {
-        if gateway_keys.is_empty() && !policy_mode {
-            return Err(
-                "an exposed gateway requires at least one authenticated GATEWAY_KEYS entry".into(),
-            );
-        }
-        if allow_auth_passthrough {
-            return Err(
-                "CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH cannot be used on an exposed gateway".into(),
-            );
-        }
+    if !bind_addr.ip().is_loopback() && allow_auth_passthrough {
+        return Err(
+            "CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH cannot be used on an exposed gateway".into(),
+        );
     }
     Ok(())
 }
@@ -69,111 +49,11 @@ pub(super) fn env_u32(name: &str, default: u32) -> u32 {
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
 }
-pub(super) fn resolve_usage_recovery_path(configured: Option<String>) -> PathBuf {
-    configured
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_USAGE_RECOVERY_PATH))
-}
-pub(super) fn resolve_recovery_spool_path(configured: Option<String>) -> PathBuf {
-    configured
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_RECOVERY_SPOOL_PATH))
-}
 pub(super) fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
-}
-pub(super) fn configured_control_plane_timeout() -> Duration {
-    Duration::from_millis(
-        env_u64(
-            "CHISEI_GATEWAY_CONTROL_PLANE_TIMEOUT_MS",
-            DEFAULT_CONTROL_PLANE_TIMEOUT_MS,
-        )
-        .max(1),
-    )
-}
-pub(super) async fn connect_governance(
-    runtime: &GatewayRuntime,
-    target: &str,
-) -> Result<GatewayClient, Box<dyn std::error::Error + Send + Sync>> {
-    if runtime.control_plane_circuit.read().await.is_open() {
-        return Err(std::io::Error::other("control-plane circuit is open").into());
-    }
-
-    let mut last_error = None;
-    for attempt in 0..=runtime.resilience.control_plane_retries {
-        match connect_sekai_with_timeout(target, Some(runtime.resilience.control_plane_timeout))
-            .await
-        {
-            Ok(channel) => return Ok(channel),
-            Err(error) => {
-                last_error = Some(error);
-                if attempt < runtime.resilience.control_plane_retries {
-                    let multiplier = 1u32.checked_shl(attempt.min(10)).unwrap_or(u32::MAX);
-                    tokio::time::sleep(runtime.resilience.control_plane_retry_backoff * multiplier)
-                        .await;
-                }
-            }
-        }
-    }
-    let error = last_error.unwrap_or_else(|| std::io::Error::other("connection failed").into());
-    runtime
-        .control_plane_circuit
-        .write()
-        .await
-        .record_failure(error.to_string(), &runtime.resilience);
-    Err(error)
-}
-pub(super) async fn record_control_plane_success(runtime: &GatewayRuntime) {
-    runtime.control_plane_circuit.write().await.record_success();
-}
-pub(super) async fn record_control_plane_failure(runtime: &GatewayRuntime, error: &impl ToString) {
-    runtime
-        .control_plane_circuit
-        .write()
-        .await
-        .record_failure(error.to_string(), &runtime.resilience);
-}
-pub(super) fn initialize_usage_recovery_journal(
-    path: &Path,
-) -> std::io::Result<Vec<PendingUsageRecovery>> {
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            for _ in 0..10 {
-                let bytes = std::fs::read(path)?;
-                if let Ok(entries) = serde_json::from_slice(&bytes) {
-                    return Ok(entries);
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "concurrently created usage recovery journal is invalid",
-            ));
-        }
-        Err(error) => return Err(error),
-    };
-    file.write_all(b"[]")?;
-    file.sync_all()?;
-    Ok(Vec::new())
 }
 pub(super) fn positive_env(name: &str) -> Option<usize> {
     std::env::var(name)
@@ -227,11 +107,6 @@ pub(super) async fn gateway_health() -> Response<Body> {
     json_response(StatusCode::OK, serde_json::json!({"status": "healthy"}))
 }
 pub(super) async fn gateway_status(State(state): State<GatewayState>) -> Response<Body> {
-    let circuit_open = state.runtime.control_plane_circuit.read().await.is_open();
-    let cache = state.runtime.usage_recovery.read().await;
-    let pending_usage_recoveries = cache.pending_usage_records.len();
-    let usage_recovery_saturated = cache.usage_recovery_saturated;
-    drop(cache);
     let provider_health = {
         let mut circuits = state.runtime.upstream_circuits.write().await;
         circuits
@@ -253,18 +128,7 @@ pub(super) async fn gateway_status(State(state): State<GatewayState>) -> Respons
     json_response(
         StatusCode::OK,
         serde_json::json!({
-            "status": if circuit_open
-                || provider_circuit_open
-                || pending_usage_recoveries > 0
-                || usage_recovery_saturated
-            {
-                "degraded"
-            } else {
-                "live"
-            },
-            "control_plane_circuit_open": circuit_open,
-            "pending_usage_recoveries": pending_usage_recoveries,
-            "usage_recovery_saturated": usage_recovery_saturated,
+            "status": if provider_circuit_open { "degraded" } else { "live" },
             "provider_health": provider_health
         }),
     )
@@ -300,66 +164,13 @@ pub(super) async fn gateway_readiness(State(state): State<GatewayState>) -> Resp
         }
         return json_response(status, body);
     }
-    let Some(target) = state.config.chisei_grpc_target.as_deref() else {
-        return json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            serde_json::json!({
-                "status": "not_ready",
-                "reason": "control_plane_unconfigured"
-            }),
-        );
-    };
-    let circuit = state.runtime.control_plane_circuit.read().await;
-    if circuit.is_open() {
-        return json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            serde_json::json!({
-                "status": "not_ready",
-                "governance": "circuit_open",
-                "reason": "control-plane circuit is open"
-            }),
-        );
-    }
-    drop(circuit);
-
-    // This endpoint is intentionally unauthenticated for orchestrator probes.
-    // Serialize and cache the bounded dependency check so callers cannot turn
-    // it into an unbounded authenticated control-plane RPC source.
-    let mut cached_probe = state.runtime.readiness_probe.lock().await;
-    let ready = if let Some((checked_at, ready)) = *cached_probe
-        && checked_at.elapsed() < Duration::from_secs(READINESS_PROBE_CACHE_SECS)
-    {
-        ready
-    } else {
-        let ready = match connect_sekai_with_timeout(
-            target,
-            Some(state.runtime.resilience.control_plane_timeout),
-        )
-        .await
-        {
-            Ok(channel) => {
-                let mut client = SekaiServiceClient::new(channel);
-                client
-                    .list_schema_types(gateway_request(ListSchemaTypesRequest {}))
-                    .await
-                    .is_ok()
-            }
-            Err(_) => false,
-        };
-        *cached_probe = Some((Instant::now(), ready));
-        ready
-    };
-    if ready {
-        json_response(
-            StatusCode::OK,
-            serde_json::json!({"status": "ready", "governance": "available"}),
-        )
-    } else {
-        json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            serde_json::json!({"status": "not_ready", "governance": "unavailable"}),
-        )
-    }
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        serde_json::json!({
+            "status": "not_ready",
+            "reason": "no_valid_policy"
+        }),
+    )
 }
 pub async fn serve(config: GatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut runtime = GatewayRuntime::from_env();
@@ -378,7 +189,6 @@ pub async fn serve(config: GatewayConfig) -> Result<(), Box<dyn std::error::Erro
         &config.gateway_keys,
         config.allow_auth_passthrough,
         runtime.admin_token.as_deref(),
-        runtime.policy.is_some(),
     )?;
     if let Some(policy) = &runtime.policy {
         policy.spawn_watcher();
@@ -420,9 +230,6 @@ pub(super) async fn refresh_gateway_admin(
     let cleared_entries = key_cache.len();
     key_cache.clear();
     drop(key_cache);
-    let usage_recovery = state.runtime.usage_recovery.read().await;
-    let pending_usage_recoveries = usage_recovery.pending_usage_records.len();
-    drop(usage_recovery);
     record_gateway_event(
         &state.config,
         "chisei-gateway-admin",
@@ -440,7 +247,6 @@ pub(super) async fn refresh_gateway_admin(
         serde_json::json!({
             "refreshed": true,
             "cleared_key_cache_entries": cleared_entries,
-            "pending_usage_recoveries": pending_usage_recoveries
         }),
     )
 }

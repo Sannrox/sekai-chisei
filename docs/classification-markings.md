@@ -35,7 +35,7 @@ Dominance is reachability from the marking to the caller’s sealed ceiling.
   identical to absent rows.
 - Graph hops take the least upper bound of the path marking and the candidate.
   If that join does not exist, the hop is denied.
-- Trusted service principals (`root`, `local`, `chisei-gateway`) remain an
+- Trusted service principals (`root`, `local`) remain an
   explicit exception.
 - The sealed `classification_ceiling` is one global principal-profile token,
   interpreted in the object’s namespace lattice. Do not reuse a custom token
@@ -55,7 +55,7 @@ schema property redaction classes and free-form domain fields.)
 - **`deny_unmarked`**: optional fail-closed switch. Set namespace property
   `deny_unmarked=true` on `namespace:<name>`, or set `SEKAI_DENY_UNMARKED=1`.
   When on, unmarked reads and list rows are denied unless the principal is a
-  trusted service (`root`, `local`, `chisei-gateway`) or holds an explicit
+  trusted service (`root`, `local`) or holds an explicit
   object ACL grant. Empty ACL remains world-open, not an explicit grant.
   Marked objects keep the existing clearance rules. The default stays fail-open.
 - **Marked objects**: principal must present a ceiling that dominates the

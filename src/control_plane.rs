@@ -60,12 +60,9 @@ pub fn run(plane: ProcessPlane) -> Result<(), Box<dyn std::error::Error>> {
             (db, credentials)
         }
     };
-    let external_credentials_active = active_credentials.iter().any(|credential| {
-        !matches!(
-            credential.principal.as_str(),
-            "chisei-gateway" | "local-onboarding"
-        )
-    });
+    let external_credentials_active = active_credentials
+        .iter()
+        .any(|credential| !matches!(credential.principal.as_str(), "local-onboarding"));
     let grpc_tcp_mode = config.grpc_tcp_mode(external_credentials_active);
 
     if config.insecure && grpc_tcp_mode.auth_configured {

@@ -50,7 +50,7 @@ as a missing id does.
 
 ### Reserved principal names
 
-`root`, `local`, `anonymous` and `chisei-gateway` are built-in identities, and
+`root`, `local`, and `anonymous` are built-in identities, and
 authorization treats `root` and `local` as the local administrator. Among
 authenticated callers, only operator-issued local principal credentials may
 carry these names. If the subject of any of the following is one of

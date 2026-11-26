@@ -289,52 +289,6 @@ pub(super) async fn report_operation_event(
         .admit(req)
         .await
 }
-pub(super) async fn claim_gateway_dispatch(
-    service: &ChiseiServiceImpl,
-    req: Request<ClaimGatewayDispatchRequest>,
-) -> Result<Response<ClaimGatewayDispatchResponse>, Status> {
-    if !is_gateway_service_principal(&req, &service.config) {
-        return Err(Status::permission_denied(
-            "gateway dispatch claim requires a gateway service principal",
-        ));
-    }
-    let request = req.into_inner();
-    if request.caller_scope.trim().is_empty()
-        || request.request_alias.trim().is_empty()
-        || request.request_id.trim().is_empty()
-        || request.operation_id.trim().is_empty()
-        || request.dispatch_token.trim().is_empty()
-    {
-        return Err(Status::invalid_argument(
-            "caller_scope, request_alias, request_id, operation_id, and dispatch_token are required",
-        ));
-    }
-    let reserved = service
-        .db
-        .reserve_gateway_request_alias(
-            &request.caller_scope,
-            &request.request_alias,
-            &request.request_id,
-            &request.operation_id,
-        )
-        .map_err(Status::internal)?;
-    if !reserved {
-        return Ok(Response::new(ClaimGatewayDispatchResponse {
-            claimed: false,
-        }));
-    }
-    let claimed = service
-        .db
-        .claim_gateway_request_alias_dispatch(
-            &request.caller_scope,
-            &request.request_alias,
-            &request.request_id,
-            &request.operation_id,
-            &request.dispatch_token,
-        )
-        .map_err(Status::internal)?;
-    Ok(Response::new(ClaimGatewayDispatchResponse { claimed }))
-}
 pub(super) async fn get_operation_receipt(
     service: &ChiseiServiceImpl,
     req: Request<GetOperationReceiptRequest>,
@@ -343,8 +297,7 @@ pub(super) async fn get_operation_receipt(
     // An enterprise (tenant) context gets no administrative inspection, and
     // learns nothing about receipts outside its namespaces (#1770).
     let context = enterprise_authenticated_context(&req)?.cloned();
-    let privileged =
-        context.is_none() && matches!(actor.as_str(), "root" | "local" | "chisei-gateway");
+    let privileged = context.is_none() && matches!(actor.as_str(), "root" | "local");
     let request = req.into_inner();
     let operation_id = request.operation_id.trim();
     let request_id = request.request_id.trim();

@@ -460,7 +460,6 @@ Edit the fixture, then regenerate with
 | `ChiseiService.SetBudgetLimit` | `chisei.budget` | yes | none | `stable` |
 | `ChiseiService.GetBudgetUsage` | `chisei.budget` | yes | cli | `experimental` |
 | `ChiseiService.SetBudgetWorkUnitDefault` | `chisei.budget` | yes | cli | `experimental` |
-| `ChiseiService.DecideGatewayExecution` | `chisei.policy, chisei.budget` | yes | host | `stable` |
 | `ChiseiService.SetNamespacePolicy` | `chisei.policy` | yes | none | `stable` |
 | `ChiseiService.GetEffectivePolicySummary` | `chisei.policy` | yes | none | `experimental` |
 | `ChiseiService.StartPolicyShadow` | `chisei.policy` | yes | none | `experimental` |
@@ -488,7 +487,6 @@ Edit the fixture, then regenerate with
 | `ChiseiService.GetOperationReceipt` | `chisei.execution` | yes | sdk, host, cli | `stable` |
 | `ChiseiService.GetQualityTrend` | `chisei.execution` | yes | sdk | `stable` |
 | `ChiseiService.GetExecutionTelemetry` | `chisei.execution` | yes | none | `experimental` |
-| `ChiseiService.ClaimGatewayDispatch` | `gateway.governance, chisei.execution` | yes | host | `stable` |
 | `ChiseiService.PutEvaluatorDefinition` | `chisei.evaluation` | yes | none | `experimental` |
 | `ChiseiService.PutEvaluationPlan` | `chisei.evaluation` | yes | cli, mcp | `stable` |
 | `ChiseiService.GetEvaluationPlan` | `chisei.evaluation` | yes | mcp | `experimental` |
@@ -499,7 +497,7 @@ Edit the fixture, then regenerate with
 
 ## Removed calls
 
-These public RPCs were deleted (#2278). Internal stores and composition stay
+These public RPCs were deleted (#2278, #2701). Internal stores and composition stay
 where remaining product paths still use them.
 
 | RPC | Replacement |
@@ -511,3 +509,5 @@ where remaining product paths still use them.
 | `ChiseiService.GetGunshiAllocationStatus` | operator console Gunshi tiles |
 | `ChiseiService.GetSampleObservation` | none; scoring still records observations internally |
 | `ChiseiService.RunLookupFirstPromotionGate` | in-process lookup-first composition |
+| `ChiseiService.DecideGatewayExecution` | gateway policy mode (`CHISEI_GATEWAY_POLICY_PATH`) |
+| `ChiseiService.ClaimGatewayDispatch` | gateway policy mode; dispatch aliases stay local to the gateway |

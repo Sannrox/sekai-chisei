@@ -98,7 +98,6 @@ impl SekaiStore {
         self.inner.list_all_objects(filter)
     }
 
-    #[cfg(any(test, feature = "gateway-test-support"))]
     pub fn delete_grant(&self, grant_id: &str) -> Result<(), String> {
         self.inner.delete_grant(grant_id).map(|_| ())
     }

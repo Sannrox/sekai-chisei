@@ -8,8 +8,7 @@ control plane.
 Direction: [ADR 0152](decisions/0152-gateway-is-the-model-egress-layer.md)
 makes the gateway the model egress layer with its own egress policy, no calls
 into Sekai or Chisei, and no `chisei_context`. [Policy mode](#policy-mode) is
-that admission path. The rest of this page describes the current
-`gateway.decide/v2` path, which stays supported until it is drained.
+the only admission path.
 
 It exposes:
 
@@ -20,32 +19,11 @@ It exposes:
   semantics; not `DiscoverCapabilities`); and
 - `/healthz`, `/readyz`, and `/statusz` operator endpoints.
 
-For each request, the gateway authenticates and attributes the caller,
-preflights policy, budget, and egress decisions, resolves the provider/model,
-streams the response, and records normalized usage and audit evidence. By
-default, budget/policy preflight uses the control-plane
-`DecideGatewayExecution` RPC using `gateway.decide/v2` (Issues #163 and #418).
-The same decision also runs the internal sampling pipeline when request text is
-available; there is no separate pipeline RPC or gateway sampling mode.
-A missing, corrupt, or blocking context-admission policy denies admission.
-A pipeline or sampling error after admission also denies when `pipeline_spec`
-was set. A configured gateway has no legacy
-multi-RPC fallback: denial or control-plane unavailability stops the request
-before provider contact. The control plane owns policy, budget, lifecycle,
-evaluation, capability, and route decisions; the gateway translates supported
-wire formats and enforces the returned decision.
-
-Gateway coordination has three Chisei RPCs: `DecideGatewayExecution`,
-`RecordUsage`, and `ClaimGatewayDispatch`. Sample observations are folded into
-trusted usage recording. The claim call combines
-alias reservation and dispatch-token claiming into one atomic operation.
-Normalized usage and the complete canonical operation receipt are persisted in
-one trusted `RecordUsage` accounting call; generic gateway audit facts use the
-Sekai decision log rather than a gateway-specific audit RPC.
-
-The v2 contract is a coordinated gateway/control-plane upgrade. Mixed v1/v2
-deployments reject admission rather than silently reconstructing missing policy
-fields at the gateway.
+For each request, the gateway authenticates the caller against its policy
+file, checks route, limit, and egress rules, resolves the provider, streams
+the response, and appends admission and usage records to its own log. Chisei
+does not sit on that request path. `RecordUsage` remains a Chisei RPC for
+operators and accounting principals; the gateway never calls it.
 
 ## Guided launch
 
@@ -230,18 +208,16 @@ CHISEI_GATEWAY_ADMIN_TOKEN='<random-32-byte-minimum-token>' \
 cargo run -p chisei-gateway --bin chisei-gateway -- refresh
 ```
 
-`GATEWAY_KEYS=key=agent:project` remains an explicit environment allowlist for
-development and Docker Compose. Do not confuse it with control-plane
-principal credentials.
-
 ## Policy mode
 
-Set `CHISEI_GATEWAY_POLICY_PATH` to a policy file and the gateway admits
+Set `CHISEI_GATEWAY_POLICY_PATH` to a policy file. The gateway admits
 requests against that file alone. It does not need, and does not call, Sekai
 or Chisei: `CHISEI_GRPC_URL` and `SEKAI_SOCKET` are ignored, and requests keep
-flowing while the control plane is down. Policy mode refuses to start with
-`GATEWAY_KEYS` or `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH`; the policy names
-every principal and key.
+flowing while the control plane is down. `GATEWAY_KEYS` is refused; name
+principals and keys in the policy. Loopback `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH`
+still works: identify by policy key first, otherwise the `x-chisei-agent`
+passthrough identity if that name is a policy principal. Non-loopback binds
+refuse passthrough. `sekaictl launch` writes this file and sets the path.
 
 ```json
 {
@@ -426,26 +402,18 @@ this process holds.
 
 The gateway injects no graph data (ADR 0152, #2696). A request with a
 top-level `chisei_context` field is refused with `400 invalid_request_error`
-before any decision or provider contact, in policy mode and on the
-`gateway.decide/v2` path alike. Object references in the request text are
-forwarded as written; the gateway no longer looks them up. Select context
+before any decision or provider contact. Object references in the request text
+are forwarded as written; the gateway no longer looks them up. Select context
 through native planning (`PlanExecution`), or read it with the MCP read tools
 (`Search`, `GetObject`, and `ExpandNeighborhood`).
 
 ## Usage and smoke tests
 
-Inspect recent normalized usage:
+Inspect recent normalized usage from the control plane, which reads the
+gateway log:
 
 ```bash
-SEKAI_SOCKET=./data/sekai.sock \
-cargo run -p chisei-gateway --bin chisei-gateway -- report --by agent --since 24h
-```
-
-Export a standalone report:
-
-```bash
-SEKAI_SOCKET=./data/sekai.sock \
-cargo run -p chisei-gateway --bin chisei-gateway -- report --since 24h --html dashboard.html
+cargo run -p sekai-chisei --bin sekai-chisei -- gateway-report --egress
 ```
 
 Run the deterministic local gateway smoke test without real provider

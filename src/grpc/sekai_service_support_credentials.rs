@@ -1273,13 +1273,7 @@ pub(super) fn validate_new_credential_principal(principal: &str) -> Result<Strin
     Ok(principal)
 }
 pub(super) fn validate_team_principal(principal: &str) -> Result<String, Status> {
-    let principal = validate_new_credential_principal(principal)?;
-    if principal == "chisei-gateway" {
-        return Err(Status::invalid_argument(
-            "principal \"chisei-gateway\" is reserved for gateway authentication",
-        ));
-    }
-    Ok(principal)
+    validate_new_credential_principal(principal)
 }
 pub(super) fn new_credential_token() -> String {
     format!(

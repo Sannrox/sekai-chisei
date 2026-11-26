@@ -67,10 +67,10 @@ uses the backend-neutral reusable surfaces; an unsupported backend-specific
 content projection continues to fail closed.
 
 `ExecutionPlan.evidence_references` and `ExecutionPlan.memory_references` carry
-the descriptor. Gateway sampling runs inside the canonical
-`DecideGatewayExecution` preflight and returns only the sampling outcome and
+the descriptor. Native plan preflight returns only the sampling outcome and
 governed prepared spec needed for a sampled observation; descriptor content
-stays inside the control plane.
+stays inside the control plane. Gateway HTTP admission uses the gateway's
+own policy and does not run this sampling.
 
 Receipt context metadata records the descriptor version and bounded aggregate
 counts (descriptor, source rows, source refs, source digests, and truncation).

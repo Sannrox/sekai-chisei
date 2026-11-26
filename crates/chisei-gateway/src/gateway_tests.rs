@@ -1,8 +1,5 @@
 use super::*;
 
-use chisei_core::ext::ChiseiSekaiDbExt;
-use sekai_core::db::sekai::SekaiDb;
-
 #[test]
 fn key_cache_stays_bounded_and_keeps_known_keys() {
     let ttl = Duration::from_secs(30);
@@ -48,31 +45,6 @@ fn key_cache_stays_bounded_and_keeps_known_keys() {
     insert_bounded_key_cache_entry(&mut cache, ttl, 2, "c".into(), known());
     assert_eq!(cache.len(), 2);
     assert!(!cache.contains_key("c"));
-}
-
-#[test]
-fn only_registered_gateway_identities_can_delegate_principals() {
-    let registered = GatewayIdentity {
-        agent: "alice".into(),
-        project: "acme".into(),
-        user_id: "alice".into(),
-        key_id: "alice-key".into(),
-        tier: DEFAULT_GATEWAY_TIER.into(),
-    };
-    assert!(registered.can_delegate_principal());
-    assert_eq!(registered.delegated_principal(), "alice");
-
-    let passthrough = GatewayIdentity {
-        key_id: String::new(),
-        ..registered.clone()
-    };
-    assert!(!passthrough.can_delegate_principal());
-
-    let derived = GatewayIdentity {
-        tier: "untrusted".into(),
-        ..registered
-    };
-    assert!(!derived.can_delegate_principal());
 }
 
 #[test]
@@ -898,90 +870,22 @@ fn correlation_scope_uses_resolved_identity_only() {
 fn rejects_weak_admin_tokens() {
     let bind = "127.0.0.1:8788".parse().unwrap();
     let keys = HashMap::new();
-    assert!(validate_gateway_security(bind, &keys, false, Some("change-me"), false).is_err());
-    assert!(validate_gateway_security(bind, &keys, false, Some("too-short"), false).is_err());
+    assert!(validate_gateway_security(bind, &keys, false, Some("change-me")).is_err());
+    assert!(validate_gateway_security(bind, &keys, false, Some("too-short")).is_err());
     assert!(
-        validate_gateway_security(
-            bind,
-            &keys,
-            false,
-            Some("0123456789abcdef0123456789abcdef"),
-            false
-        )
-        .is_ok()
+        validate_gateway_security(bind, &keys, false, Some("0123456789abcdef0123456789abcdef"))
+            .is_ok()
     );
-}
-
-#[test]
-fn gateway_requires_an_explicit_control_plane_target() {
-    assert!(required_control_plane_target(None, None).is_err());
-    assert!(required_control_plane_target(Some("  ".into()), None).is_err());
-    assert_eq!(
-        required_control_plane_target(None, Some("/tmp/sekai.sock".into())).unwrap(),
-        "/tmp/sekai.sock"
-    );
-    assert_eq!(
-        required_control_plane_target(Some("  ".into()), Some("/tmp/sekai-fallback.sock".into()))
-            .unwrap(),
-        "/tmp/sekai-fallback.sock"
-    );
-    assert_eq!(
-        required_control_plane_target(
-            Some("http://127.0.0.1:50051".into()),
-            Some("/tmp/sekai.sock".into())
-        )
-        .unwrap(),
-        "http://127.0.0.1:50051"
-    );
-}
-
-#[test]
-fn recovery_paths_use_canonical_configuration() {
-    assert_eq!(
-        resolve_usage_recovery_path(None),
-        PathBuf::from(DEFAULT_USAGE_RECOVERY_PATH)
-    );
-    assert_eq!(
-        resolve_usage_recovery_path(Some("/var/lib/sekai/usage.json".into())),
-        PathBuf::from("/var/lib/sekai/usage.json")
-    );
-    assert_eq!(
-        resolve_recovery_spool_path(None),
-        PathBuf::from(DEFAULT_RECOVERY_SPOOL_PATH)
-    );
-    assert_eq!(
-        resolve_recovery_spool_path(Some("/new/recovery.jsonl".into())),
-        PathBuf::from("/new/recovery.jsonl")
-    );
-}
-
-#[test]
-fn exposed_gateway_requires_keys_and_no_auth_passthrough() {
-    let bind = "0.0.0.0:8788".parse().unwrap();
-    let mut keys = HashMap::new();
-    assert!(validate_gateway_security(bind, &keys, false, None, false).is_err());
-    keys.insert(
-        "hash".to_string(),
-        GatewayIdentity {
-            agent: "agent".to_string(),
-            project: "project".to_string(),
-            user_id: "user".to_string(),
-            key_id: "key".to_string(),
-            tier: DEFAULT_GATEWAY_TIER.to_string(),
-        },
-    );
-    assert!(validate_gateway_security(bind, &keys, true, None, false).is_err());
-    assert!(validate_gateway_security(bind, &keys, false, None, false).is_ok());
 }
 
 #[test]
 fn policy_mode_owns_keys_and_refuses_passthrough() {
     let bind = "0.0.0.0:8788".parse().unwrap();
     let no_keys = HashMap::new();
-    assert!(validate_gateway_security(bind, &no_keys, false, None, true).is_ok());
-    assert!(validate_gateway_security(bind, &no_keys, true, None, true).is_err());
+    assert!(validate_gateway_security(bind, &no_keys, false, None).is_ok());
+    assert!(validate_gateway_security(bind, &no_keys, true, None).is_err());
     let keys = parse_gateway_keys("k=agent", "default").unwrap();
-    assert!(validate_gateway_security(bind, &keys, false, None, true).is_err());
+    assert!(validate_gateway_security(bind, &keys, false, None).is_err());
 }
 
 #[test]
@@ -1187,164 +1091,6 @@ fn gateway_success_receipt_uses_canonical_complete_shape() {
     )));
     assert_eq!(receipt.initiating_actor, identity.agent);
     assert!(receipt.completeness().complete);
-    let receipt_db = SekaiDb::new(":memory:").unwrap();
-    receipt_db.put_operation_receipt(&receipt).unwrap();
-    assert_eq!(
-        receipt_db
-            .find_gateway_receipt_by_logical_operation_id("gateway-op-1", Some(2))
-            .unwrap()
-            .unwrap()
-            .operation_id,
-        receipt.operation_id
-    );
-    assert_eq!(
-        receipt_db
-            .find_operation_receipt_by_request_id(&context.request_id)
-            .unwrap()
-            .unwrap()
-            .operation_id,
-        receipt.operation_id
-    );
-    assert_eq!(
-        receipt_db
-            .find_operation_receipt_by_lookup_request_id(
-                "client-request-1",
-                Some("scope-a"),
-                Some(&identity.agent),
-            )
-            .unwrap()
-            .unwrap()
-            .operation_id,
-        receipt.operation_id
-    );
-    assert!(
-        receipt_db
-            .find_operation_receipt_by_lookup_request_id(
-                "client-request-1",
-                Some("scope-a"),
-                Some("agent:other"),
-            )
-            .unwrap()
-            .is_none()
-    );
-    let mut legacy_replay = receipt.clone();
-    for event in &mut legacy_replay.events {
-        if event.kind == ReceiptEventKind::IntentRecorded {
-            event.attributes.remove("caller_scope");
-        }
-    }
-    receipt_db.put_operation_receipt(&legacy_replay).unwrap();
-    assert!(
-        receipt_db
-            .find_operation_receipt_by_lookup_request_id(
-                "client-request-1",
-                Some("scope-a"),
-                Some(&identity.agent),
-            )
-            .unwrap()
-            .is_some()
-    );
-    let mut duplicate_request = receipt.clone();
-    duplicate_request.operation_id = "duplicate-operation".into();
-    assert!(
-        receipt_db
-            .put_operation_receipt(&duplicate_request)
-            .is_err()
-    );
-
-    let mut other_scope = receipt.clone();
-    other_scope.operation_id = "other-scope-operation".into();
-    for event in &mut other_scope.events {
-        event.operation_id = other_scope.operation_id.clone();
-        event.event_id = event
-            .event_id
-            .replace(&receipt.operation_id, &other_scope.operation_id);
-        event.parent_event_id = event
-            .parent_event_id
-            .as_ref()
-            .map(|parent| parent.replace(&receipt.operation_id, &other_scope.operation_id));
-        if event.kind == ReceiptEventKind::IntentRecorded {
-            event
-                .attributes
-                .insert("request_id".into(), "other-internal-request".into());
-            event
-                .attributes
-                .insert("caller_scope".into(), "scope-b".into());
-        }
-    }
-    receipt_db.put_operation_receipt(&other_scope).unwrap();
-    assert_eq!(
-        receipt_db
-            .find_operation_receipt_by_lookup_request_id(
-                "client-request-1",
-                Some("scope-b"),
-                Some(&identity.agent),
-            )
-            .unwrap()
-            .unwrap()
-            .operation_id,
-        other_scope.operation_id
-    );
-    assert!(
-        receipt_db
-            .find_operation_receipt_by_lookup_request_id("client-request-1", None, None,)
-            .unwrap_err()
-            .contains("multiple")
-    );
-
-    receipt_db
-        .gateway_test_execute_batch(
-            "DROP INDEX idx_chisei_operation_receipts_lookup;
-             PRAGMA user_version=0;
-             UPDATE chisei_operation_receipts
-             SET caller_scope=NULL, request_id='chisei:scope-a:legacy', updated_at=999
-             WHERE operation_id='other-scope-operation';",
-        )
-        .unwrap();
-    receipt_db.gateway_test_migrate_chisei().unwrap();
-    assert_eq!(
-        receipt_db
-            .find_operation_receipt_by_lookup_request_id(
-                "client-request-1",
-                Some("scope-a"),
-                Some(&identity.agent),
-            )
-            .unwrap()
-            .unwrap()
-            .operation_id,
-        receipt.operation_id
-    );
-    receipt_db.put_operation_receipt(&other_scope).unwrap();
-    assert!(
-        receipt_db
-            .find_operation_receipt_by_lookup_request_id(
-                "client-request-1",
-                Some("scope-b"),
-                Some(&identity.agent),
-            )
-            .unwrap()
-            .is_none()
-    );
-
-    let mut spoofed_request = receipt.clone();
-    spoofed_request.operation_id = "spoofed-operation".into();
-    for event in &mut spoofed_request.events {
-        if event.kind == ReceiptEventKind::IntentRecorded {
-            event.attributes.remove("request_id");
-            event.attributes.remove("lookup_request_id");
-        } else if event.kind == ReceiptEventKind::VerificationRecorded {
-            event
-                .attributes
-                .insert("request_id".into(), "spoofed-request".into());
-        }
-    }
-    receipt_db.put_operation_receipt(&spoofed_request).unwrap();
-    assert!(
-        receipt_db
-            .find_operation_receipt_by_request_id("spoofed-request")
-            .unwrap()
-            .is_none()
-    );
     let serialized = serde_json::to_string(&receipt).unwrap();
     assert!(serialized.contains("openai.builtin/v3"));
     assert!(serialized.contains(CAPABILITY_MATRIX_VERSION));
@@ -1604,7 +1350,7 @@ async fn global_rate_limit_blocks_identity_rotation() {
 
 #[tokio::test]
 async fn oversized_gateway_request_is_rejected() {
-    let mut runtime = GatewayRuntime::new(Duration::from_secs(30), None);
+    let mut runtime = test_gateway_runtime();
     runtime.max_request_bytes = 16;
     let gateway_base = spawn_gateway_with_runtime(routing_config(), runtime).await;
     let response = reqwest::Client::new()
@@ -1627,7 +1373,6 @@ fn routing_config() -> GatewayConfig {
         anthropic_api_key: None,
         ollama_base_url: "http://localhost:11434/v1".to_string(),
         native_base_url: Some("http://localhost:9999/v1".to_string()),
-        chisei_grpc_target: None,
         default_project: "default".to_string(),
         gateway_keys: HashMap::new(),
         allow_auth_passthrough: true,
@@ -1635,196 +1380,6 @@ fn routing_config() -> GatewayConfig {
         pricing: HashMap::new(),
         allow_cross_provider: false,
     }
-}
-
-#[tokio::test]
-async fn pending_usage_recovery_is_deduplicated_and_bounded() {
-    let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
-    let usage = |work_unit: String, tokens_used| RecordUsageRequest {
-        user_id: "agent:safe-agent".into(),
-        tokens_used,
-        subject: String::new(),
-        project: "default".into(),
-        agent: "safe-agent".into(),
-        key_id: "safe-agent".into(),
-        work_unit: work_unit.clone(),
-        metric: String::new(),
-        idempotency_key: format!("test-usage-{work_unit}"),
-        operation_receipt_json: String::new(),
-        sample_observation: None,
-    };
-    assert!(
-        queue_pending_usage_records(&runtime, [usage("same".into(), 2), usage("same".into(), 3)],)
-            .await
-    );
-    {
-        let cache = runtime.usage_recovery.read().await;
-        assert_eq!(cache.pending_usage_records.len(), 1);
-        assert_eq!(
-            cache
-                .pending_usage_records
-                .values()
-                .next()
-                .unwrap()
-                .tokens_used,
-            2
-        );
-    }
-    for index in 1..MAX_PENDING_USAGE_RECOVERIES {
-        assert!(queue_pending_usage_records(&runtime, [usage(format!("work-{index}"), 1)],).await);
-    }
-    assert!(!queue_pending_usage_records(&runtime, [usage("overflow".into(), 1)]).await);
-    let cache = runtime.usage_recovery.read().await;
-    assert_eq!(
-        cache.pending_usage_records.len(),
-        MAX_PENDING_USAGE_RECOVERIES
-    );
-    assert!(cache.usage_recovery_saturated);
-}
-
-#[tokio::test]
-async fn invalid_usage_recovery_journal_fails_closed() {
-    let path = std::env::temp_dir().join(format!(
-        "chisei-invalid-usage-recovery-{}.json",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::write(&path, b"not-json").unwrap();
-
-    let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-        .with_usage_recovery_path(Some(path.clone()));
-    let cache = runtime.usage_recovery.read().await;
-    assert!(cache.pending_usage_records.is_empty());
-    assert!(cache.usage_recovery_saturated);
-
-    std::fs::remove_file(path).unwrap();
-}
-
-#[tokio::test]
-async fn missing_usage_recovery_journal_is_initialized() {
-    let path = std::env::temp_dir().join(format!(
-        "chisei-new-usage-recovery-{}.json",
-        uuid::Uuid::new_v4()
-    ));
-
-    let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-        .with_usage_recovery_path(Some(path.clone()));
-    let cache = runtime.usage_recovery.read().await;
-    assert!(!cache.usage_recovery_saturated);
-    assert_eq!(std::fs::read(&path).unwrap(), b"[]");
-
-    std::fs::remove_file(path).unwrap();
-}
-
-#[tokio::test]
-async fn unavailable_usage_recovery_journal_fails_closed() {
-    let parent = std::env::temp_dir().join(format!(
-        "chisei-blocked-usage-recovery-{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::write(&parent, b"not-a-directory").unwrap();
-    let path = parent.join("journal.json");
-
-    let runtime =
-        GatewayRuntime::new(Duration::from_secs(30), None).with_usage_recovery_path(Some(path));
-    let cache = runtime.usage_recovery.read().await;
-    assert!(cache.usage_recovery_saturated);
-
-    std::fs::remove_file(parent).unwrap();
-}
-
-#[tokio::test]
-async fn gateway_recovery_spool_replays_llm_rows() {
-    let directory = std::env::temp_dir().join(format!("chisei-recovery-{}", uuid::Uuid::new_v4()));
-    let recovery_path = directory.join("recovery.jsonl");
-    let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-        .with_recovery_spool_path(Some(recovery_path.clone()));
-    tokio::fs::create_dir_all(&directory).await.unwrap();
-    tokio::fs::write(&recovery_path, br#"{"kind":"llm_row""#)
-        .await
-        .unwrap();
-    let values = HashMap::from([
-        ("request_id".into(), "recovered-request".into()),
-        ("timestamp_ms".into(), "1".into()),
-        ("status".into(), "200".into()),
-        (
-            "resolved_model".into(),
-            "anthropic/claude-sonnet-4-6".into(),
-        ),
-        ("profile_version".into(), "anthropic.builtin/v3".into()),
-        (
-            "pricing_snapshot_version".into(),
-            "anthropic.cache/v1".into(),
-        ),
-        ("cache_creation_5m_input_tokens".into(), "20".into()),
-        ("cache_creation_1h_input_tokens".into(), "10".into()),
-        ("cache_savings_usd_micros".into(), "270".into()),
-    ]);
-    assert!(
-        append_gateway_recovery(
-            &runtime,
-            GatewayRecoveryRecord::LlmRow {
-                values: values.clone(),
-            },
-        )
-        .await
-    );
-    assert!(
-        append_gateway_recovery(
-            &runtime,
-            GatewayRecoveryRecord::LlmRow {
-                values: values.clone(),
-            },
-        )
-        .await
-    );
-    let plane = FakeSekaiPlane::default();
-    let target = spawn_fake_sekai_plane(plane.clone()).await;
-    let mut config = routing_config();
-    config.chisei_grpc_target = Some(target);
-    replay_gateway_recovery(&config, &runtime).await;
-    let rows: Vec<HashMap<String, String>> = plane
-        .llm_rows
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|row| row.values.clone())
-        .collect();
-    assert_eq!(
-        rows.iter()
-            .filter(|row| row.get("request_id") == Some(&"recovered-request".into()))
-            .count(),
-        1
-    );
-    let recovered = rows
-        .iter()
-        .find(|row| row.get("request_id") == Some(&"recovered-request".into()))
-        .unwrap();
-    assert_eq!(
-        recovered
-            .get("pricing_snapshot_version")
-            .map(String::as_str),
-        Some("anthropic.cache/v1")
-    );
-    assert_eq!(
-        recovered
-            .get("cache_creation_5m_input_tokens")
-            .map(String::as_str),
-        Some("20")
-    );
-    assert_eq!(
-        recovered
-            .get("cache_creation_1h_input_tokens")
-            .map(String::as_str),
-        Some("10")
-    );
-    assert_eq!(
-        recovered
-            .get("cache_savings_usd_micros")
-            .map(String::as_str),
-        Some("270")
-    );
-    assert!(!recovery_path.exists());
-    let _ = std::fs::remove_dir_all(directory);
 }
 
 #[test]
@@ -2218,179 +1773,18 @@ fn client_dispatch_adapter_allows_anthropic_to_openai_only() {
 }
 
 #[tokio::test]
-async fn control_plane_circuit_rejects_after_repeated_connection_failure() {
-    let runtime =
-        GatewayRuntime::new(Duration::from_secs(30), None).with_resilience(ResilienceConfig {
-            control_plane_retries: 0,
-            circuit_failure_threshold: 1,
-            circuit_cooldown: Duration::from_secs(60),
-            ..ResilienceConfig::default()
-        });
-    let target = "/tmp/sekai-chisei-missing-circuit-test.sock";
-    assert!(connect_governance(&runtime, target).await.is_err());
-    let error = connect_governance(&runtime, target).await.unwrap_err();
-    assert!(error.to_string().contains("circuit is open"));
-}
-
-#[test]
-fn capability_routing_failure_preserves_gateway_error_type() {
-    let rejection = governance_status_rejection(&tonic::Status::failed_precondition(
-        "capability_unsupported: no available candidate can preserve required capabilities",
-    ));
-
-    assert_eq!(rejection.status, StatusCode::BAD_REQUEST);
-    assert_eq!(rejection.error_type, "capability_unsupported");
-    assert!(
-        rejection
-            .reason
-            .contains("no available candidate can preserve required capabilities")
-    );
-}
-
-#[tokio::test]
-async fn stalled_control_plane_rpc_is_bounded_and_opens_circuit() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let target = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        let (_socket, _) = listener.accept().await.unwrap();
-        std::future::pending::<()>().await;
-    });
-    let runtime =
-        GatewayRuntime::new(Duration::from_secs(30), None).with_resilience(ResilienceConfig {
-            control_plane_retries: 0,
-            control_plane_timeout: Duration::from_millis(25),
-            circuit_failure_threshold: 1,
-            ..ResilienceConfig::default()
-        });
-
-    let started = Instant::now();
-    let channel = connect_governance(&runtime, &target).await.unwrap();
-    let error = SekaiServiceClient::new(channel)
-        .list_schema_types(gateway_request(ListSchemaTypesRequest {}))
-        .await
-        .unwrap_err();
-    assert!(is_transient_governance_status(&error));
-    record_control_plane_failure(&runtime, &error).await;
-    assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(runtime.control_plane_circuit.read().await.is_open());
-}
-
-#[tokio::test]
-async fn only_transient_statuses_open_the_control_plane_circuit() {
-    let runtime =
-        GatewayRuntime::new(Duration::from_secs(30), None).with_resilience(ResilienceConfig {
-            circuit_failure_threshold: 2,
-            ..ResilienceConfig::default()
-        });
-    let client_fault =
-        tonic::Status::failed_precondition("capability_unsupported: tool use is not supported");
-    for _ in 0..5 {
-        record_control_plane_status(&runtime, &client_fault).await;
-    }
-    assert!(!runtime.control_plane_circuit.read().await.is_open());
-
-    let outage = tonic::Status::unavailable("control plane down");
-    record_control_plane_status(&runtime, &outage).await;
-    record_control_plane_status(&runtime, &outage).await;
-    assert!(runtime.control_plane_circuit.read().await.is_open());
-}
-
-#[tokio::test]
-async fn successful_key_store_lookup_resets_control_plane_failures() {
-    let key = "sk-chisei-resilient-worker";
-    let target = spawn_fake_sekai_plane(FakeSekaiPlane {
-        gateway_keys: vec![sekai_proto::sekai::Object {
-            id: "gateway-key-resilient-worker".into(),
-            kind: "gateway_key".into(),
-            name: "resilient-worker".into(),
-            namespace: "default".into(),
-            properties: HashMap::from([
-                ("agent".into(), "resilient-worker".into()),
-                ("project".into(), "default".into()),
-                ("status".into(), "active".into()),
-                ("key_hash".into(), hash_gateway_key(key)),
-            ]),
-            ..Default::default()
-        }],
-        ..Default::default()
-    })
-    .await;
-    let runtime =
-        GatewayRuntime::new(Duration::from_secs(30), None).with_resilience(ResilienceConfig {
-            circuit_failure_threshold: 2,
-            ..ResilienceConfig::default()
-        });
-    runtime
-        .control_plane_circuit
-        .write()
-        .await
-        .record_failure("transient".into(), &runtime.resilience);
-    let mut config = routing_config();
-    config.chisei_grpc_target = Some(target);
-    let state = GatewayState {
-        client: runtime.http_timeouts.client(),
-        config: Arc::new(config),
-        runtime: runtime.clone(),
-    };
-
-    assert!(
-        resolve_identity_from_key_store(&state, key)
-            .await
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(
-        runtime
-            .control_plane_circuit
-            .read()
-            .await
-            .consecutive_failures,
-        0
-    );
-}
-
-#[tokio::test]
-async fn readiness_probe_failures_do_not_mutate_the_traffic_circuit() {
-    let runtime =
-        GatewayRuntime::new(Duration::from_secs(30), None).with_resilience(ResilienceConfig {
-            circuit_failure_threshold: 1,
-            ..ResilienceConfig::default()
-        });
-    let mut config = routing_config();
-    config.chisei_grpc_target =
-        Some("/tmp/sekai-chisei-missing-readiness-isolation-test.sock".to_string());
-    let gateway_base = spawn_gateway_with_runtime(config, runtime.clone()).await;
-    for _ in 0..3 {
-        assert_eq!(
-            reqwest::Client::new()
-                .get(format!("{gateway_base}/readyz"))
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-    }
-    let circuit = runtime.control_plane_circuit.read().await;
-    assert_eq!(circuit.consecutive_failures, 0);
-    assert!(!circuit.is_open());
-}
-
-#[tokio::test]
 async fn readiness_fails_when_provider_registry_disappears() {
     let directory = std::env::temp_dir().join(format!(
         "chisei-readiness-provider-registry-{}",
         uuid::Uuid::new_v4()
     ));
     let registry_path = directory.join("registry.json");
-    let audit_path = directory.join("audit.jsonl");
     crate::provider_profile::refresh_provider_registry_async(&registry_path)
         .await
         .unwrap();
     std::fs::remove_file(&registry_path).unwrap();
     let runtime = GatewayRuntime::new(Duration::from_secs(30), None)
-        .with_provider_registry_state_path(Some(registry_path))
-        .with_recovery_spool_path(Some(audit_path));
+        .with_provider_registry_state_path(Some(registry_path));
     let config = routing_config();
     let state = GatewayState {
         client: runtime.http_timeouts.client(),
@@ -2611,28 +2005,6 @@ async fn lifecycle_mutation_invalidation_reloads_the_runtime_snapshot() {
     assert_eq!(after.state_version, 1);
     assert!(after.resolve_model("openai/gpt-5.5").is_err());
     std::fs::remove_dir_all(directory).unwrap();
-}
-
-#[tokio::test]
-async fn gateway_status_surfaces_sticky_usage_recovery_saturation() {
-    let runtime = GatewayRuntime::new(Duration::from_secs(30), None);
-    runtime
-        .usage_recovery
-        .write()
-        .await
-        .usage_recovery_saturated = true;
-    let state = GatewayState {
-        client: runtime.http_timeouts.client(),
-        config: Arc::new(routing_config()),
-        runtime,
-    };
-
-    let response = gateway_status(State(state)).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["status"], "degraded");
-    assert_eq!(body["usage_recovery_saturated"], true);
 }
 
 #[test]
@@ -3083,17 +2455,60 @@ async fn spawn_fake_upstream(
     (format!("http://{addr}/v1"), requests)
 }
 
+fn test_passthrough_policy() -> PolicyStore {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.json");
+    let principals = [
+        "codex-app",
+        "claude-code",
+        "coder",
+        "safe-agent",
+        "alice",
+        "agent",
+        "resilient-worker",
+    ];
+    let mut principal_json = Vec::new();
+    for name in principals {
+        principal_json.push(serde_json::json!({
+            "name": name,
+            "key_sha256": [
+                hash_gateway_key(&format!("unused-{name}")),
+                hash_gateway_key(&format!("sk-chisei-{name}")),
+            ],
+            "routes": [
+                {"provider": "openai", "models": ["*"]},
+                {"provider": "anthropic", "models": ["*"]},
+                {"provider": "ollama", "models": ["*"]},
+                {"provider": "native", "models": ["*"]},
+                {"provider": "xai", "models": ["*"]},
+                {"provider": "meta", "models": ["*"]},
+            ],
+        }));
+    }
+    let policy = serde_json::json!({
+        "format": POLICY_FORMAT,
+        "generation": 1,
+        "principals": principal_json,
+        "egress": [
+            {"provider": "openai", "data_classes": ["unknown", "public", "internal", "unclassified", "sensitive"]},
+            {"provider": "anthropic", "data_classes": ["unknown", "public", "internal", "unclassified", "sensitive"]},
+            {"provider": "ollama", "data_classes": ["unknown", "public", "internal", "unclassified", "sensitive"]},
+            {"provider": "native", "data_classes": ["unknown", "public", "internal", "unclassified", "sensitive"]},
+            {"provider": "xai", "data_classes": ["unknown", "public", "internal", "unclassified", "sensitive"]},
+            {"provider": "meta", "data_classes": ["unknown", "public", "internal", "unclassified", "sensitive"]},
+        ],
+    });
+    std::fs::write(&path, serde_json::to_vec(&policy).unwrap()).unwrap();
+    let store = PolicyStore::open(path);
+    std::mem::forget(dir);
+    store
+}
+
 async fn spawn_gateway_with_config(config: GatewayConfig) -> String {
     spawn_gateway_with_runtime(config, test_gateway_runtime()).await
 }
 
-async fn spawn_gateway_with_runtime(config: GatewayConfig, mut runtime: GatewayRuntime) -> String {
-    if runtime.recovery_spool_path.is_none() {
-        runtime.recovery_spool_path = Some(std::env::temp_dir().join(format!(
-            "chisei-gateway-recovery-{}.jsonl",
-            uuid::Uuid::new_v4()
-        )));
-    }
+async fn spawn_gateway_with_runtime(config: GatewayConfig, runtime: GatewayRuntime) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -3105,11 +2520,17 @@ async fn spawn_gateway_with_runtime(config: GatewayConfig, mut runtime: GatewayR
 }
 
 fn test_gateway_runtime() -> GatewayRuntime {
+    let mut runtime = GatewayRuntime::new(Duration::from_secs(DEFAULT_KEY_CACHE_TTL_SECS), None)
+        .with_resilience(ResilienceConfig {
+            ..ResilienceConfig::default()
+        });
+    runtime.policy = Some(test_passthrough_policy());
+    runtime
+}
+
+fn test_gateway_runtime_without_policy() -> GatewayRuntime {
     GatewayRuntime::new(Duration::from_secs(DEFAULT_KEY_CACHE_TTL_SECS), None).with_resilience(
         ResilienceConfig {
-            control_plane_retries: 4,
-            control_plane_retry_backoff: Duration::from_millis(50),
-            control_plane_timeout: Duration::from_secs(10),
             ..ResilienceConfig::default()
         },
     )
@@ -3127,7 +2548,6 @@ async fn openai_passthrough_rejects_requests_without_client_auth() {
         ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
         native_base_url: None,
         anthropic_api_key: None,
-        chisei_grpc_target: None,
         default_project: "default".to_string(),
         gateway_keys: HashMap::new(),
         allow_auth_passthrough: true,
@@ -3164,7 +2584,6 @@ async fn foreign_model_namespace_cannot_bypass_cross_provider_gate() {
         ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
         native_base_url: None,
         anthropic_api_key: Some("real-anthropic-key".to_string()),
-        chisei_grpc_target: None,
         default_project: "default".to_string(),
         gateway_keys: HashMap::new(),
         allow_auth_passthrough: false,
@@ -3216,7 +2635,6 @@ async fn unknown_key_is_rejected_when_allowlist_is_configured() {
         ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
         native_base_url: None,
         anthropic_api_key: Some("real-anthropic-key".to_string()),
-        chisei_grpc_target: None,
         default_project: "default".to_string(),
         gateway_keys,
         allow_auth_passthrough: false,
@@ -3239,28 +2657,30 @@ async fn unknown_key_is_rejected_when_allowlist_is_configured() {
 }
 
 #[tokio::test]
-async fn fail_closed_blocks_when_chisei_preflight_is_unavailable() {
+async fn fail_closed_blocks_when_policy_is_unavailable() {
     let (upstream_base, requests) = spawn_fake_upstream(
         r#"{"id":"resp_1","status":"completed"}"#,
         "application/json",
     )
     .await;
-    let gateway_base = spawn_gateway_with_config(GatewayConfig {
-        bind_addr: "127.0.0.1:0".parse().unwrap(),
-        openai_base_url: upstream_base,
-        openai_api_key: Some("real-openai-key".to_string()),
-        anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
-        ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
-        native_base_url: None,
-        anthropic_api_key: Some("real-anthropic-key".to_string()),
-        chisei_grpc_target: Some("/tmp/sekai-chisei-missing-test.sock".to_string()),
-        default_project: "default".to_string(),
-        gateway_keys: HashMap::new(),
-        allow_auth_passthrough: false,
-        rewrite_openai_passthrough_auth: false,
-        pricing: HashMap::new(),
-        allow_cross_provider: false,
-    })
+    let gateway_base = spawn_gateway_with_runtime(
+        GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            pricing: HashMap::new(),
+            allow_cross_provider: false,
+        },
+        test_gateway_runtime_without_policy(),
+    )
     .await;
 
     let resp = reqwest::Client::new()
@@ -3290,7 +2710,6 @@ async fn caller_provider_credentials_do_not_reach_upstream_without_admission() {
         ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
         native_base_url: None,
         anthropic_api_key: Some("real-anthropic-key".to_string()),
-        chisei_grpc_target: None,
         default_project: "default".to_string(),
         gateway_keys: HashMap::new(),
         allow_auth_passthrough: true,
@@ -3303,48 +2722,41 @@ async fn caller_provider_credentials_do_not_reach_upstream_without_admission() {
     let resp = reqwest::Client::new()
         .post(format!("{gateway_base}/v1/responses"))
         .bearer_auth("sk-caller-openai")
-        .header(X_CHISEI_AGENT.as_str(), "codex-app")
+        .header(X_CHISEI_AGENT.as_str(), "not-a-policy-principal")
         .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
         .send()
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert!(requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn configured_gateway_fails_closed_when_decision_is_unavailable() {
+async fn configured_gateway_fails_closed_when_policy_is_unavailable() {
     let (upstream_base, requests) = spawn_fake_upstream(
         r#"{"id":"resp_1","status":"completed"}"#,
         "application/json",
     )
     .await;
-    let gateway_base = spawn_gateway_with_config(GatewayConfig {
-        bind_addr: "127.0.0.1:0".parse().unwrap(),
-        openai_base_url: upstream_base,
-        openai_api_key: Some("real-openai-key".to_string()),
-        anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
-        ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
-        native_base_url: None,
-        anthropic_api_key: Some("real-anthropic-key".to_string()),
-        chisei_grpc_target: Some("/tmp/sekai-chisei-missing-test.sock".to_string()),
-        default_project: "default".to_string(),
-        gateway_keys: HashMap::from([(
-            "sk-chisei-codex-app".to_string(),
-            GatewayIdentity {
-                agent: "codex-app".to_string(),
-                project: "default".to_string(),
-                user_id: "agent:codex-app".to_string(),
-                key_id: "codex-app".to_string(),
-                tier: "low-risk".to_string(),
-            },
-        )]),
-        allow_auth_passthrough: false,
-        rewrite_openai_passthrough_auth: false,
-        pricing: HashMap::new(),
-        allow_cross_provider: false,
-    })
+    let gateway_base = spawn_gateway_with_runtime(
+        GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            openai_base_url: upstream_base,
+            openai_api_key: Some("real-openai-key".to_string()),
+            anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+            ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+            native_base_url: None,
+            anthropic_api_key: Some("real-anthropic-key".to_string()),
+            default_project: "default".to_string(),
+            gateway_keys: HashMap::new(),
+            allow_auth_passthrough: false,
+            rewrite_openai_passthrough_auth: false,
+            pricing: HashMap::new(),
+            allow_cross_provider: false,
+        },
+        test_gateway_runtime_without_policy(),
+    )
     .await;
 
     let resp = reqwest::Client::new()
@@ -3359,17 +2771,31 @@ async fn configured_gateway_fails_closed_when_decision_is_unavailable() {
 
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(requests.lock().unwrap().is_empty());
+}
 
-    let classified = reqwest::Client::new()
-        .post(format!("{gateway_base}/v1/responses"))
-        .bearer_auth("sk-chisei-codex-app")
-        .header("x-chisei-data-class", "sensitive")
-        .json(&serde_json::json!({"model": "gpt-5.5", "input": "hello"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(classified.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(requests.lock().unwrap().is_empty());
+#[tokio::test]
+async fn retired_chisei_context_is_refused_before_provider_contact() {
+    let (upstream_base, requests) = spawn_fake_upstream(
+        r#"{"id":"resp_1","status":"completed"}"#,
+        "application/json",
+    )
+    .await;
+    let gateway_base = spawn_gateway_with_config(GatewayConfig {
+        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        openai_base_url: upstream_base,
+        openai_api_key: Some("real-openai-key".to_string()),
+        anthropic_base_url: "http://127.0.0.1:9/v1".to_string(),
+        ollama_base_url: "http://127.0.0.1:11434/v1".to_string(),
+        native_base_url: None,
+        anthropic_api_key: Some("real-anthropic-key".to_string()),
+        default_project: "default".to_string(),
+        gateway_keys: HashMap::new(),
+        allow_auth_passthrough: false,
+        rewrite_openai_passthrough_auth: false,
+        pricing: HashMap::new(),
+        allow_cross_provider: false,
+    })
+    .await;
 
     let explicit = reqwest::Client::new()
         .post(format!("{gateway_base}/v1/responses"))
@@ -3384,7 +2810,6 @@ async fn configured_gateway_fails_closed_when_decision_is_unavailable() {
         .send()
         .await
         .unwrap();
-    // The retired field is refused before the control plane is consulted.
     assert_eq!(explicit.status(), StatusCode::BAD_REQUEST);
     let body: serde_json::Value = explicit.json().await.unwrap();
     assert!(
@@ -3675,87 +3100,6 @@ fn automatic_cache_attempt_requires_profile_support_and_minimum_size() {
         anthropic.as_ref(),
         &[b'x'; 4 * 4_096]
     ));
-}
-
-/// A Sekai plane that implements only the calls the gateway's key store and
-/// recovery replay make; every other RPC returns UNIMPLEMENTED. Tests that
-/// need the real control plane live in the root `tests/gateway_control_plane.rs`.
-#[derive(Clone, Default)]
-struct FakeSekaiPlane {
-    gateway_keys: Vec<sekai_proto::sekai::Object>,
-    llm_rows: Arc<std::sync::Mutex<Vec<sekai_proto::sekai::Row>>>,
-}
-
-#[tonic::async_trait]
-impl sekai_proto::sekai::sekai_service_server::SekaiService for FakeSekaiPlane {
-    async fn find_by_property(
-        &self,
-        request: GrpcRequest<FindByPropertyRequest>,
-    ) -> Result<tonic::Response<sekai_proto::sekai::ListObjectsResponse>, tonic::Status> {
-        let request = request.into_inner();
-        let objects = self
-            .gateway_keys
-            .iter()
-            .filter(|object| {
-                object.kind == request.kind
-                    && object.properties.get(&request.key) == Some(&request.value)
-            })
-            .cloned()
-            .collect();
-        Ok(tonic::Response::new(
-            sekai_proto::sekai::ListObjectsResponse {
-                objects,
-                ..Default::default()
-            },
-        ))
-    }
-
-    async fn query_rows(
-        &self,
-        request: GrpcRequest<QueryRowsRequest>,
-    ) -> Result<tonic::Response<sekai_proto::sekai::QueryRowsResponse>, tonic::Status> {
-        let filters = request.into_inner().query.unwrap_or_default().filters;
-        let rows = self
-            .llm_rows
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|row| {
-                filters
-                    .iter()
-                    .all(|filter| row.values.get(&filter.column) == Some(&filter.value))
-            })
-            .cloned()
-            .collect();
-        Ok(tonic::Response::new(
-            sekai_proto::sekai::QueryRowsResponse { rows },
-        ))
-    }
-
-    async fn append_rows(
-        &self,
-        request: GrpcRequest<AppendRowsRequest>,
-    ) -> Result<tonic::Response<sekai_proto::sekai::AppendRowsResponse>, tonic::Status> {
-        let rows = request.into_inner().rows;
-        let count = rows.len() as i32;
-        self.llm_rows.lock().unwrap().extend(rows);
-        Ok(tonic::Response::new(
-            sekai_proto::sekai::AppendRowsResponse { count },
-        ))
-    }
-}
-
-async fn spawn_fake_sekai_plane(plane: FakeSekaiPlane) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(sekai_proto::sekai::sekai_service_server::SekaiServiceServer::new(plane))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .unwrap();
-    });
-    format!("http://{addr}")
 }
 
 const POLICY_KEY: &str = "sk-policy-coder";

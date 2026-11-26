@@ -831,7 +831,7 @@ fn external_identities_may_not_claim_reserved_principals() {
             .unwrap()
     };
 
-    for subject in ["root", "local", "anonymous", "chisei-gateway"] {
+    for subject in ["root", "local", "anonymous"] {
         assert_eq!(
             interceptor
                 .call(request(&assertion(subject)))
@@ -17709,22 +17709,6 @@ async fn credential_rpcs_reject_privileged_principal_names() {
             .unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
-}
-
-#[tokio::test]
-async fn managed_credentials_reject_reserved_gateway_principal() {
-    let error = service()
-        .create_credential(with_named_principal(
-            CreateCredentialRequest {
-                principal: "chisei-gateway".into(),
-                managed_team_principal: true,
-                tenant_id: String::new(),
-            },
-            "local",
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }
 
 #[tokio::test]

@@ -232,10 +232,9 @@ pub(super) async fn update_dataset(
             .iter()
             .any(|principal| matches!(principal.as_str(), "root" | "local"));
         let trusted_gateway = parsed.id == "llm_calls"
-            && principals.iter().any(|principal| {
-                principal == "chisei-gateway"
-                    || service.gateway_schema_principals.contains(principal)
-            });
+            && principals
+                .iter()
+                .any(|principal| service.gateway_schema_principals.contains(principal));
         if !control_plane_admin && !trusted_gateway {
             return Err(Status::permission_denied(
                 "unbound dataset updates require control-plane administration or the gateway service principal",

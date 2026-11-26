@@ -1063,12 +1063,6 @@ async fn dispatch<I>(
             })
             .await
         }
-        ("chisei.ChiseiService", "DecideGatewayExecution") => {
-            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
-                ChiseiService::decide_gateway_execution(&*svc, req).await
-            })
-            .await
-        }
         ("chisei.ChiseiService", "SetNamespacePolicy") => {
             invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::set_namespace_policy(&*svc, req).await
@@ -1120,12 +1114,6 @@ async fn dispatch<I>(
         ("chisei.ChiseiService", "ExecuteEvaluationManifest") => {
             invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
                 ChiseiService::execute_evaluation_manifest(&*svc, req).await
-            })
-            .await
-        }
-        ("chisei.ChiseiService", "ClaimGatewayDispatch") => {
-            invoke_chisei(state, metadata, extensions, body, |svc, req| async move {
-                ChiseiService::claim_gateway_dispatch(&*svc, req).await
             })
             .await
         }

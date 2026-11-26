@@ -22,6 +22,7 @@ use axum::http::Uri;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::any;
+use sekai_domain::gateway_keys::hash_gateway_key;
 use serde_json::{Value, json};
 use tokio::sync::watch;
 
@@ -331,6 +332,35 @@ impl GatewayStack {
             );
         }
 
+        let policy_path = dir.path().join("gateway-policy.json");
+        let policy = json!({
+            "format": "chisei.gateway-policy/v1",
+            "generation": 1,
+            "principals": [
+                {
+                    "name": "codex-app",
+                    "key_sha256": [hash_gateway_key(CODEX_KEY)],
+                    "routes": [
+                        {"provider": "openai", "models": ["*"]},
+                        {"provider": "anthropic", "models": ["*"]}
+                    ],
+                },
+                {
+                    "name": "claude-code",
+                    "key_sha256": [hash_gateway_key(CLAUDE_KEY)],
+                    "routes": [
+                        {"provider": "openai", "models": ["*"]},
+                        {"provider": "anthropic", "models": ["*"]}
+                    ],
+                }
+            ],
+            "egress": [
+                {"provider": "openai", "data_classes": ["unknown", "public", "internal"]},
+                {"provider": "anthropic", "data_classes": ["unknown", "public", "internal"]}
+            ],
+        });
+        std::fs::write(&policy_path, serde_json::to_vec(&policy).unwrap()).unwrap();
+
         let mut gateway = None;
         let mut base = String::new();
         for _ in 1..=10 {
@@ -338,31 +368,20 @@ impl GatewayStack {
             // Truncated per attempt, so it always holds the latest attempt's output.
             let log_file = std::fs::File::create(&gateway_log_path).expect("gateway log");
             let child = Command::new(chisei_gateway_bin())
-                .env("SEKAI_SOCKET", &socket)
-                .env("SEKAI_DB_PATH", &sekai_db)
-                .env("CHISEI_DB_PATH", &chisei_db)
                 .env("GATEWAY_BIND", format!("127.0.0.1:{gateway_port}"))
+                .env("CHISEI_GATEWAY_POLICY_PATH", &policy_path)
                 .env("CHISEI_OPENAI_BASE_URL", fake.openai_base())
                 .env("CHISEI_ANTHROPIC_BASE_URL", fake.anthropic_base())
                 .env("OPENAI_API_KEY", "control-plane-openai-smoke-key")
                 .env("ANTHROPIC_API_KEY", "control-plane-anthropic-smoke-key")
                 .env("CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH", "1")
-                .env("CHISEI_GATEWAY_CONTROL_PLANE_RETRIES", "0")
-                .env("CHISEI_GATEWAY_CONTROL_PLANE_TIMEOUT_MS", "5000")
-                .env(
-                    "CHISEI_GATEWAY_USAGE_RECOVERY_PATH",
-                    dir.path().join("usage-recovery.json"),
-                )
-                .env(
-                    "CHISEI_GATEWAY_RECOVERY_SPOOL_PATH",
-                    dir.path().join("recovery-spool"),
-                )
                 .env(
                     "CHISEI_GATEWAY_PRICING",
                     "gpt-5.5=1:2,claude-sonnet-4-8=3:15",
                 )
                 .env("RUST_LOG", "error")
                 .env_remove("CHISEI_GRPC_URL")
+                .env_remove("SEKAI_SOCKET")
                 .stdout(Stdio::from(
                     log_file.try_clone().expect("clone gateway log"),
                 ))
@@ -795,14 +814,14 @@ async fn spawned_gateway_serves_readyz() {
     assert_eq!(
         response.status(),
         reqwest::StatusCode::OK,
-        "readyz with a live control plane\n{}\n{}",
+        "readyz with a valid policy\n{}\n{}",
         response.text().await.unwrap_or_default(),
         stack.logs()
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn spawned_gateway_fail_closed_when_control_plane_down() {
+async fn spawned_gateway_admits_when_control_plane_down() {
     let mut stack = GatewayStack::spawn().await;
     stack.kill_control_plane();
     let response = stack
@@ -817,15 +836,14 @@ async fn spawned_gateway_fail_closed_when_control_plane_down() {
         .await;
     assert_eq!(
         response.status(),
-        reqwest::StatusCode::SERVICE_UNAVAILABLE,
-        "dead control plane should fail closed\n{}\n{}",
+        reqwest::StatusCode::OK,
+        "policy mode keeps admitting while the control plane is down\n{}\n{}",
         response.text().await.unwrap_or_default(),
         stack.logs()
     );
-    assert_eq!(
-        stack.fake.hit_count(),
-        0,
-        "dead control plane must not reach the upstream"
+    assert!(
+        stack.fake.hit_count() > 0,
+        "policy admission must still reach the upstream"
     );
 }
 

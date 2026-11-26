@@ -215,7 +215,6 @@ async fn gateway(upstream: String, models: &[&str], dir: &std::path::Path) -> St
         anthropic_api_key: None,
         ollama_base_url: "http://127.0.0.1:9/v1".into(),
         native_base_url: None,
-        chisei_grpc_target: None,
         default_project: "default".into(),
         gateway_keys: HashMap::new(),
         allow_auth_passthrough: false,
@@ -224,7 +223,6 @@ async fn gateway(upstream: String, models: &[&str], dir: &std::path::Path) -> St
         allow_cross_provider: false,
     };
     let runtime = TestRuntime::new(test_support::DEFAULT_KEY_CACHE_TTL)
-        .with_recovery_spool_path(dir.join("recovery.jsonl"))
         .with_policy(policy_path, &dir.join("log"))
         .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

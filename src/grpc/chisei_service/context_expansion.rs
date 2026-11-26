@@ -1,4 +1,4 @@
-//! Shared context-expansion gate helpers for gateway decide and planning.
+//! Shared context-expansion gate helpers for native planning.
 //!
 //! These are private implementation used by already-deep modules. They are not a
 //! new ordered lifecycle.

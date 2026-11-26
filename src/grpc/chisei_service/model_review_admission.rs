@@ -37,6 +37,7 @@ impl ChiseiServiceImpl {
             .map_err(model_review_denied)
     }
 
+    #[cfg(test)]
     pub(super) fn review_admits_candidate(&self, namespace: &str, model: &str) -> bool {
         let Ok(identity) = model_review::identity_from_model(model) else {
             return false;
@@ -99,6 +100,7 @@ impl ChiseiServiceImpl {
         .map_err(model_release_denied)
     }
 
+    #[cfg(test)]
     pub(super) fn evidence_admits_candidate(&self, namespace: &str, model: &str) -> bool {
         match self.hosted_profile_for_model(namespace, model) {
             Ok(None) => true,

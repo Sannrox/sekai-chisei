@@ -509,6 +509,3 @@ pub(super) fn carries_chisei_context(body: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(body)
         .is_ok_and(|object| object.contains_key("chisei_context"))
 }
-pub(super) fn estimate_tokens_from_bytes(request_bytes: usize) -> i32 {
-    request_bytes.div_ceil(4).min(i32::MAX as usize) as i32
-}

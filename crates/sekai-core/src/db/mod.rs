@@ -66,7 +66,6 @@ pub mod sync_scope;
 pub mod transform_chain;
 pub mod transform_replay;
 pub mod transform_shadow;
-#[cfg(any(test, feature = "gateway-test-support"))]
 pub use postgres::ScratchDatabase;
 pub use postgres::off_runtime;
 #[cfg(test)]

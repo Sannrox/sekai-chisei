@@ -1,11 +1,4 @@
 pub mod gateway;
-pub mod gateway_report;
-pub mod gateway_setup;
-
-#[allow(dead_code)]
-mod client;
-#[cfg(test)]
-pub use chisei_core::config;
 pub use sekai_domain::domain;
 pub use sekai_domain::enterprise;
 mod gateway_support;

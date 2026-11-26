@@ -2,7 +2,7 @@ use std::error::Error as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -22,13 +22,8 @@ use std::collections::{BTreeMap, HashMap};
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::Request as GrpcRequest;
-use tracing::{Instrument, error, info, warn};
+use tracing::{Instrument, info, warn};
 
-use crate::client::{
-    GatewayClient, connect_sekai_as_gateway_with_timeout, connect_sekai_with_timeout,
-};
-use crate::gateway_support::METRIC_REQUESTS;
 use crate::llm::HttpTimeouts;
 use crate::pricing::lookup_pricing_entry;
 pub use crate::pricing::{ModelPricing, parse_pricing_table};
@@ -43,21 +38,8 @@ use sekai_domain::receipt::{
     GovernedReference, OPERATION_RECEIPT_VERSION, OperationReceipt, OperationReceiptEvent,
     ReceiptEventKind, UncoveredSurface,
 };
-use sekai_proto::chisei::chisei_service_client::ChiseiServiceClient;
-use sekai_proto::chisei::{
-    ClaimGatewayDispatchRequest, DecideGatewayExecutionRequest, RecordUsageRequest,
-    SampleObservation,
-};
-use sekai_proto::sekai::sekai_service_client::SekaiServiceClient;
-use sekai_proto::sekai::{
-    AppendRowsRequest, ColumnDef, CreateDatasetRequest, CreateLinkRequest, CreateObjectRequest,
-    Dataset, Decision, FindByExternalIdRequest, FindByPropertyRequest, Link,
-    ListSchemaTypesRequest, Object as SekaiObject, QueryRowsRequest, RecordDecisionRequest, Row,
-    RowFilter, RowQuery, UpdateDatasetRequest,
-};
 
 const DEFAULT_GATEWAY_BIND: &str = "127.0.0.1:8788";
-const DELEGATED_PRINCIPAL_HEADER: &str = "x-sekai-delegated-principal";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
 const DEFAULT_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
@@ -90,28 +72,17 @@ const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
 const TRACESTATE: HeaderName = HeaderName::from_static("tracestate");
 const IDEMPOTENCY_KEY: HeaderName = HeaderName::from_static("idempotency-key");
 const DEFAULT_KEY_CACHE_TTL_SECS: u64 = 30;
-const READINESS_PROBE_CACHE_SECS: u64 = 5;
 const PROVIDER_REGISTRY_REFRESH_TTL_MS: u64 = 250;
 const MAX_SSE_FRAME_BYTES: usize = 1024 * 1024;
 const SSE_VALIDATION_WINDOW_BYTES: usize = 64 * 1024;
 const STREAM_FORWARD_CHANNEL_CAPACITY: usize = 32;
 const STREAM_FORWARD_CHUNK_BYTES: usize = 64 * 1024;
-const MAX_PENDING_USAGE_RECOVERIES: usize = 4096;
-const DEFAULT_RECOVERY_SPOOL_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const DEFAULT_CONTROL_PLANE_RETRIES: u32 = 2;
-const DEFAULT_CONTROL_PLANE_RETRY_BACKOFF_MS: u64 = 25;
-const DEFAULT_CONTROL_PLANE_TIMEOUT_MS: u64 = 3_000;
 const DEFAULT_CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
 const DEFAULT_CIRCUIT_COOLDOWN_SECS: u64 = 5;
 const DEFAULT_UPSTREAM_CONNECT_RETRIES: u32 = 1;
 const MAX_PROVIDER_RETRY_AFTER_SECS: u64 = 60 * 60;
-const RECOVERY_REPLAY_YIELD_INTERVAL: usize = 32;
-const SCHEMA_RECONCILIATION_RETRY_MS: u64 = 60_000;
 const DEFAULT_GATEWAY_TIER: &str = "standard";
 const MIN_ADMIN_TOKEN_BYTES: usize = 32;
-const DEFAULT_USAGE_RECOVERY_PATH: &str = "data/chisei-gateway-usage-recovery.json";
-const DEFAULT_RECOVERY_SPOOL_PATH: &str = "data/chisei-gateway-recovery.jsonl";
-pub(crate) use chisei_provider::gateway_contract::LLM_CALLS_COLUMNS;
 
 #[path = "gateway_runtime.rs"]
 mod runtime;
@@ -135,9 +106,6 @@ use upstream::*;
 #[path = "gateway_usage.rs"]
 mod usage;
 use usage::*;
-#[path = "gateway_recovery.rs"]
-mod recovery;
-use recovery::*;
 #[path = "gateway_policy.rs"]
 mod policy;
 use policy::*;
@@ -157,7 +125,6 @@ pub struct GatewayConfig {
     pub anthropic_api_key: Option<String>,
     pub ollama_base_url: String,
     pub native_base_url: Option<String>,
-    pub chisei_grpc_target: Option<String>,
     pub default_project: String,
     pub gateway_keys: HashMap<String, GatewayIdentity>,
     pub allow_auth_passthrough: bool,
@@ -222,17 +189,9 @@ impl GatewayConfig {
         {
             return Err("a configured provider API key is required for chisei-gateway".into());
         }
-        // Policy mode admits against the gateway's own policy and never calls
-        // the control plane, so it needs no control-plane target.
-        let policy_mode = policy_path_from_env().is_some();
-        let chisei_grpc_target = if policy_mode {
-            None
-        } else {
-            Some(required_control_plane_target(
-                std::env::var("CHISEI_GRPC_URL").ok(),
-                std::env::var("SEKAI_SOCKET").ok(),
-            )?)
-        };
+        if policy_path_from_env().is_none() {
+            return Err(format!("{POLICY_PATH_ENV} is required").into());
+        }
         let default_project =
             std::env::var("GATEWAY_DEFAULT_PROJECT").unwrap_or_else(|_| "default".to_string());
         let gateway_keys = parse_gateway_keys(
@@ -254,7 +213,6 @@ impl GatewayConfig {
             &gateway_keys,
             allow_auth_passthrough,
             std::env::var("CHISEI_GATEWAY_ADMIN_TOKEN").ok().as_deref(),
-            policy_mode,
         )?;
 
         Ok(Self {
@@ -265,7 +223,6 @@ impl GatewayConfig {
             anthropic_api_key,
             ollama_base_url,
             native_base_url,
-            chisei_grpc_target,
             default_project,
             gateway_keys,
             allow_auth_passthrough,
@@ -292,14 +249,6 @@ impl GatewayIdentity {
         } else {
             &self.user_id
         }
-    }
-
-    fn can_delegate_principal(&self) -> bool {
-        !self.key_id.is_empty() && self.tier != "untrusted"
-    }
-
-    fn delegated_principal(&self) -> &str {
-        &self.agent
     }
 }
 
@@ -350,21 +299,9 @@ struct GatewayRuntime {
     global_rate_limit_requests: u64,
     rate_limit_window: Duration,
     rate_limits: Arc<RwLock<HashMap<String, RateLimitWindow>>>,
-    usage_recovery: Arc<RwLock<UsageRecoveryState>>,
-    usage_recovery_path: Option<PathBuf>,
-    usage_recovery_lock: Arc<Mutex<()>>,
     provider_registry_state_path: Option<PathBuf>,
     provider_registry_refresh: Arc<Mutex<ProviderRegistryRefreshState>>,
     provider_registry_refresh_generation: Arc<AtomicU64>,
-    recovery_spool_path: Option<PathBuf>,
-    recovery_spool_max_bytes: u64,
-    recovery_spool_lock: Arc<Mutex<()>>,
-    recovery_replay_running: Arc<AtomicBool>,
-    llm_calls_schema_reconciled: Arc<AtomicBool>,
-    llm_calls_schema_retry_after_ms: Arc<AtomicU64>,
-    llm_calls_schema_lock: Arc<Mutex<()>>,
-    control_plane_circuit: Arc<RwLock<CircuitBreakerState>>,
-    readiness_probe: Arc<Mutex<Option<(Instant, bool)>>>,
     upstream_circuits: Arc<RwLock<HashMap<String, CircuitBreakerState>>>,
     resilience: ResilienceConfig,
     /// Set in policy mode: the gateway-owned egress policy replaces every
@@ -376,9 +313,6 @@ struct GatewayRuntime {
 
 #[derive(Debug, Clone)]
 struct ResilienceConfig {
-    control_plane_retries: u32,
-    control_plane_retry_backoff: Duration,
-    control_plane_timeout: Duration,
     circuit_failure_threshold: u32,
     circuit_cooldown: Duration,
     upstream_connect_retries: u32,
@@ -393,11 +327,6 @@ struct ProviderRegistryRefreshState {
 impl Default for ResilienceConfig {
     fn default() -> Self {
         Self {
-            control_plane_retries: DEFAULT_CONTROL_PLANE_RETRIES,
-            control_plane_retry_backoff: Duration::from_millis(
-                DEFAULT_CONTROL_PLANE_RETRY_BACKOFF_MS,
-            ),
-            control_plane_timeout: Duration::from_millis(DEFAULT_CONTROL_PLANE_TIMEOUT_MS),
             circuit_failure_threshold: DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
             circuit_cooldown: Duration::from_secs(DEFAULT_CIRCUIT_COOLDOWN_SECS),
             upstream_connect_retries: DEFAULT_UPSTREAM_CONNECT_RETRIES,
@@ -490,62 +419,6 @@ impl CircuitBreakerState {
     }
 }
 
-#[derive(Default)]
-struct UsageRecoveryState {
-    pending_usage_records: HashMap<String, RecordUsageRequest>,
-    usage_recovery_saturated: bool,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PendingUsageRecovery {
-    user_id: String,
-    tokens_used: i32,
-    subject: String,
-    project: String,
-    agent: String,
-    key_id: String,
-    work_unit: String,
-    metric: String,
-    idempotency_key: String,
-    #[serde(default)]
-    operation_receipt_json: String,
-}
-
-impl From<RecordUsageRequest> for PendingUsageRecovery {
-    fn from(request: RecordUsageRequest) -> Self {
-        Self {
-            user_id: request.user_id,
-            tokens_used: request.tokens_used,
-            subject: request.subject,
-            project: request.project,
-            agent: request.agent,
-            key_id: request.key_id,
-            work_unit: request.work_unit,
-            metric: request.metric,
-            idempotency_key: request.idempotency_key,
-            operation_receipt_json: request.operation_receipt_json,
-        }
-    }
-}
-
-impl From<PendingUsageRecovery> for RecordUsageRequest {
-    fn from(request: PendingUsageRecovery) -> Self {
-        Self {
-            user_id: request.user_id,
-            tokens_used: request.tokens_used,
-            subject: request.subject,
-            project: request.project,
-            agent: request.agent,
-            key_id: request.key_id,
-            work_unit: request.work_unit,
-            metric: request.metric,
-            idempotency_key: request.idempotency_key,
-            operation_receipt_json: request.operation_receipt_json,
-            sample_observation: None,
-        }
-    }
-}
-
 impl GatewayRuntime {
     fn from_env() -> Self {
         let key_cache_ttl = std::env::var("CHISEI_GATEWAY_KEY_CACHE_TTL_SECS")
@@ -554,15 +427,6 @@ impl GatewayRuntime {
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_KEY_CACHE_TTL_SECS));
         let resilience = ResilienceConfig {
-            control_plane_retries: env_u32(
-                "CHISEI_GATEWAY_CONTROL_PLANE_RETRIES",
-                DEFAULT_CONTROL_PLANE_RETRIES,
-            ),
-            control_plane_retry_backoff: Duration::from_millis(env_u64(
-                "CHISEI_GATEWAY_CONTROL_PLANE_RETRY_BACKOFF_MS",
-                DEFAULT_CONTROL_PLANE_RETRY_BACKOFF_MS,
-            )),
-            control_plane_timeout: configured_control_plane_timeout(),
             circuit_failure_threshold: env_u32(
                 "CHISEI_GATEWAY_CIRCUIT_FAILURE_THRESHOLD",
                 DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
@@ -584,9 +448,6 @@ impl GatewayRuntime {
                 .filter(|value| !value.trim().is_empty()),
         )
         .with_resilience(resilience)
-        .with_usage_recovery_path(Some(resolve_usage_recovery_path(
-            std::env::var("CHISEI_GATEWAY_USAGE_RECOVERY_PATH").ok(),
-        )))
         // Registry state sits beside the Sekai file: SEKAI_DB_PATH, else
         // `<SEKAI_DATA_DIR>/sekai.db`. The gateway does not open a third
         // durable store.
@@ -605,15 +466,7 @@ impl GatewayRuntime {
                         .into_owned()
                 }),
         )))
-        .with_recovery_spool_path(Some(resolve_recovery_spool_path(
-            std::env::var("CHISEI_GATEWAY_RECOVERY_SPOOL_PATH").ok(),
-        )))
         .with_http_timeouts(HttpTimeouts::from_env());
-        runtime.recovery_spool_max_bytes = std::env::var("CHISEI_GATEWAY_RECOVERY_SPOOL_MAX_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_RECOVERY_SPOOL_MAX_BYTES)
-            .max(1);
         runtime.max_request_bytes =
             positive_env("CHISEI_GATEWAY_MAX_REQUEST_BYTES").unwrap_or(DEFAULT_MAX_REQUEST_BYTES);
         runtime.rate_limit_requests = positive_env("CHISEI_GATEWAY_RATE_LIMIT_REQUESTS")
@@ -641,23 +494,11 @@ impl GatewayRuntime {
             global_rate_limit_requests: DEFAULT_GLOBAL_RATE_LIMIT_REQUESTS,
             rate_limit_window: Duration::from_secs(DEFAULT_RATE_LIMIT_WINDOW_SECS),
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
-            usage_recovery: Arc::new(RwLock::new(UsageRecoveryState::default())),
-            usage_recovery_path: None,
-            usage_recovery_lock: Arc::new(Mutex::new(())),
             provider_registry_state_path: None,
             provider_registry_refresh: Arc::new(
                 Mutex::new(ProviderRegistryRefreshState::default()),
             ),
             provider_registry_refresh_generation: Arc::new(AtomicU64::new(0)),
-            recovery_spool_path: None,
-            recovery_spool_max_bytes: DEFAULT_RECOVERY_SPOOL_MAX_BYTES,
-            recovery_spool_lock: Arc::new(Mutex::new(())),
-            recovery_replay_running: Arc::new(AtomicBool::new(false)),
-            llm_calls_schema_reconciled: Arc::new(AtomicBool::new(false)),
-            llm_calls_schema_retry_after_ms: Arc::new(AtomicU64::new(0)),
-            llm_calls_schema_lock: Arc::new(Mutex::new(())),
-            control_plane_circuit: Arc::new(RwLock::new(CircuitBreakerState::default())),
-            readiness_probe: Arc::new(Mutex::new(None)),
             upstream_circuits: Arc::new(RwLock::new(HashMap::new())),
             resilience: ResilienceConfig::default(),
             policy: None,
@@ -672,52 +513,6 @@ impl GatewayRuntime {
 
     fn with_resilience(mut self, resilience: ResilienceConfig) -> Self {
         self.resilience = resilience;
-        self
-    }
-
-    fn with_usage_recovery_path(mut self, path: Option<PathBuf>) -> Self {
-        self.usage_recovery_path = path;
-        if let Some(path) = self.usage_recovery_path.as_ref() {
-            let cache = Arc::get_mut(&mut self.usage_recovery)
-                .expect("new gateway runtime cache is not shared")
-                .get_mut();
-            match std::fs::read(path) {
-                Ok(bytes) => match serde_json::from_slice::<Vec<PendingUsageRecovery>>(&bytes) {
-                    Ok(entries) => {
-                        for entry in entries {
-                            let request = RecordUsageRequest::from(entry);
-                            cache
-                                .pending_usage_records
-                                .insert(usage_recovery_key(&request), request);
-                        }
-                    }
-                    Err(error) => {
-                        error!(path = %path.display(), %error, "usage recovery journal is invalid");
-                        cache.usage_recovery_saturated = true;
-                    }
-                },
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    match initialize_usage_recovery_journal(path) {
-                        Ok(entries) => {
-                            for entry in entries {
-                                let request = RecordUsageRequest::from(entry);
-                                cache
-                                    .pending_usage_records
-                                    .insert(usage_recovery_key(&request), request);
-                            }
-                        }
-                        Err(error) => {
-                            error!(path = %path.display(), %error, "usage recovery journal cannot be initialized");
-                            cache.usage_recovery_saturated = true;
-                        }
-                    }
-                }
-                Err(error) => {
-                    error!(path = %path.display(), %error, "usage recovery journal is unreadable");
-                    cache.usage_recovery_saturated = true;
-                }
-            }
-        }
         self
     }
 
@@ -761,11 +556,6 @@ impl GatewayRuntime {
         self.provider_registry_refresh_generation
             .fetch_add(1, Ordering::Release);
         result
-    }
-
-    fn with_recovery_spool_path(mut self, path: Option<PathBuf>) -> Self {
-        self.recovery_spool_path = path;
-        self
     }
 }
 
@@ -922,6 +712,7 @@ struct UsageContext {
     context_admission_descriptor_version: Option<String>,
     context_admission_decision: Option<String>,
     context_admission_reasons: Vec<String>,
+    #[allow(dead_code)]
     task_class: String,
     data_class: String,
     request_hash: String,
@@ -975,31 +766,6 @@ impl GatewayRejection {
             None => json_error(self.status, &self.error_type, &self.reason),
         }
     }
-}
-
-/// Admit payload returned by the gateway's canonical governance decision.
-#[derive(Debug, Clone)]
-struct GatewayDecisionAdmit {
-    resolved_model: String,
-    resolved_runtime: String,
-    policy_version: String,
-    budget_scope: String,
-    /// Reserved for usage/receipt correlation once post-call accounting binds it.
-    #[allow(dead_code)]
-    budget_grant_id: String,
-    route_bias: Option<String>,
-    provisional_local_free: bool,
-    policy_scope: Option<String>,
-    data_class: Option<String>,
-    fallback_models: Vec<String>,
-    eval_regressed: bool,
-    eval_regression_reason: String,
-    context_admission_policy_version: Option<String>,
-    context_admission_descriptor_version: Option<String>,
-    context_admission_decision: Option<String>,
-    context_admission_reasons: Vec<String>,
-    pipeline_observation: Option<GatewayPipelineObservation>,
-    metadata_operation: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1235,7 +1001,6 @@ impl AnthropicMessageStreamTranslator {
 enum IdentityError {
     MissingKey,
     UnknownKey,
-    KeyStoreUnavailable,
     NoValidPolicy,
 }
 
@@ -1244,7 +1009,6 @@ impl IdentityError {
         match self {
             Self::MissingKey => "missing gateway key",
             Self::UnknownKey => "unknown chisei gateway key",
-            Self::KeyStoreUnavailable => "gateway key store unavailable",
             Self::NoValidPolicy => "the gateway has no valid egress policy",
         }
     }
@@ -1256,10 +1020,6 @@ impl IdentityError {
                 (!config.gateway_keys.is_empty()).to_string(),
             ),
             (
-                "key_store_configured".to_string(),
-                config.chisei_grpc_target.is_some().to_string(),
-            ),
-            (
                 "presented_key".to_string(),
                 matches!(self, Self::UnknownKey).to_string(),
             ),
@@ -1268,7 +1028,7 @@ impl IdentityError {
 
     fn response(self) -> Response<Body> {
         let status = match self {
-            Self::KeyStoreUnavailable | Self::NoValidPolicy => StatusCode::SERVICE_UNAVAILABLE,
+            Self::NoValidPolicy => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::UNAUTHORIZED,
         };
         json_error(status, "authentication_error", self.reason())
@@ -1485,25 +1245,6 @@ struct GatewayPipelineObservation {
     reason: String,
     rate: f64,
     prepared_spec: String,
-}
-
-enum AliasReservationError {
-    Conflict(String),
-    Unavailable(String),
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum GatewayRecoveryRecord {
-    Receipt {
-        actor: String,
-        operation_id: String,
-        receipt_json: String,
-        outcome: String,
-    },
-    LlmRow {
-        values: HashMap<String, String>,
-    },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

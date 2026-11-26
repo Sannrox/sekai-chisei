@@ -322,9 +322,6 @@ export declare const HTTP_UNARY_METHODS: readonly [{
     readonly rpc: "SetBudgetLimit";
 }, {
     readonly service: "chisei.ChiseiService";
-    readonly rpc: "DecideGatewayExecution";
-}, {
-    readonly service: "chisei.ChiseiService";
     readonly rpc: "SetNamespacePolicy";
 }, {
     readonly service: "chisei.ChiseiService";
@@ -341,9 +338,6 @@ export declare const HTTP_UNARY_METHODS: readonly [{
 }, {
     readonly service: "chisei.ChiseiService";
     readonly rpc: "GetQualityTrend";
-}, {
-    readonly service: "chisei.ChiseiService";
-    readonly rpc: "ClaimGatewayDispatch";
 }, {
     readonly service: "chisei.ChiseiService";
     readonly rpc: "PutEvaluationPlan";

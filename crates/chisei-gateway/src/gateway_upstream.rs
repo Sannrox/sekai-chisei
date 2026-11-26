@@ -55,8 +55,7 @@ pub(super) async fn send_upstream_with_resilience(
             {
                 request = retry.expect("retry availability was checked");
                 let multiplier = 1u32.checked_shl(attempt.min(10)).unwrap_or(u32::MAX);
-                tokio::time::sleep(runtime.resilience.control_plane_retry_backoff * multiplier)
-                    .await;
+                tokio::time::sleep(Duration::from_millis(25) * multiplier).await;
             }
             Err(error) => {
                 {

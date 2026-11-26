@@ -102,7 +102,7 @@ pub(super) fn required_authenticated_actor<T>(request: &Request<T>) -> Result<St
 /// carries a gateway principal's name does not qualify.
 pub(super) fn is_gateway_service_principal<T>(request: &Request<T>, config: &Config) -> bool {
     let actor = authenticated_actor(request);
-    if matches!(actor.as_str(), "root" | "local" | "chisei-gateway") {
+    if matches!(actor.as_str(), "root" | "local") {
         return true;
     }
     let token_authenticated = request
@@ -127,7 +127,7 @@ pub(super) fn require_eval_admin<T>(request: &Request<T>) -> Result<(), Status> 
 }
 pub(super) fn require_eval_reader<T>(request: &Request<T>, config: &Config) -> Result<(), Status> {
     let actor = authenticated_actor(request);
-    if matches!(actor.as_str(), "root" | "local" | "chisei-gateway")
+    if matches!(actor.as_str(), "root" | "local")
         || config
             .gateway_receipt_principals
             .iter()
@@ -643,13 +643,14 @@ pub(super) fn require_external_project_access(
         ))
     }
 }
+#[cfg(test)]
 pub(super) fn require_team_namespace_actor_access(
     db: &RuntimeDb,
     facts: &dyn SekaiFactReader,
     actor: &str,
     namespace: &str,
 ) -> Result<(), Status> {
-    let trusted_service = matches!(actor, "root" | "local" | "chisei-gateway");
+    let trusted_service = matches!(actor, "root" | "local");
     if trusted_service {
         return Ok(());
     }
@@ -673,11 +674,7 @@ pub(super) fn require_execution_namespace_access(
     actor: &str,
     namespace: &str,
 ) -> Result<(), Status> {
-    if actor == "chisei-gateway" {
-        canonical_namespace(namespace).map(|_| ())
-    } else {
-        require_namespace_access(facts, actor, namespace)
-    }
+    require_namespace_access(facts, actor, namespace)
 }
 pub(super) fn require_execution_namespace_access_with_context(
     db: &RuntimeDb,
@@ -869,34 +866,11 @@ pub(super) fn strongest_pressure(
         _ => PressureLevel::None,
     }
 }
-pub(super) fn execution_context_actor(
-    db: &RuntimeDb,
-    facts: &dyn SekaiFactReader,
-    _config: &Config,
-    actor: &str,
-    delegated: Option<&str>,
-    namespace: &str,
-) -> Result<String, Status> {
-    let Some(delegated) = delegated.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(actor.to_string());
-    };
-    if !matches!(actor, "root" | "local" | "chisei-gateway") {
-        return Err(Status::permission_denied(
-            "delegated execution identity requires a gateway service principal",
-        ));
-    }
-    if team_principal_status(facts, db, delegated)?.unwrap_or(false) {
-        require_namespace_access(facts, delegated, namespace)?;
-        Ok(delegated.to_string())
-    } else {
-        Ok(actor.to_string())
-    }
-}
-
 /// Combined Split reads `sekai_team_principals` from in-process Sekai.
 /// A remote hop has no team-principal RPC; `None` lets callers fail closed
 /// (require membership, or refuse delegation) instead of querying a Chisei dest
 /// that no longer owns the table.
+#[cfg(test)]
 fn team_principal_status(
     facts: &dyn SekaiFactReader,
     _fallback: &RuntimeDb,
@@ -914,6 +888,7 @@ fn team_principal_status(
     }
 }
 
+#[cfg(test)]
 fn missing_team_principal_table(error: &str) -> bool {
     error.contains("sekai_team_principals")
         && (error.contains("no such table")

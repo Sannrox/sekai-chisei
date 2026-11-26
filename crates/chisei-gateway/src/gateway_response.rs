@@ -434,51 +434,6 @@ pub(super) fn extract_request_model(body: &[u8]) -> Option<String> {
                 .map(str::to_string)
         })
 }
-pub(super) fn extract_gateway_pipeline_spec(body: &[u8]) -> String {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return truncate_gateway_spec(&String::from_utf8_lossy(body));
-    };
-    let mut parts = Vec::new();
-    collect_gateway_spec_text(&value, &mut parts);
-    let spec = parts
-        .into_iter()
-        .filter(|part| !part.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if spec.is_empty() {
-        truncate_gateway_spec(&value.to_string())
-    } else {
-        truncate_gateway_spec(&spec)
-    }
-}
-pub(super) fn collect_gateway_spec_text(value: &serde_json::Value, parts: &mut Vec<String>) {
-    match value {
-        serde_json::Value::String(text) => {
-            if !text.trim().is_empty() {
-                parts.push(text.clone());
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                collect_gateway_spec_text(item, parts);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for key in ["input", "instructions", "system", "content", "messages"] {
-                if let Some(value) = map.get(key) {
-                    collect_gateway_spec_text(value, parts);
-                }
-            }
-            if map.get("type").and_then(|value| value.as_str()) == Some("text")
-                && let Some(text) = map.get("text").and_then(|value| value.as_str())
-                && !text.trim().is_empty()
-            {
-                parts.push(text.to_string());
-            }
-        }
-        _ => {}
-    }
-}
 pub(super) fn truncate_gateway_spec(value: &str) -> String {
     const MAX_GATEWAY_SPEC_CHARS: usize = 4000;
     value.chars().take(MAX_GATEWAY_SPEC_CHARS).collect()

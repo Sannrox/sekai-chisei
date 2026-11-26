@@ -9,6 +9,9 @@
 - Superseded by: [ADR 0152](0152-gateway-is-the-model-egress-layer.md)
 - Related: [ADR 0008](0008-gateway-is-a-fail-closed-translator.md)
 
+The `DecideGatewayExecution` / `gateway.decide/v2` path named here was deleted
+in #2701; gateway admission is the gateway's own policy file.
+
 ## Context
 
 [#2279](https://github.com/Sannrox/sekai-chisei/issues/2279) asked which

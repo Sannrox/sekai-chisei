@@ -843,7 +843,7 @@ fn gateway_request<T>(message: T) -> GrpcRequest<T> {
     let mut request = GrpcRequest::new(message);
     request
         .metadata_mut()
-        .insert("x-principal", "chisei-gateway".parse().unwrap());
+        .insert("x-principal", "local".parse().unwrap());
     request
 }
 

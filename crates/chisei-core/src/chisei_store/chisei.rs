@@ -4,7 +4,7 @@ use crate::chisei::{
     eval, evolve,
     receipt::{OperationReceipt, ReceiptEventKind},
 };
-#[cfg(any(test, feature = "gateway-test-support"))]
+#[cfg(test)]
 use crate::chisei_store::ChiseiSqliteSchema;
 use crate::chisei_store::chisei_eval_backend::{
     EVAL_GATE_MAX_CASES, EVAL_GATE_MAX_RESULTS, decode_eval_gate_cases, decode_eval_gate_run,
@@ -13,20 +13,10 @@ use crate::chisei_store::ext::ReceiptChainSekaiDbExt;
 use sekai_core::db::sekai::SekaiDb;
 
 pub trait ChiseiSekaiDbExt {
-    #[cfg(feature = "gateway-test-support")]
-    #[doc(hidden)]
-    fn gateway_test_migrate_chisei(&self) -> Result<(), String>;
-
     fn insert_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String>;
 }
 
 impl ChiseiSekaiDbExt for SekaiDb {
-    #[cfg(feature = "gateway-test-support")]
-    #[doc(hidden)]
-    fn gateway_test_migrate_chisei(&self) -> Result<(), String> {
-        self.migrate_chisei()
-    }
-
     fn insert_operation_receipt(&self, receipt: &OperationReceipt) -> Result<(), String> {
         let receipt_json = serde_json::to_string(receipt).map_err(|error| error.to_string())?;
         let request_id = receipt_intent_attr(receipt, "request_id");

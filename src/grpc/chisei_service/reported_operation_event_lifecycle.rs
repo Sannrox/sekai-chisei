@@ -390,11 +390,8 @@ async fn report_operation_event(
         .gateway_receipt_principals
         .iter()
         .any(|principal| principal == &actor);
-    let trusted_outcome_reporter = (request_auth_source.as_deref() == Some("token")
-        && (configured_gateway || matches!(actor.as_str(), "chisei-gateway" | "root")))
-        || (service.config.insecure
-            && request_auth_source.as_deref() == Some("local")
-            && actor == "chisei-gateway");
+    let trusted_outcome_reporter = request_auth_source.as_deref() == Some("token")
+        && (configured_gateway || actor.as_str() == "root");
     if !receipt_mutation_transport_allowed(&req, &service.config) {
         return Err(Status::permission_denied(
             "operation event reporting requires authenticated transport",

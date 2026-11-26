@@ -8,7 +8,6 @@ repository = "https://github.com/Sannrox/sekai-chisei"
 
 [features]
 default = []
-gateway-test-support = ["sekai-core/gateway-test-support"]
 
 [dependencies]
 async-trait = "0.1"
@@ -61,7 +60,7 @@ opentelemetry = { version = "0.32", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
 sekai-adapters = { path = "../sekai-adapters" }
 sekai-proto = { version = "3.0.0", path = "../sekai-proto" }
-sekai-core = { version = "4.0.0", path = "../sekai-core", features = ["gateway-test-support"] }
+sekai-core = { version = "4.0.0", path = "../sekai-core" }
 tempfile = "3"
 tokio = { version = "1", default-features = false, features = [
     "macros",

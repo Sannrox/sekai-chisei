@@ -44,7 +44,6 @@ pub struct EvaluationManifestWrite {
     pub request_digest: String,
 }
 
-#[cfg(any(test, feature = "gateway-test-support"))]
 thread_local! {
     /// Hosted routing-profile catalog reads on this thread (#1185-#1187).
     pub static HOSTED_PROFILE_LISTS: std::cell::Cell<usize> =
@@ -1038,16 +1037,6 @@ pub trait ChiseiRuntimeDb {
         scope_id: &str,
         now_ms: i64,
     ) -> Result<Vec<BudgetScopeUsage>, String>;
-
-    /// Test helper used by gateway setup fixtures.
-    #[cfg(feature = "gateway-test-support")]
-    #[doc(hidden)]
-    fn gateway_test_budget_usage(
-        &self,
-        scope_id: &str,
-        metric: &str,
-        now_ms: i64,
-    ) -> Result<(i64, i64, String), String>;
 }
 
 impl ChiseiRuntimeDb for RuntimeDb {
@@ -1760,7 +1749,6 @@ impl ChiseiRuntimeDb for RuntimeDb {
         namespace: &str,
     ) -> Result<Vec<crate::chisei::routing_profiles::HostedRoutingProfile>, String> {
         use crate::chisei_store::chisei_routing_profile::ChiseiRoutingProfileBackend;
-        #[cfg(any(test, feature = "gateway-test-support"))]
         HOSTED_PROFILE_LISTS.with(|lists| lists.set(lists.get() + 1));
         match self {
             Self::Sqlite(db) => db.list_hosted_routing_profiles(namespace),
@@ -3718,24 +3706,6 @@ impl ChiseiRuntimeDb for RuntimeDb {
             Self::Postgres(db) => {
                 sekai_core::db::postgres::off_runtime(|| db.budget_usage_chain(scope_id, now_ms))
             }
-        }
-    }
-
-    /// Test helper used by gateway setup fixtures.
-    #[cfg(feature = "gateway-test-support")]
-    #[doc(hidden)]
-    fn gateway_test_budget_usage(
-        &self,
-        scope_id: &str,
-        metric: &str,
-        now_ms: i64,
-    ) -> Result<(i64, i64, String), String> {
-        match self {
-            Self::Sqlite(db) => db.gateway_test_budget_usage(scope_id, metric, now_ms),
-            Self::Postgres(_) => Err(
-                "gateway_test_budget_usage is unavailable on the PostgreSQL community runtime"
-                    .into(),
-            ),
         }
     }
 }

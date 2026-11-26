@@ -40,10 +40,6 @@ resolver = "2"
 [features]
 default = []
 secret-command = ["sekai-domain/secret-command"]
-gateway-test-support = [
-    "sekai-core/gateway-test-support",
-    "chisei-core/gateway-test-support",
-]
 experimental-rpcs = []
 
 [dependencies]
@@ -150,8 +146,8 @@ fs2 = "0.4.3"
 futures = "0.3"
 
 [dev-dependencies]
-chisei-core = { version = "3.0.0", path = "crates/chisei-core", features = ["gateway-test-support"] }
-sekai-core = { version = "4.0.0", path = "crates/sekai-core", features = ["gateway-test-support"] }
+chisei-core = { version = "3.0.0", path = "crates/chisei-core" }
+sekai-core = { version = "4.0.0", path = "crates/sekai-core" }
 sekai-adapters = { path = "crates/sekai-adapters" }
 sekai-client = { path = "crates/sekai-client" }
 sekai-connector-runtime = { path = "crates/sekai-connector-runtime" }

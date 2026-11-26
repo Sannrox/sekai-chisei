@@ -187,25 +187,22 @@ value to stdout.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GATEWAY_BIND` | `127.0.0.1:8788` | HTTP gateway bind address. Preferred over `GATEWAY_PORT`. Non-loopback binds require non-empty `GATEWAY_KEYS` and must not enable `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH` |
+| `GATEWAY_BIND` | `127.0.0.1:8788` | HTTP gateway bind address. Preferred over `GATEWAY_PORT`. Non-loopback binds require a valid policy and must not enable `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH` |
 | `GATEWAY_PORT` | unset | Loopback-only fallback: when `GATEWAY_BIND` is unset, binds `127.0.0.1:{port}` |
-| `CHISEI_GRPC_URL` | unset | Required control-plane TCP URL or Unix socket path; falls back only to an explicitly set `SEKAI_SOCKET` |
+| `CHISEI_GATEWAY_POLICY_PATH` | required | Gateway-owned egress policy file (`chisei.gateway-policy/v1`). Startup refuses a missing path. `GATEWAY_KEYS` is refused |
+| `CHISEI_GATEWAY_LOG_DIR` | `chisei-gateway-log` beside the policy file | Durable admission and usage log. One gateway process owns it at a time |
 | `CHISEI_OPENAI_BASE_URL` | OpenAI API | OpenAI-compatible upstream |
 | `CHISEI_MODEL_DISCOVERY_TTL_SECS` | `300` | Provider model-catalog cache lifetime; stale refresh failures retain the last-known provider snapshot and initial failures use static routing defaults |
 | `CHISEI_ANTHROPIC_BASE_URL` | Anthropic API | Anthropic-compatible upstream; include `/v1` |
 | `CHISEI_OLLAMA_BASE_URL` | `${OLLAMA_URL}/v1` | Gateway upstream for `ollama/*` models |
-| `GATEWAY_KEYS` | empty | Explicit `key=agent:project` development/compose allowlist (required when the bind is non-loopback) |
-| `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH` | unset | Loopback-only. Set `1` to let the gateway forward caller auth unchanged. Non-loopback binds refuse this flag |
+| `CHISEI_GATEWAY_ALLOW_AUTH_PASSTHROUGH` | unset | Loopback-only. Identify by policy key first; otherwise the `x-chisei-agent` passthrough identity if that name is a policy principal. Non-loopback binds refuse this flag |
 | `GATEWAY_DEFAULT_PROJECT` | `default` | Attribution fallback when a key omits a project |
 | `CHISEI_GATEWAY_ADMIN_TOKEN` | unset | Enables cache refresh; must be at least 32 bytes |
 | `CHISEI_GATEWAY_MAX_REQUEST_BYTES` | `33554432` | Maximum buffered request body |
 | `CHISEI_GATEWAY_RATE_LIMIT_REQUESTS` | `120` | Requests per identity and window |
 | `CHISEI_GATEWAY_GLOBAL_RATE_LIMIT_REQUESTS` | `1200` | Gateway-wide requests per window |
 | `CHISEI_GATEWAY_RATE_LIMIT_WINDOW_SECS` | `60` | Fixed rate-limit window |
-| `CHISEI_GATEWAY_KEY_CACHE_TTL_SECS` | `30` | Virtual-key lookup cache lifetime |
-| `CHISEI_GATEWAY_USAGE_RECOVERY_PATH` | `data/chisei-gateway-usage-recovery.json` | Durable journal for post-call usage records that could not yet reach the control plane |
-| `CHISEI_GATEWAY_RECOVERY_SPOOL_PATH` | `data/chisei-gateway-recovery.jsonl` | Durable receipt, usage, and refusal recovery file (process CWD-relative unless absolute) |
-| `CHISEI_GATEWAY_RECOVERY_SPOOL_MAX_BYTES` | `67108864` | Hard recovery-spool capacity; new records are refused after the file reaches this size until replay or operator cleanup frees space |
+| `CHISEI_GATEWAY_KEY_CACHE_TTL_SECS` | `30` | Policy-key lookup cache lifetime |
 | `CHISEI_GATEWAY_ALLOW_CROSS_PROVIDER` | unset | Set `1` to enable supported lossy provider bridges |
 | `CHISEI_GATEWAY_PRICING` | unset | Versioned per-model `input:output[:cache_read[:cache_write_5m[:cache_write_1h]]]` USD-per-million pricing table for gateway ledger rows and native operation receipts; class rates must be supplied to price provider cache-write premiums |
 
@@ -229,13 +226,11 @@ a later table. An unpriced model's event carries no `cost_usd_micros`, not a
 zero. The combined and Chisei processes refuse to boot when the table does
 not parse, including a model listed twice.
 
-When starting `chisei-gateway` directly, set either `CHISEI_GRPC_URL` or
-`SEKAI_SOCKET`. The gateway does not inherit the control plane's built-in
-`./data/sekai.sock` default. Startup fails when neither variable supplies a
-non-empty target. Every provider request requires a live control-plane
-admission before provider contact.
-`sekaictl launch` and the Docker image set the socket target for their managed
-topologies.
+When starting `chisei-gateway` directly, set `CHISEI_GATEWAY_POLICY_PATH`.
+Startup fails without it. The gateway never calls Sekai or Chisei;
+`CHISEI_GRPC_URL` and `SEKAI_SOCKET` are ignored. A missing or invalid policy
+denies every request with zero provider contact. `sekaictl launch` writes the
+policy file and sets the path.
 
 See [the gateway guide](gateway.md) for authentication and routing semantics.
 

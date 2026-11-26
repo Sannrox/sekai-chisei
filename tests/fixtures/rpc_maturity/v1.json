@@ -3093,15 +3093,6 @@
     },
     {
       "service": "ChiseiService",
-      "rpc": "DecideGatewayExecution",
-      "storage_path": "chisei.policy, chisei.budget",
-      "real_backend": "yes",
-      "consumer": "host",
-      "classification": "stable",
-      "product_tier": "experimental"
-    },
-    {
-      "service": "ChiseiService",
       "rpc": "SetNamespacePolicy",
       "storage_path": "chisei.policy",
       "real_backend": "yes",
@@ -3341,15 +3332,6 @@
       "real_backend": "yes",
       "consumer": "none",
       "classification": "experimental",
-      "product_tier": "experimental"
-    },
-    {
-      "service": "ChiseiService",
-      "rpc": "ClaimGatewayDispatch",
-      "storage_path": "gateway.governance, chisei.execution",
-      "real_backend": "yes",
-      "consumer": "host",
-      "classification": "stable",
       "product_tier": "experimental"
     },
     {

@@ -223,14 +223,14 @@ async fn setup_seeds_gateway_objects_budget_policy_and_dataset() {
     );
 
     let request_budget_project = db
-        .gateway_test_budget_usage(
+        .budget_usage(
             "project:sekai-chisei",
             "requests",
             chrono::Utc::now().timestamp_millis(),
         )
         .unwrap();
     let request_budget_agent = db
-        .gateway_test_budget_usage(
+        .budget_usage(
             "project:sekai-chisei/agent:codex-app",
             "requests",
             chrono::Utc::now().timestamp_millis(),
