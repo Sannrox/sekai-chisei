@@ -13,6 +13,7 @@ pub mod function_revision_gate;
 pub mod gateway_egress_policy;
 pub mod gateway_log_reader;
 pub mod invoice_extraction_eval;
+pub(crate) mod recorded_eval_cases;
 pub use chisei_core::lookup_first;
 pub mod sekai_facts;
 pub mod sekai_principal;

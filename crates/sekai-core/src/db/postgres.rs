@@ -1366,6 +1366,12 @@ const MIGRATIONS: &[Migration] = &[
         MigrationOwner::Sekai,
     ),
     mig(189, "chisei_budget_limit_mode", "", MigrationOwner::Chisei),
+    mig(
+        190,
+        "chisei_eval_recorded_datasets",
+        "",
+        MigrationOwner::Chisei,
+    ),
 ];
 
 type Manager = PostgresConnectionManager<MakeTlsConnector>;

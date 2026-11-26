@@ -972,6 +972,107 @@ pub(super) async fn execute_evaluation_manifest(
     }))
 }
 
+/// The wire answer for a finished dataset run.
+fn run_response(report: crate::chisei::eval_run::EvalRunReport) -> RunEvalDatasetResponse {
+    RunEvalDatasetResponse {
+        failure_groups: report
+            .failure_groups
+            .into_iter()
+            .map(|group| EvalFailureGroup {
+                dimension: group.dimension.as_str().into(),
+                key: group.key,
+                trial_code: group.trial_code.unwrap_or_default(),
+                count: u32::try_from(group.case_ids.len()).unwrap_or(u32::MAX),
+                case_ids: group.case_ids,
+            })
+            .collect(),
+        status: report.status,
+        cases_total: report.cases_total as u32,
+        spent_micros: report.spent_micros,
+        ledger: report
+            .results
+            .into_iter()
+            .map(|result| EvalRunCaseLine {
+                case_id: result.case_id,
+                passed: result.outcome.passed,
+                reason: result.outcome.reason,
+                trial_code: result.outcome.trial_code.unwrap_or_default(),
+                unmet_metrics: result.outcome.unmet_metrics,
+                input_tokens: result.outcome.input_tokens,
+                output_tokens: result.outcome.output_tokens,
+                cost_micros: result.outcome.cost_micros,
+            })
+            .collect(),
+        unrun_case_ids: report.unrun_cases,
+        uncertain_micros: report.uncertain_micros,
+        policy_scorer_version: report.policy.scorer_version,
+        policy_counts: report
+            .policy
+            .counts
+            .into_iter()
+            .map(|(kind, count)| EvalPolicyCount {
+                kind: kind.as_str().into(),
+                count,
+            })
+            .collect(),
+        policy_violations: report
+            .policy
+            .violations
+            .into_iter()
+            .map(|violation| EvalPolicyViolation {
+                kind: violation.kind.as_str().into(),
+                case_id: violation.case_id,
+                receipt_id: violation.receipt_id,
+            })
+            .collect(),
+    }
+}
+
+/// Run a recorded dataset (ADR 0153): replay each decided proposal through
+/// the agent dry run as the caller and score it against the human decision.
+/// Nothing is submitted, so no Action instance, receipt or effect is created.
+async fn run_recorded_dataset(
+    service: &ChiseiServiceImpl,
+    caller: Request<()>,
+    spec: crate::chisei::eval_run::EvalRunSpec,
+    dataset: crate::chisei::eval_dataset::EvalDataset,
+    actor: String,
+) -> Result<Response<RunEvalDatasetResponse>, Status> {
+    use crate::chisei::eval_dataset::recorded::RecordedEvalDatasetStore;
+    use crate::chisei::eval_run::{RUN_CONFLICT, RUN_IN_PROGRESS, run_as};
+    use crate::composition::recorded_eval_cases::RecordedCaseExecutor;
+    let sekai = service.in_process_sekai_service()?;
+    let store = service.db.runtime_arc();
+    let report = tokio::task::spawn_blocking(move || {
+        let stored = store
+            .get_recorded_eval_dataset(&spec.namespace, &spec.dataset, Some(&spec.dataset_version))
+            .map_err(Status::internal)?
+            .ok_or_else(|| Status::not_found(crate::chisei::eval_dataset::DATASET_NOT_FOUND))?;
+        let executor = RecordedCaseExecutor::prepare(
+            &sekai,
+            caller,
+            &spec.namespace,
+            &stored.definition,
+            &spec.agent,
+        )?;
+        run_as(store.as_ref(), &executor, &spec, &dataset, &actor, || {
+            chrono::Utc::now().timestamp_millis()
+        })
+        .map_err(|error| {
+            if error == RUN_CONFLICT {
+                Status::already_exists(error)
+            } else if error == RUN_IN_PROGRESS {
+                Status::aborted(error)
+            } else {
+                Status::internal(error)
+            }
+        })
+    })
+    .await
+    .map_err(|_| Status::internal("eval run task failed"))??;
+    Ok(Response::new(run_response(report)))
+}
+
 pub(super) async fn run_eval_dataset(
     service: &ChiseiServiceImpl,
     req: Request<RunEvalDatasetRequest>,
@@ -982,6 +1083,7 @@ pub(super) async fn run_eval_dataset(
     };
     let actor = authenticated_actor(&req);
     let context = enterprise_authenticated_context(&req)?.cloned();
+    let caller = crate::composition::recorded_eval_cases::caller_of(&req);
     let request = req.into_inner();
     // A tenant context (#3089) writes only its tenant's namespaces; any other
     // caller needs an editor or admin grant.
@@ -1052,6 +1154,14 @@ pub(super) async fn run_eval_dataset(
         .await
         .map_err(|_| Status::internal("eval dataset task failed"))??
     };
+    if crate::chisei::eval_dataset::recorded::is_recorded_dataset(&dataset) {
+        if !artifact_digest.is_empty() {
+            return Err(Status::failed_precondition(
+                "a recorded eval dataset run cannot be bound to a release artifact",
+            ));
+        }
+        return run_recorded_dataset(service, caller, spec, dataset, actor).await;
+    }
     let pricing = crate::cost_estimate::pricing_from_env()
         .map_err(|_| Status::failed_precondition("model pricing is misconfigured"))?
         .remove(&spec.model);
@@ -1101,58 +1211,7 @@ pub(super) async fn run_eval_dataset(
     })
     .await
     .map_err(|_| Status::internal("eval run task failed"))??;
-    Ok(Response::new(RunEvalDatasetResponse {
-        failure_groups: report
-            .failure_groups
-            .into_iter()
-            .map(|group| EvalFailureGroup {
-                dimension: group.dimension.as_str().into(),
-                key: group.key,
-                trial_code: group.trial_code.unwrap_or_default(),
-                count: u32::try_from(group.case_ids.len()).unwrap_or(u32::MAX),
-                case_ids: group.case_ids,
-            })
-            .collect(),
-        status: report.status,
-        cases_total: report.cases_total as u32,
-        spent_micros: report.spent_micros,
-        ledger: report
-            .results
-            .into_iter()
-            .map(|result| EvalRunCaseLine {
-                case_id: result.case_id,
-                passed: result.outcome.passed,
-                reason: result.outcome.reason,
-                trial_code: result.outcome.trial_code.unwrap_or_default(),
-                unmet_metrics: result.outcome.unmet_metrics,
-                input_tokens: result.outcome.input_tokens,
-                output_tokens: result.outcome.output_tokens,
-                cost_micros: result.outcome.cost_micros,
-            })
-            .collect(),
-        unrun_case_ids: report.unrun_cases,
-        uncertain_micros: report.uncertain_micros,
-        policy_scorer_version: report.policy.scorer_version,
-        policy_counts: report
-            .policy
-            .counts
-            .into_iter()
-            .map(|(kind, count)| EvalPolicyCount {
-                kind: kind.as_str().into(),
-                count,
-            })
-            .collect(),
-        policy_violations: report
-            .policy
-            .violations
-            .into_iter()
-            .map(|violation| EvalPolicyViolation {
-                kind: violation.kind.as_str().into(),
-                case_id: violation.case_id,
-                receipt_id: violation.receipt_id,
-            })
-            .collect(),
-    }))
+    Ok(Response::new(run_response(report)))
 }
 
 /// Records a new run bound to the released artifact it evaluates (#1677),

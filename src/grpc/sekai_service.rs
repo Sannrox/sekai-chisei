@@ -130,6 +130,8 @@ use support_credentials::*;
 pub(in crate::grpc) use support_credentials::enforce_namespace_tenant_context_for;
 #[path = "compliance_export_rpc.rs"]
 mod compliance_export_rpc;
+#[path = "sekai_service_recorded_cases.rs"]
+mod recorded_cases;
 #[path = "sekai_service_rpc_actions.rs"]
 mod rpc_actions;
 #[path = "sekai_service_rpc_audit_export.rs"]

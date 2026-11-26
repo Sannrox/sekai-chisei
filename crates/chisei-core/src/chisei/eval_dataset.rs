@@ -24,6 +24,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub mod recorded;
+
 use crate::chisei::evaluation_execution::EvaluationEvidenceInput;
 use crate::chisei::evaluation_manifest::digest_json;
 use sekai_core::sekai::synthetic::{SizePreset, Spec, SupplyChain, generate};
@@ -35,7 +37,7 @@ pub const EVAL_CASE_SCHEMA: &str = "chisei.eval-case/v1";
 /// Bumped whenever generation from the same definition would change, so
 /// such a change is a new version, never a rewritten one.
 pub const GENERATOR_VERSION: &str = "eval-dataset-generator/v1";
-const DATASET_NOT_FOUND: &str = "eval dataset version not found";
+pub const DATASET_NOT_FOUND: &str = "eval dataset version not found";
 /// Names the server's read-only directory of checked-in definitions, read
 /// beside the definitions put under a namespace.
 pub const EVAL_DATASETS_DIR_ENV: &str = "CHISEI_EVAL_DATASETS_DIR";

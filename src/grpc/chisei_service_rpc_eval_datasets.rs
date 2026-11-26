@@ -4,16 +4,27 @@
 //! (`CHISEI_EVAL_DATASETS_DIR`, read-only) and the ones put under it. Put
 //! needs namespace write access and leaves an audit decision; get, list and
 //! case paging need read access and only ever read the caller's namespace.
+//!
+//! Recorded definitions (ADR 0153, #3513) are put through the same call under
+//! their own contract. They need namespace admin and the Sekai plane in this
+//! process; get and list show their selection, never the instance ids, and
+//! case paging shows only the cases the caller can read.
 
 use super::*;
+use crate::chisei::eval_dataset::recorded::{
+    RecordedDatasetSelection, RecordedEvalDatasetDefinition, RecordedEvalDatasetStore,
+    StoredRecordedEvalDataset, is_recorded_dataset, is_recorded_definition,
+};
 use crate::chisei::eval_dataset::{
     DatasetSources, EvalDataset, EvalDatasetDefinition, EvalDatasetDefinitionStore,
     StoredEvalDatasetDefinition, datasets_directory, directory_definitions, is_not_found,
 };
 use crate::chisei_store::ChiseiDecisionStore;
+use crate::composition::recorded_eval_cases as recorded;
 
 const SOURCE_STORED: &str = "stored";
 const SOURCE_DIRECTORY: &str = "directory";
+const SOURCE_RECORDED: &str = "recorded";
 const DEFINITION_PAGE: (usize, usize) = (50, 200);
 const CASE_PAGE: (usize, usize) = (100, 1_000);
 
@@ -32,7 +43,58 @@ pub(super) fn resolve_dataset(
         namespace,
     }
     .resolve(name, version)
+    .or_else(|error| {
+        if !is_not_found(&error) {
+            return Err(error);
+        }
+        // A name the directory and the synthetic store do not hold may be a
+        // recorded definition.
+        match resolve_recorded(store, namespace, name, version) {
+            Ok(Some((_, dataset))) => Ok(dataset),
+            Ok(None) => Err(error),
+            Err(status) => Err(status.message().to_string()),
+        }
+    })
     .map_err(Status::not_found)
+}
+
+/// The recorded definition stored at `name@version` and its dataset.
+pub(super) fn resolve_recorded(
+    store: &sekai_core::db::runtime_db::RuntimeDb,
+    namespace: &str,
+    name: &str,
+    version: &str,
+) -> Result<Option<(StoredRecordedEvalDataset, EvalDataset)>, Status> {
+    let Some(stored) = store
+        .get_recorded_eval_dataset(namespace, name, Some(version))
+        .map_err(Status::internal)?
+    else {
+        return Ok(None);
+    };
+    let dataset = stored
+        .definition
+        .dataset(namespace)
+        .map_err(Status::internal)?;
+    Ok((dataset.version == version).then_some((stored, dataset)))
+}
+
+/// A recorded version as a definition record. Its JSON is the selection: the
+/// instance ids stay out of reads that do not check clearance per case.
+fn recorded_record(
+    record: StoredRecordedEvalDataset,
+) -> Result<EvalDatasetDefinitionRecord, Status> {
+    Ok(EvalDatasetDefinitionRecord {
+        namespace: record.namespace,
+        name: record.definition.selection.name.clone(),
+        version: record.version,
+        definition_json: serde_json::to_string(&record.definition.selection)
+            .map_err(|error| Status::internal(error.to_string()))?,
+        source: SOURCE_RECORDED.into(),
+        digest: record.digest,
+        case_count: record.case_count,
+        created_by: record.created_by,
+        created_at_ms: record.created_at_ms,
+    })
 }
 
 fn page_size(requested: u32, (default, max): (usize, usize)) -> usize {
@@ -77,6 +139,32 @@ fn directory_record(
     })
 }
 
+/// The audit decision for a recorded version: the dataset, version and case
+/// count, never the instance ids (ADR 0153 rule 7).
+fn recorded_decision(record: &StoredRecordedEvalDataset) -> crate::sekai::audit::Decision {
+    let name = &record.definition.selection.name;
+    crate::sekai::audit::Decision {
+        id: format!(
+            "eval-dataset-definition:{}:{name}@{}",
+            record.namespace, record.version
+        ),
+        timestamp: record.created_at_ms,
+        actor: record.created_by.clone(),
+        action: "eval_dataset_definition/put".into(),
+        reason: "recorded eval dataset definition version stored".into(),
+        evidence: HashMap::from([
+            ("namespace".into(), record.namespace.clone()),
+            ("dataset".into(), name.clone()),
+            ("dataset_version".into(), record.version.clone()),
+            ("dataset_digest".into(), record.digest.clone()),
+            ("source".into(), SOURCE_RECORDED.into()),
+            ("case_count".into(), record.case_count.to_string()),
+        ]),
+        target_id: format!("{}/{name}", record.namespace),
+        outcome: "stored".into(),
+    }
+}
+
 /// The audit decision for a stored version. Built from the stored row, so a
 /// put retried after its audit write failed records the same decision.
 fn definition_decision(record: &StoredEvalDatasetDefinition) -> crate::sekai::audit::Decision {
@@ -105,6 +193,9 @@ pub(super) async fn put_eval_dataset_definition(
     service: &ChiseiServiceImpl,
     req: Request<PutEvalDatasetDefinitionRequest>,
 ) -> Result<Response<PutEvalDatasetDefinitionResponse>, Status> {
+    if is_recorded_definition(&req.get_ref().definition_json) {
+        return put_recorded_definition(service, req).await;
+    }
     let actor = authenticated_actor(&req);
     let request = req.into_inner();
     require_namespace_write_access(service.sekai_facts.reader(), &actor, &request.namespace)?;
@@ -133,6 +224,15 @@ pub(super) async fn put_eval_dataset_definition(
                 "the server's definitions directory defines this eval dataset; it is read-only",
             ));
         }
+        if store
+            .get_recorded_eval_dataset(&request.namespace, &record.definition.name, None)
+            .map_err(Status::internal)?
+            .is_some()
+        {
+            return Err(Status::failed_precondition(
+                "a recorded eval dataset holds this name",
+            ));
+        }
         // Refuse what the audit write would refuse before anything is stored.
         crate::sekai::audit::validate_decision(&definition_decision(&record))
             .map_err(Status::invalid_argument)?;
@@ -150,6 +250,77 @@ pub(super) async fn put_eval_dataset_definition(
         })?;
     Ok(Response::new(PutEvalDatasetDefinitionResponse {
         record: Some(stored_record(stored)?),
+    }))
+}
+
+/// Put a recorded definition: select the decided instances the caller can
+/// read, freeze them as case references and store the version. Namespace
+/// admin only: it turns review decisions into a reusable labelled set.
+async fn put_recorded_definition(
+    service: &ChiseiServiceImpl,
+    req: Request<PutEvalDatasetDefinitionRequest>,
+) -> Result<Response<PutEvalDatasetDefinitionResponse>, Status> {
+    let actor = authenticated_actor(&req);
+    let context = enterprise_authenticated_context(&req)?.cloned();
+    require_namespace_admin_access(
+        service.sekai_facts.reader(),
+        &actor,
+        context.as_ref(),
+        &req.get_ref().namespace,
+    )?;
+    let sekai = service.in_process_sekai_service()?;
+    let caller = recorded::caller_of(&req);
+    let request = req.into_inner();
+    if request.definition_json.len() > crate::chisei::eval_dataset::MAX_STORED_DEFINITION_BYTES {
+        return Err(Status::invalid_argument(
+            "recorded eval dataset definition is too large",
+        ));
+    }
+    let selection = RecordedDatasetSelection::parse(&request.definition_json)
+        .map_err(Status::invalid_argument)?;
+    let store = service.db.runtime_arc();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let stored = tokio::task::spawn_blocking(move || {
+        let directory = datasets_directory();
+        let sources = DatasetSources {
+            directory: directory.as_deref(),
+            store: store.as_ref(),
+            namespace: &request.namespace,
+        };
+        if sources
+            .directory_definition(&selection.name)
+            .map_err(Status::failed_precondition)?
+            .is_some()
+            || store
+                .get_eval_dataset_definition(&request.namespace, &selection.name, None)
+                .map_err(Status::internal)?
+                .is_some()
+        {
+            return Err(Status::failed_precondition(
+                "a synthetic eval dataset definition holds this name",
+            ));
+        }
+        let cases = recorded::select_cases(&sekai, &caller, &request.namespace, &selection)?;
+        let definition = RecordedEvalDatasetDefinition::freeze(selection, cases)
+            .map_err(Status::failed_precondition)?;
+        let record = StoredRecordedEvalDataset::new(&request.namespace, definition, &actor, now_ms)
+            .map_err(Status::internal)?;
+        crate::sekai::audit::validate_decision(&recorded_decision(&record))
+            .map_err(Status::invalid_argument)?;
+        store
+            .put_recorded_eval_dataset(&record)
+            .map_err(Status::internal)
+    })
+    .await
+    .map_err(|_| Status::internal("eval dataset definition task failed"))??;
+    service
+        .db
+        .record_decisions_idempotently(&[recorded_decision(&stored)])
+        .map_err(|_| {
+            Status::unavailable("eval dataset definition audit unavailable; retry the put")
+        })?;
+    Ok(Response::new(PutEvalDatasetDefinitionResponse {
+        record: Some(recorded_record(stored)?),
     }))
 }
 
@@ -178,11 +349,17 @@ pub(super) async fn get_eval_dataset_definition(
                 return Ok(record);
             }
         }
-        store
+        if let Some(record) = store
             .get_eval_dataset_definition(&request.namespace, &request.name, version)
             .map_err(Status::internal)?
+        {
+            return stored_record(record);
+        }
+        store
+            .get_recorded_eval_dataset(&request.namespace, &request.name, version)
+            .map_err(Status::internal)?
             .ok_or_else(|| Status::not_found("eval dataset definition not found"))
-            .and_then(stored_record)
+            .and_then(recorded_record)
     })
     .await
     .map_err(|_| Status::internal("eval dataset definition task failed"))??;
@@ -219,13 +396,28 @@ pub(super) async fn list_eval_dataset_definitions(
             .into_iter()
             .map(stored_record)
             .collect::<Result<Vec<_>, _>>()?;
-        // By name; the directory's entry wins a name both hold, as on get.
-        let mut definitions: Vec<EvalDatasetDefinitionRecord> =
-            directory.into_iter().chain(stored).collect();
+        let recorded = store
+            .list_recorded_eval_datasets(&request.namespace, &after, limit + 1)
+            .map_err(Status::internal)?
+            .into_iter()
+            .map(recorded_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        // By name; the directory's entry wins a name both hold, as on get,
+        // then the synthetic store's.
+        let rank = |record: &EvalDatasetDefinitionRecord| match record.source.as_str() {
+            SOURCE_DIRECTORY => 0,
+            SOURCE_STORED => 1,
+            _ => 2,
+        };
+        let mut definitions: Vec<EvalDatasetDefinitionRecord> = directory
+            .into_iter()
+            .chain(stored)
+            .chain(recorded)
+            .collect();
         definitions.sort_by(|left, right| {
-            left.name.cmp(&right.name).then_with(|| {
-                (left.source != SOURCE_DIRECTORY).cmp(&(right.source != SOURCE_DIRECTORY))
-            })
+            left.name
+                .cmp(&right.name)
+                .then_with(|| rank(left).cmp(&rank(right)))
         });
         definitions.dedup_by(|later, earlier| later.name == earlier.name);
         let next_page_token = if definitions.len() > limit {
@@ -253,6 +445,8 @@ pub(super) async fn list_eval_dataset_cases(
 ) -> Result<Response<ListEvalDatasetCasesResponse>, Status> {
     // Admitted for tenant assertions (#3056).
     require_request_namespace_read(service.sekai_facts.reader(), &req, &req.get_ref().namespace)?;
+    let caller = recorded::caller_of(&req);
+    let sekai = service.in_process_sekai_service().ok();
     let request = req.into_inner();
     let limit = page_size(request.page_size, CASE_PAGE);
     // The token is `<version>/<offset>`: a version never changes, so an
@@ -281,12 +475,23 @@ pub(super) async fn list_eval_dataset_cases(
                 Status::failed_precondition(status.message())
             }
         })?;
-        let total = dataset.cases.len();
+        let cases = if is_recorded_dataset(&dataset) {
+            readable_recorded_cases(
+                store.as_ref(),
+                sekai.as_deref(),
+                &caller,
+                &request,
+                &dataset,
+            )?
+        } else {
+            dataset.cases.clone()
+        };
+        let total = cases.len();
         if offset > total {
             return Err(Status::invalid_argument("page_token is past the last case"));
         }
         let end = (offset + limit).min(total);
-        let cases = dataset.cases[offset..end]
+        let cases = cases[offset..end]
             .iter()
             .map(|case| EvalDatasetCase {
                 case_id: case.case_id.clone(),
@@ -309,4 +514,34 @@ pub(super) async fn list_eval_dataset_cases(
     .await
     .map_err(|_| Status::internal("eval dataset cases task failed"))??;
     Ok(Response::new(response))
+}
+
+/// The cases of a recorded version the caller can read. Every source must
+/// still stand, or the version answers "not found"; a case the caller cannot
+/// read is left out, so it looks like a case the version never had.
+fn readable_recorded_cases(
+    store: &sekai_core::db::runtime_db::RuntimeDb,
+    sekai: Option<&crate::grpc::sekai_service::SekaiServiceImpl>,
+    caller: &Request<()>,
+    request: &ListEvalDatasetCasesRequest,
+    dataset: &EvalDataset,
+) -> Result<Vec<crate::chisei::eval_dataset::EvalCase>, Status> {
+    let sekai =
+        sekai.ok_or_else(|| Status::failed_precondition(recorded::RECORDED_NEEDS_COMBINED))?;
+    let (stored, _) = resolve_recorded(
+        store,
+        &request.namespace,
+        &request.dataset,
+        &request.dataset_version,
+    )?
+    .ok_or_else(|| Status::not_found(crate::chisei::eval_dataset::DATASET_NOT_FOUND))?;
+    let sources = recorded::sources(sekai, &request.namespace, &stored.definition)?;
+    let readable = recorded::readable(sekai, caller, &sources)?;
+    Ok(dataset
+        .cases
+        .iter()
+        .zip(readable)
+        .filter(|(_, readable)| *readable)
+        .map(|(case, _)| case.clone())
+        .collect())
 }
