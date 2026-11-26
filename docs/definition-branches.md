@@ -297,11 +297,34 @@ review. The output datasets are created, and the carried rows of each are
 appended as one new version under the caller's dataset write grant; source
 version ids are not carried. A retry appends rows only to a dataset that has
 none yet, and refuses one whose rows differ from the package's as changed
-outside the installation, so the rows land once per package and dataset. `GetNamespacePackageInstallation` reports the installation as
+outside the installation, so the rows land once per package and dataset.
+`GetNamespacePackageInstallation` reports the installation as
 `pending_definitions` until that proposal merges, then `installed`, or
 `diverged` when the merged definitions do not reproduce the ontology digest.
-Installing the same package again returns the same installation; another
-version of an installed package is refused until upgrade ships.
+Installing the same package again returns the same installation.
+
+Installing a later version of an installed package upgrades the
+installation. An earlier version is refused. The same checks come first:
+
+- Definitions open as `package/<name>/v<version>` against the published
+  head, only while that head still reproduces the installed ontology digest.
+  Unchanged definitions open nothing and keep the merged proposal. An
+  installed version whose proposal is still open is refused until it merges
+  or closes; one that closed installs as into an empty namespace.
+- A dataset an earlier version installed keeps its id and binding and needs
+  no entry in `datasets`; a target naming another dataset is refused. A
+  changed definition updates the dataset under the dataset write grant while
+  its schema is still the one the installation recorded. Carried rows are
+  appended as one new version holding the rows the dataset lacks, while its
+  latest version still holds what the installation wrote. A dataset only
+  takes appended rows, so a version that drops rows is refused.
+- New entries install as above. Resources the new version no longer carries
+  stay in place and are listed in `retained_resources`.
+
+A resource changed outside the installation since the last install is
+refused by name, never overwritten. Each step is idempotent and the record
+is replaced last, only while it still holds the version the upgrade read,
+so a retry converges and of two racing upgrades the first wins.
 
 `CompareDefinitionRevisions` takes two revision digests in one namespace. It
 reauthorizes every member on both revisions, then reports added, removed, and

@@ -5944,12 +5944,17 @@ message ExportNamespacePackageResponse {
 // (#3093, ADR 0169). Every signature, digest and mapping is checked before
 // the first write. The definitions open as a proposal for the namespace's
 // normal review; the datasets are created bound to objects in the namespace.
-// Installing the same package again changes nothing. Experimental.
+// Installing the same package again changes nothing. Installing a later
+// version upgrades the installation: datasets it created keep their ids and
+// need no mapping, and a resource changed outside the installation is
+// refused by name. Experimental.
 message InstallNamespacePackageRequest {
   string namespace = 1;
   // Envelope JSON from ExportNamespacePackage.
   string envelope_json = 2;
-  // One target per dataset entry, keyed by entry id.
+  // One target per dataset entry, keyed by entry id. An upgrade may leave
+  // out entries an earlier version installed; a target given for one must
+  // name the dataset it installed.
   map<string, NamespacePackageDatasetTarget> datasets = 3;
 }
 
@@ -5994,6 +5999,9 @@ message NamespacePackageInstallation {
   string signer_identity = 12;
   string installed_by = 13;
   int64 installed_at_ms = 14;
+  // Resources an earlier version created that the installed version no
+  // longer carries. An upgrade leaves them in place.
+  repeated NamespacePackageInstalledResource retained_resources = 15;
 }
 
 // A resource the installation created (output) or was mapped to (input).

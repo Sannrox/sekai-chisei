@@ -17,6 +17,14 @@
 //! the target namespace, appends carried rows as one new version, and records
 //! the installation. Each step is idempotent, so a retry after a crash
 //! converges; the record is written last.
+//!
+//! Installing a later version of an installed package upgrades it (#3093
+//! decision 8): the definitions open as the next version's proposal against
+//! the published head, each dataset an earlier version created keeps its id
+//! and takes the new definition and rows, new entries install as above, and
+//! resources the new version no longer carries stay in place, listed as
+//! retained. A resource changed outside the installation since the last
+//! install is refused by name, never overwritten.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -328,19 +336,30 @@ fn packaged_rows(
 /// Version rows read per page while packaging content.
 const CONTENT_PAGE: usize = 1_000;
 
-/// Carried rows of an output, and whether install still has to append them.
+/// Carried rows of an output, whether install still has to append them, and
+/// the [`package_domain::rows_digest`] its latest version holds once done.
 struct PlannedContent {
     rows: Vec<std::collections::HashMap<String, String>>,
     append: bool,
+    digest: String,
+}
+
+/// What install does to an output dataset.
+enum DatasetWrite {
+    Create,
+    /// An upgrade changes the definition of a dataset an earlier version
+    /// created.
+    Update,
+    /// Already as the entry describes: a retry, or an unchanged upgrade.
+    Keep,
 }
 
 /// One dataset entry, checked against its target before anything is
 /// written.
 enum PlannedDataset {
-    /// Created on install; `exists` when a retry finds it already created.
     Output {
         dataset: crate::sekai::dataset::Dataset,
-        exists: bool,
+        write: DatasetWrite,
         content: Option<PlannedContent>,
     },
     Input,
@@ -367,22 +386,32 @@ pub(super) fn install_namespace_package_with(
         .map_err(Status::failed_precondition)?;
     let package = &envelope.package;
     let db = service.db.runtime();
-    if let Some(installed) = db
+    // An installation of this package already there makes this an upgrade
+    // (#3093 decision 8), unless it is the same package again.
+    let previous = db
         .get_namespace_package_installation(&input.namespace, &package.name)
-        .map_err(|_| Status::internal("package installation unavailable"))?
-    {
-        // The same package again changes nothing; another version is an
-        // upgrade, which a later layer adds.
-        if installed.package_digest != package.package_digest {
+        .map_err(|_| Status::internal("package installation unavailable"))?;
+    if let Some(installed) = &previous {
+        if installed.package_digest == package.package_digest {
+            return Ok(Response::new(InstallNamespacePackageResponse {
+                installation: Some(to_proto_installation(service, installed.clone())?),
+            }));
+        }
+        if package.version <= installed.package_version {
             return Err(Status::failed_precondition(format!(
-                "namespace {} already holds version {} of package {}",
+                "namespace {} already holds version {} of package {}; an upgrade needs a later version",
                 input.namespace, installed.package_version, package.name
             )));
         }
-        return Ok(Response::new(InstallNamespacePackageResponse {
-            installation: Some(to_proto_installation(service, installed)?),
-        }));
     }
+    let earlier = |entry: &package_domain::PackageEntry| {
+        previous.as_ref().and_then(|installed| {
+            installed
+                .resources
+                .iter()
+                .find(|resource| resource.kind == entry.kind && resource.entry_id == entry.id)
+        })
+    };
 
     let mut planned = Vec::new();
     for entry in package
@@ -390,21 +419,62 @@ pub(super) fn install_namespace_package_with(
         .iter()
         .filter(|entry| entry.kind == KIND_DATASET_VERSION)
     {
-        let target = input.datasets.remove(&entry.id).ok_or_else(|| {
-            Status::invalid_argument(format!(
-                "entry {KIND_DATASET_VERSION}/{} is not mapped to a dataset",
-                entry.id
-            ))
-        })?;
-        let plan = plan_dataset(
-            service,
-            &principals,
-            tenant_context.as_ref(),
-            &input.namespace,
-            entry,
-            &target,
-        )?;
-        planned.push((entry, target.dataset_id, plan));
+        let name = format!("{}/{}", entry.kind, entry.id);
+        let mapped = input.datasets.remove(&entry.id);
+        let (dataset_id, plan) = match earlier(entry) {
+            // An upgrade keeps each dataset an earlier version installed.
+            Some(resource) => {
+                if resource.role != entry.role {
+                    return Err(Status::failed_precondition(format!(
+                        "entry {name} changed role since the installed version"
+                    )));
+                }
+                if let Some(target) =
+                    mapped.filter(|target| target.dataset_id != resource.resource_id)
+                {
+                    return Err(Status::invalid_argument(format!(
+                        "entry {name} is installed as dataset {}, not {}",
+                        resource.resource_id, target.dataset_id
+                    )));
+                }
+                let plan = match entry.role {
+                    EntryRole::Output => plan_upgraded_output(
+                        service,
+                        &principals,
+                        tenant_context.as_ref(),
+                        entry,
+                        resource,
+                    )?,
+                    _ => plan_dataset(
+                        service,
+                        &principals,
+                        tenant_context.as_ref(),
+                        &input.namespace,
+                        entry,
+                        &NamespacePackageDatasetTarget {
+                            dataset_id: resource.resource_id.clone(),
+                            object_id: String::new(),
+                        },
+                    )?,
+                };
+                (resource.resource_id.clone(), plan)
+            }
+            None => {
+                let target = mapped.ok_or_else(|| {
+                    Status::invalid_argument(format!("entry {name} is not mapped to a dataset"))
+                })?;
+                let plan = plan_dataset(
+                    service,
+                    &principals,
+                    tenant_context.as_ref(),
+                    &input.namespace,
+                    entry,
+                    &target,
+                )?;
+                (target.dataset_id, plan)
+            }
+        };
+        planned.push((entry, dataset_id, plan));
     }
     if let Some(unknown) = input.datasets.keys().next() {
         return Err(Status::invalid_argument(format!(
@@ -416,19 +486,32 @@ pub(super) fn install_namespace_package_with(
         .definitions()
         .map_err(Status::failed_precondition)?;
     let members = prepare_package_members(&input.namespace, &definitions)?;
-    let proposal_ids = if members.is_empty() {
+    let mut proposal_ids = if members.is_empty() {
         None
     } else {
         let id = format!("package/{}/v{}", package.name, package.version);
         Some((id.clone(), id))
     };
-    if let Some((_, proposal_id)) = &proposal_ids {
-        refuse_unless_empty(service, &input.namespace, proposal_id)?;
+    let definitions = match &proposal_ids {
+        Some((_, proposal_id)) => definitions_target(
+            service,
+            &input.namespace,
+            proposal_id,
+            &package.ontology_digest,
+            previous.as_ref(),
+        )?,
+        None => DefinitionsTarget::Open(None),
+    };
+    if let (DefinitionsTarget::Unchanged, Some(installed)) = (&definitions, &previous) {
+        // The merged proposal of the installed version stays the record.
+        proposal_ids = Some((installed.branch_id.clone(), installed.proposal_id.clone()));
     }
 
     // Every check passed; the writes follow, each idempotent.
     let mut resources = Vec::new();
-    if let Some((branch_id, proposal_id)) = &proposal_ids {
+    if let (Some((branch_id, proposal_id)), DefinitionsTarget::Open(expected_published_digest)) =
+        (&proposal_ids, definitions)
+    {
         open_import_proposal(
             service,
             &principals,
@@ -440,33 +523,45 @@ pub(super) fn install_namespace_package_with(
                 package_digest: package.package_digest.clone(),
                 commit: String::new(),
                 idempotency_key: format!("namespace-package/{}", package.package_digest),
-                expected_published_digest: None,
+                expected_published_digest,
             },
         )?;
+    }
+    if let Some((_, proposal_id)) = &proposal_ids {
         resources.push(InstalledResource {
             kind: KIND_DEFINITION_PACKAGE.into(),
             entry_id: package_domain::DEFINITIONS_ENTRY_ID.into(),
             role: EntryRole::Output,
             resource_id: proposal_id.clone(),
+            schema_digest: String::new(),
+            rows_digest: String::new(),
         });
     }
     for (entry, dataset_id, plan) in planned {
+        let mut rows_digest = String::new();
         if let PlannedDataset::Output {
             dataset,
-            exists,
+            write,
             content,
         } = &plan
         {
-            if !exists {
-                db.create_dataset(dataset).map_err(|_| {
+            match write {
+                DatasetWrite::Create => db.create_dataset(dataset).map_err(|_| {
                     Status::aborted(format!("dataset {dataset_id} was not created"))
-                })?;
+                })?,
+                DatasetWrite::Update => db.update_dataset(dataset).map_err(|_| {
+                    Status::aborted(format!("dataset {dataset_id} was not updated"))
+                })?,
+                DatasetWrite::Keep => {}
             }
-            // One append, so the rows land as one new version.
-            if let Some(PlannedContent { rows, append: true }) = content {
-                db.append_rows(&dataset_id, rows).map_err(|_| {
-                    Status::aborted(format!("dataset {dataset_id} content was not written"))
-                })?;
+            if let Some(content) = content {
+                // One append, so the rows land as one new version.
+                if content.append {
+                    db.append_rows(&dataset_id, &content.rows).map_err(|_| {
+                        Status::aborted(format!("dataset {dataset_id} content was not written"))
+                    })?;
+                }
+                rows_digest.clone_from(&content.digest);
             }
         }
         resources.push(InstalledResource {
@@ -474,7 +569,25 @@ pub(super) fn install_namespace_package_with(
             entry_id: entry.id.clone(),
             role: entry.role,
             resource_id: dataset_id,
+            schema_digest: entry.digest.clone(),
+            rows_digest,
         });
+    }
+    // What earlier versions created and this one no longer carries stays in
+    // place and is reported.
+    let carried: BTreeSet<(String, String)> = resources
+        .iter()
+        .map(|resource| (resource.kind.clone(), resource.entry_id.clone()))
+        .collect();
+    let mut retained = BTreeMap::new();
+    for resource in previous
+        .iter()
+        .flat_map(|installed| installed.resources.iter().chain(&installed.retained))
+    {
+        let key = (resource.kind.clone(), resource.entry_id.clone());
+        if !carried.contains(&key) {
+            retained.entry(key).or_insert_with(|| resource.clone());
+        }
     }
     let (branch_id, proposal_id) = proposal_ids.unwrap_or_default();
     let installation = Installation {
@@ -490,12 +603,15 @@ pub(super) fn install_namespace_package_with(
         branch_id,
         proposal_id,
         resources,
+        retained: retained.into_values().collect(),
         installed_by: principals.first().cloned().unwrap_or_default(),
         installed_at_ms: now_millis(),
     };
-    let stored = db
-        .put_namespace_package_installation(&installation)
-        .map_err(|_| Status::internal("package installation unavailable"))?;
+    let stored = match &previous {
+        Some(installed) => db.replace_namespace_package_installation(installed, &installation),
+        None => db.put_namespace_package_installation(&installation),
+    }
+    .map_err(|_| Status::internal("package installation unavailable"))?;
     if stored.package_digest != installation.package_digest {
         return Err(Status::aborted(format!(
             "another install of package {} won the race",
@@ -505,6 +621,44 @@ pub(super) fn install_namespace_package_with(
     Ok(Response::new(InstallNamespacePackageResponse {
         installation: Some(to_proto_installation(service, stored)?),
     }))
+}
+
+/// The dataset an output entry describes, as `id` bound to `object_id`, and
+/// the rows it carries.
+fn entry_dataset(
+    entry: &package_domain::PackageEntry,
+    id: &str,
+    object_id: &str,
+    created: i64,
+) -> Result<(crate::sekai::dataset::Dataset, Option<Vec<ContentRow>>), Status> {
+    let unreadable =
+        || Status::failed_precondition(format!("entry {}/{} is unreadable", entry.kind, entry.id));
+    let (document, rows) = if entry.content_included {
+        let carried: DatasetContentDocument =
+            serde_json::from_str(&entry.document_json).map_err(|_| unreadable())?;
+        (carried.definition(), Some(carried.rows))
+    } else {
+        let document: DatasetDocument =
+            serde_json::from_str(&entry.document_json).map_err(|_| unreadable())?;
+        (document, None)
+    };
+    let dataset = crate::sekai::dataset::Dataset {
+        id: id.to_string(),
+        name: document.name,
+        columns: document
+            .columns
+            .into_iter()
+            .map(|column| crate::sekai::dataset::ColumnDef {
+                name: column.name,
+                col_type: column.col_type,
+                classification: column.classification,
+            })
+            .collect(),
+        object_id: object_id.to_string(),
+        created,
+        partition_keys: document.partition_keys,
+    };
+    Ok((dataset, rows))
 }
 
 /// Checks one dataset entry against its target in `namespace`: an output
@@ -544,36 +698,12 @@ fn plan_dataset(
                         "entry {name} needs an object in namespace {namespace} to bind to"
                     ))
                 })?;
-            let unreadable = || Status::failed_precondition(format!("entry {name} is unreadable"));
-            let (document, rows) = if entry.content_included {
-                let carried: DatasetContentDocument =
-                    serde_json::from_str(&entry.document_json).map_err(|_| unreadable())?;
-                (carried.definition(), Some(carried.rows))
-            } else {
-                let document: DatasetDocument =
-                    serde_json::from_str(&entry.document_json).map_err(|_| unreadable())?;
-                (document, None)
-            };
-            let dataset = crate::sekai::dataset::Dataset {
-                id: target.dataset_id.clone(),
-                name: document.name,
-                columns: document
-                    .columns
-                    .into_iter()
-                    .map(|column| crate::sekai::dataset::ColumnDef {
-                        name: column.name,
-                        col_type: column.col_type,
-                        classification: column.classification,
-                    })
-                    .collect(),
-                object_id: object.id,
-                created: now_millis(),
-                partition_keys: document.partition_keys,
-            };
+            let (dataset, rows) =
+                entry_dataset(entry, &target.dataset_id, &object.id, now_millis())?;
             authorize_dataset(service, principals, tenant_context, &dataset, true)?;
-            let exists = match existing {
-                None => false,
-                Some(found) if same_definition(&found, &dataset) => true,
+            let write = match existing {
+                None => DatasetWrite::Create,
+                Some(found) if same_definition(&found, &dataset) => DatasetWrite::Keep,
                 Some(_) => {
                     return Err(Status::already_exists(format!(
                         "entry {name}: dataset {} already exists",
@@ -581,12 +711,17 @@ fn plan_dataset(
                     )));
                 }
             };
+            let owned = match write {
+                // A dataset this install has not created yet holds nothing.
+                DatasetWrite::Create => Owned::Fresh,
+                _ => Owned::Nothing,
+            };
             let content = rows
-                .map(|rows| plan_content(service, &name, &dataset, exists, rows))
+                .map(|rows| plan_content(service, &name, &dataset, owned, rows))
                 .transpose()?;
             Ok(PlannedDataset::Output {
                 dataset,
-                exists,
+                write,
                 content,
             })
         }
@@ -626,65 +761,193 @@ fn plan_dataset(
     }
 }
 
+/// Checks an output an earlier version created against the entry of the
+/// version being installed. The dataset keeps its id and binding. Its
+/// definition is updated, under the dataset write grant, only while its schema
+/// is still the one the installation recorded; carried rows go in as for
+/// [`plan_content`]. Anything changed outside the installation is refused by
+/// name, never overwritten.
+fn plan_upgraded_output(
+    service: &SekaiServiceImpl,
+    principals: &[String],
+    tenant_context: Option<&crate::enterprise::AuthenticatedContext>,
+    entry: &package_domain::PackageEntry,
+    resource: &InstalledResource,
+) -> Result<PlannedDataset, Status> {
+    let name = format!("{}/{}", entry.kind, entry.id);
+    let changed = || {
+        Status::failed_precondition(format!(
+            "entry {name}: dataset {} changed outside the installation",
+            resource.resource_id
+        ))
+    };
+    let existing = service
+        .db
+        .runtime()
+        .get_dataset(&resource.resource_id)
+        .map_err(Status::internal)?
+        .ok_or_else(changed)?;
+    let (dataset, rows) =
+        entry_dataset(entry, &existing.id, &existing.object_id, existing.created)?;
+    authorize_dataset(service, principals, tenant_context, &existing, true)?;
+    authorize_dataset(service, principals, tenant_context, &dataset, true)?;
+    let found = DatasetDocument::of(&existing);
+    let write = if found == DatasetDocument::of(&dataset) {
+        DatasetWrite::Keep
+    } else if found.schema_digest().map_err(Status::internal)? == resource.schema_digest {
+        DatasetWrite::Update
+    } else {
+        return Err(changed());
+    };
+    let owned = if resource.rows_digest.is_empty() {
+        Owned::Nothing
+    } else {
+        Owned::Rows(&resource.rows_digest)
+    };
+    let content = rows
+        .map(|rows| plan_content(service, &name, &dataset, owned, rows))
+        .transpose()?;
+    Ok(PlannedDataset::Output {
+        dataset,
+        write,
+        content,
+    })
+}
+
+/// What the installation already holds in an output it is about to append to.
+#[derive(Clone, Copy)]
+enum Owned<'a> {
+    /// The dataset is created by this install.
+    Fresh,
+    /// The installation wrote no rows to it yet: it takes carried rows while
+    /// it has no version.
+    Nothing,
+    /// The installation wrote rows with this digest: an upgrade appends over
+    /// them while the latest version still holds them.
+    Rows(&'a str),
+}
+
 /// Checks carried rows against the schema of the dataset they go into, and
-/// decides whether they still have to be appended. A dataset the install has
-/// not created yet takes them. One a retry finds already created takes them
-/// when it has no version yet, and is done when its latest version holds
-/// exactly these rows; any other content was written outside the install and
-/// is refused by name rather than appended to. So the rows land once per
-/// `(package digest, target dataset)`.
+/// decides which still have to be appended. A dataset version holds every row
+/// appended so far, so the aim is a latest version holding exactly the carried
+/// rows. One that already does is done, so the rows land once per `(package
+/// digest, target dataset)`. A fresh dataset, or one without a version, takes
+/// them all. In an upgrade, a latest version still holding what the
+/// installation wrote takes the carried rows it lacks; a version that drops
+/// rows cannot apply to an append-only dataset and is refused by name. Any
+/// other content was written outside the installation and is refused by name.
 fn plan_content(
     service: &SekaiServiceImpl,
     name: &str,
     dataset: &crate::sekai::dataset::Dataset,
-    exists: bool,
+    owned: Owned<'_>,
     rows: Vec<ContentRow>,
 ) -> Result<PlannedContent, Status> {
     let schema = DatasetDocument::of(dataset);
     package_domain::check_rows(&schema.columns, &rows)
         .map_err(|error| Status::failed_precondition(format!("entry {name}: {error}")))?;
-    let rows: Vec<std::collections::HashMap<String, String>> = rows
-        .into_iter()
-        .map(|row| row.into_iter().collect())
-        .collect();
-    if !exists {
-        return Ok(PlannedContent {
-            append: !rows.is_empty(),
-            rows,
-        });
-    }
-    let db = service.db.runtime();
-    let version_id = db
-        .latest_dataset_version_id(&dataset.id)
-        .map_err(Status::internal)?;
-    if version_id.is_empty() {
-        return Ok(PlannedContent {
-            append: !rows.is_empty(),
-            rows,
-        });
-    }
-    // One row more than carried is enough to tell the contents apart.
-    let stored = db
-        .dataset_version_rows_after(&dataset.id, &version_id, i64::MIN, rows.len() + 1)
-        .map_err(Status::internal)?;
-    let canonical = |row: &std::collections::HashMap<String, String>| {
-        let row: ContentRow = row.clone().into_iter().collect();
-        serde_json::to_string(&row).unwrap_or_default()
+    let digest = package_domain::rows_digest(&rows).map_err(Status::internal)?;
+    let latest = match owned {
+        Owned::Fresh => LatestRows::NoVersion,
+        _ => latest_rows(service, &dataset.id)?,
     };
-    let mut found: Vec<String> = stored.iter().map(|(_, row)| canonical(row)).collect();
-    let mut carried: Vec<String> = rows.iter().map(canonical).collect();
-    found.sort();
-    carried.sort();
-    if found != carried {
-        return Err(Status::failed_precondition(format!(
+    let changed = || {
+        Status::failed_precondition(format!(
             "entry {name}: dataset {} changed outside the installation",
             dataset.id
-        )));
-    }
+        ))
+    };
+    let missing = match latest {
+        LatestRows::NoVersion => rows,
+        LatestRows::Rows(found) => {
+            let found_digest = package_domain::rows_digest(&found).map_err(Status::internal)?;
+            if found_digest == digest {
+                Vec::new()
+            } else if matches!(owned, Owned::Rows(wrote) if wrote == found_digest) {
+                rows_beyond(&found, rows).ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "entry {name}: the package drops rows dataset {} holds, and a dataset only takes appended rows",
+                        dataset.id
+                    ))
+                })?
+            } else {
+                return Err(changed());
+            }
+        }
+        LatestRows::Other => return Err(changed()),
+    };
     Ok(PlannedContent {
-        rows,
-        append: false,
+        append: !missing.is_empty(),
+        rows: missing
+            .into_iter()
+            .map(|row| row.into_iter().collect())
+            .collect(),
+        digest,
     })
+}
+
+/// The rows of `carried` beyond those `found` holds, counting duplicates, or
+/// `None` when `found` holds a row `carried` lacks.
+fn rows_beyond(found: &[ContentRow], carried: Vec<ContentRow>) -> Option<Vec<ContentRow>> {
+    let mut held = BTreeMap::<&ContentRow, usize>::new();
+    for row in found {
+        *held.entry(row).or_default() += 1;
+    }
+    let mut beyond = Vec::new();
+    for row in carried {
+        match held.get_mut(&row) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => beyond.push(row),
+        }
+    }
+    held.values().all(|count| *count == 0).then_some(beyond)
+}
+
+/// The latest version of a dataset, as install compares it.
+enum LatestRows {
+    NoVersion,
+    Rows(Vec<ContentRow>),
+    /// Purged, or larger than any package carries: not rows an install wrote.
+    Other,
+}
+
+fn latest_rows(service: &SekaiServiceImpl, dataset_id: &str) -> Result<LatestRows, Status> {
+    let db = service.db.runtime();
+    let version_id = db
+        .latest_dataset_version_id(dataset_id)
+        .map_err(Status::internal)?;
+    if version_id.is_empty() {
+        return Ok(LatestRows::NoVersion);
+    }
+    if db
+        .get_dataset_version(dataset_id, &version_id, 0)
+        .map_err(Status::internal)?
+        .purged
+    {
+        return Ok(LatestRows::Other);
+    }
+    let mut budget = MAX_PACKAGE_CONTENT_BYTES;
+    let mut rows = Vec::new();
+    let mut after = i64::MIN;
+    loop {
+        let page = db
+            .dataset_version_rows_after(dataset_id, &version_id, after, CONTENT_PAGE)
+            .map_err(Status::internal)?;
+        let Some((last, _)) = page.last() else {
+            break;
+        };
+        after = *last;
+        for (_, values) in page {
+            let row: ContentRow = values.into_iter().collect();
+            let bytes = package_domain::row_bytes(&row).map_err(Status::internal)?;
+            let Some(left) = budget.checked_sub(bytes) else {
+                return Ok(LatestRows::Other);
+            };
+            budget = left;
+            rows.push(row);
+        }
+    }
+    Ok(LatestRows::Rows(rows))
 }
 
 /// A dataset a retry finds is the one this install creates: same name,
@@ -697,34 +960,98 @@ fn same_definition(
         && found.object_id == planned.object_id
 }
 
-/// Install opens the definitions on an empty namespace only: merging into
-/// one that holds definitions is a non-goal of #3093. A retry whose proposal
-/// already exists (and may have merged) passes.
-fn refuse_unless_empty(
+/// What install does with a package's definitions.
+enum DefinitionsTarget {
+    /// Open the proposal, against this published head when it is `Some`.
+    Open(Option<String>),
+    /// An upgrade whose definitions equal the merged ones of the installed
+    /// version: nothing to propose.
+    Unchanged,
+}
+
+/// Where the definitions proposal `proposal_id` may open, and the published
+/// head it must open against. A retry whose proposal already exists (and may
+/// have merged) passes. A first install, or an upgrade whose earlier proposal
+/// never merged, opens only into a namespace without definitions: merging
+/// into one that holds definitions is a non-goal of #3093. An upgrade over
+/// merged definitions opens against the published head, and only while that
+/// head still holds the installed ontology digest; an earlier proposal still
+/// open is refused, so two versions are never under review at once.
+fn definitions_target(
     service: &SekaiServiceImpl,
     namespace: &str,
     proposal_id: &str,
-) -> Result<(), Status> {
+    ontology_digest: &str,
+    previous: Option<&Installation>,
+) -> Result<DefinitionsTarget, Status> {
     let db = service.db.runtime();
-    if db
-        .get_definition_proposal(namespace, proposal_id)
-        .map_err(|_| Status::internal("definition proposal unavailable"))?
-        .is_some()
-    {
-        return Ok(());
-    }
-    let Some(head) = db
-        .get_published_definition_revision(namespace)
-        .map_err(|_| Status::internal("definition revision unavailable"))?
-    else {
-        return Ok(());
+    let proposal = |id: &str| {
+        db.get_definition_proposal(namespace, id)
+            .map_err(|_| Status::internal("definition proposal unavailable"))
     };
-    if head.members.is_empty() {
-        return Ok(());
+    if proposal(proposal_id)?.is_some() {
+        return Ok(DefinitionsTarget::Open(None));
     }
-    Err(Status::failed_precondition(format!(
-        "namespace {namespace} already holds definitions; a package installs into an empty namespace"
-    )))
+    let earlier = match previous.filter(|installed| !installed.proposal_id.is_empty()) {
+        Some(installed) => proposal(&installed.proposal_id)?.map(|found| (installed, found)),
+        None => None,
+    };
+    let head = db
+        .get_published_definition_revision(namespace)
+        .map_err(|_| Status::internal("definition revision unavailable"))?;
+    match earlier {
+        Some((installed, found))
+            if found.status == crate::sekai::definition_proposal::STATUS_OPEN =>
+        {
+            Err(Status::failed_precondition(format!(
+                "proposal {} of version {} is still open; merge or close it before upgrading",
+                installed.proposal_id, installed.package_version
+            )))
+        }
+        Some((installed, found))
+            if found.status == crate::sekai::definition_proposal::STATUS_MERGED =>
+        {
+            let head = head.ok_or_else(|| Status::internal("definition revision unavailable"))?;
+            if published_package_digest(service, namespace, &head.revision_digest)?
+                != installed.ontology_digest
+            {
+                return Err(Status::failed_precondition(format!(
+                    "the definitions of namespace {namespace} changed outside the installation"
+                )));
+            }
+            if installed.ontology_digest == ontology_digest {
+                return Ok(DefinitionsTarget::Unchanged);
+            }
+            Ok(DefinitionsTarget::Open(Some(head.revision_digest)))
+        }
+        _ => match head {
+            Some(head) if !head.members.is_empty() => Err(Status::failed_precondition(format!(
+                "namespace {namespace} already holds definitions; a package installs into an empty namespace"
+            ))),
+            _ => Ok(DefinitionsTarget::Open(None)),
+        },
+    }
+}
+
+/// The namespace-free package digest of the definitions at `revision_digest`,
+/// the value an installation's ontology digest is compared with.
+fn published_package_digest(
+    service: &SekaiServiceImpl,
+    namespace: &str,
+    revision_digest: &str,
+) -> Result<String, Status> {
+    let members = service
+        .db
+        .runtime()
+        .get_definition_members(namespace, revision_digest)
+        .map_err(|_| Status::internal("definition revision unavailable"))?;
+    definition_package::build_package(
+        members
+            .into_iter()
+            .map(|member| (member.member_kind, member.member_id, member.definition_json)),
+    )
+    .map(|package| package.package_digest)
+    .map_err(Status::internal)
 }
 
 /// The installation with its status, derived from its definitions proposal.
@@ -732,32 +1059,41 @@ fn to_proto_installation(
     service: &SekaiServiceImpl,
     installation: Installation,
 ) -> Result<NamespacePackageInstallation, Status> {
-    let db = service.db.runtime();
     let (merged, published_digest) = if installation.proposal_id.is_empty() {
         (None, None)
     } else {
-        let proposal = db
+        let proposal = service
+            .db
+            .runtime()
             .get_definition_proposal(&installation.namespace, &installation.proposal_id)
             .map_err(|_| Status::internal("definition proposal unavailable"))?;
         match proposal {
             Some(proposal)
                 if proposal.status == crate::sekai::definition_proposal::STATUS_MERGED =>
             {
-                let members = db
-                    .get_definition_members(&installation.namespace, &proposal.candidate_digest)
-                    .map_err(|_| Status::internal("definition revision unavailable"))?;
-                let published =
-                    definition_package::build_package(members.into_iter().map(|member| {
-                        (member.member_kind, member.member_id, member.definition_json)
-                    }))
-                    .map_err(Status::internal)?;
-                (Some(true), Some(published.package_digest))
+                let digest = published_package_digest(
+                    service,
+                    &installation.namespace,
+                    &proposal.candidate_digest,
+                )?;
+                (Some(true), Some(digest))
             }
             _ => (Some(false), None),
         }
     };
     let status =
         package_domain::installation_status(&installation, merged, published_digest.as_deref());
+    let to_proto = |resource: InstalledResource| NamespacePackageInstalledResource {
+        kind: resource.kind,
+        entry_id: resource.entry_id,
+        role: match resource.role {
+            EntryRole::Output => "output",
+            EntryRole::Input => "input",
+            _ => "unknown",
+        }
+        .into(),
+        resource_id: resource.resource_id,
+    };
     Ok(NamespacePackageInstallation {
         installation_id: installation.installation_id,
         namespace: installation.namespace,
@@ -768,21 +1104,8 @@ fn to_proto_installation(
         status: status.into(),
         branch_id: installation.branch_id,
         proposal_id: installation.proposal_id,
-        resources: installation
-            .resources
-            .into_iter()
-            .map(|resource| NamespacePackageInstalledResource {
-                kind: resource.kind,
-                entry_id: resource.entry_id,
-                role: match resource.role {
-                    EntryRole::Output => "output",
-                    EntryRole::Input => "input",
-                    _ => "unknown",
-                }
-                .into(),
-                resource_id: resource.resource_id,
-            })
-            .collect(),
+        resources: installation.resources.into_iter().map(to_proto).collect(),
+        retained_resources: installation.retained.into_iter().map(to_proto).collect(),
         source_namespace: installation.source_namespace,
         signer_identity: installation.signer_identity,
         installed_by: installation.installed_by,

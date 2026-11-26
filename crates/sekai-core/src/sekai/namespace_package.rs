@@ -217,6 +217,18 @@ pub fn content_digest(rows: &[ContentRow]) -> Result<String, String> {
     definition_package::contract_digest(NAMESPACE_PACKAGE_CONTRACT, "dataset_content", &rows)
 }
 
+/// SHA-256 over the canonical rows in sorted order. A dataset version does not
+/// keep row order, so an installation records and compares what it wrote by
+/// this digest rather than by [`content_digest`].
+pub fn rows_digest(rows: &[ContentRow]) -> Result<String, String> {
+    let mut canonical = rows
+        .iter()
+        .map(crate::shomei::canonical_json_with_finite_numbers)
+        .collect::<Result<Vec<_>, _>>()?;
+    canonical.sort();
+    definition_package::contract_digest(NAMESPACE_PACKAGE_CONTRACT, "dataset_rows", &canonical)
+}
+
 /// The canonical JSON size of one row, as counted against
 /// [`MAX_PACKAGE_CONTENT_BYTES`].
 pub fn row_bytes(row: &ContentRow) -> Result<usize, String> {
@@ -273,6 +285,16 @@ pub struct InstalledResource {
     /// The resource in the target namespace: a dataset id, or the
     /// definitions proposal id.
     pub resource_id: String,
+    /// For a dataset: the schema digest it held when this version was
+    /// installed. An upgrade refuses a dataset whose schema has changed
+    /// since then.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub schema_digest: String,
+    /// For an output with carried rows: the [`rows_digest`] of what its
+    /// latest version held once this version was installed. An upgrade
+    /// refuses a dataset whose latest version has changed since then.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rows_digest: String,
 }
 
 /// A package installed into a namespace (#3093 decision 8), stored once per
@@ -293,6 +315,10 @@ pub struct NamespacePackageInstallation {
     pub branch_id: String,
     pub proposal_id: String,
     pub resources: Vec<InstalledResource>,
+    /// Resources an earlier version created that a later version no longer
+    /// carries. An upgrade reports them here and leaves them in place.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained: Vec<InstalledResource>,
     pub installed_by: String,
     pub installed_at_ms: i64,
 }

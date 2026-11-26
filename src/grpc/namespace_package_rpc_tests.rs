@@ -2,7 +2,9 @@
 //! what the caller may read with digests, counts the rest by kind, carries no
 //! data, and refuses a selected dataset it cannot package by name. Install
 //! checks everything before its first write, reproduces the digests once the
-//! definitions proposal merges, and changes nothing the second time.
+//! definitions proposal merges, and changes nothing the second time. A later
+//! version upgrades what the installation created and refuses what changed
+//! outside it.
 
 use super::namespace_package_rpc::{export_namespace_package_as, install_namespace_package_with};
 use super::rpc_definition_package::{PackageSigner, package_keyring_from_json};
@@ -134,12 +136,22 @@ fn export_with_content(
     dataset_ids: &[&str],
     content: &[&str],
 ) -> Result<ExportNamespacePackageResponse, Status> {
+    export_version(svc, 1, dataset_ids, content)
+}
+
+/// As [`export_with_content`], as `version` of the package.
+fn export_version(
+    svc: &SekaiServiceImpl,
+    version: u32,
+    dataset_ids: &[&str],
+    content: &[&str],
+) -> Result<ExportNamespacePackageResponse, Status> {
     export_namespace_package_as(
         svc,
         with_principal(ExportNamespacePackageRequest {
             namespace: NAMESPACE.into(),
             package_name: "support-desk".into(),
-            package_version: 1,
+            package_version: version,
             dataset_ids: dataset_ids.iter().map(|id| id.to_string()).collect(),
             content_dataset_ids: content.iter().map(|id| id.to_string()).collect(),
         }),
@@ -306,6 +318,37 @@ async fn installation(
     .map(|response| response.into_inner().installation.unwrap())
 }
 
+/// Approves and merges an installation's definitions proposal in [`TARGET`].
+async fn merge(svc: &SekaiServiceImpl, proposal_id: &str) {
+    let proposal = svc
+        .db
+        .runtime()
+        .get_definition_proposal(TARGET, proposal_id)
+        .unwrap()
+        .unwrap();
+    svc.approve_definition_proposal(with_named_principal(
+        ApproveDefinitionProposalRequest {
+            namespace: TARGET.into(),
+            proposal_id: proposal_id.into(),
+            idempotency_key: format!("{proposal_id}-approve"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+    svc.merge_definition_proposal(with_named_principal(
+        MergeDefinitionProposalRequest {
+            namespace: TARGET.into(),
+            proposal_id: proposal_id.into(),
+            expected_published_digest: proposal.base_digest,
+            idempotency_key: format!("{proposal_id}-merge"),
+        },
+        "root",
+    ))
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn install_reproduces_the_package_once_its_definitions_merge_and_only_once() {
     let svc = service();
@@ -345,33 +388,7 @@ async fn install_reproduces_the_package_once_its_definitions_merge_and_only_once
     );
 
     // The definitions go through the target's normal review.
-    let proposal = svc
-        .db
-        .runtime()
-        .get_definition_proposal(TARGET, &installed.proposal_id)
-        .unwrap()
-        .unwrap();
-    svc.approve_definition_proposal(with_named_principal(
-        ApproveDefinitionProposalRequest {
-            namespace: TARGET.into(),
-            proposal_id: installed.proposal_id.clone(),
-            idempotency_key: "install-approve".into(),
-        },
-        "root",
-    ))
-    .await
-    .unwrap();
-    svc.merge_definition_proposal(with_named_principal(
-        MergeDefinitionProposalRequest {
-            namespace: TARGET.into(),
-            proposal_id: installed.proposal_id.clone(),
-            expected_published_digest: proposal.base_digest,
-            idempotency_key: "install-merge".into(),
-        },
-        "root",
-    ))
-    .await
-    .unwrap();
+    merge(&svc, &installed.proposal_id).await;
     let merged = installation(&svc, "support-desk").await.unwrap();
     assert_eq!(merged.status, "installed");
 
@@ -664,5 +681,175 @@ async fn content_needs_an_export_grant_and_leaves_out_unreleased_columns() {
         package_domain::DatasetDocument::of(&source)
             .schema_digest()
             .unwrap()
+    );
+}
+
+/// Version 1 with `tickets` (rows included) and `notes`, installed into
+/// [`TARGET`] with its definitions merged.
+async fn installed_v1(svc: &SekaiServiceImpl) {
+    fixture(svc).await;
+    grant_export_to_tester(svc);
+    bound_dataset(svc, "notes", NAMESPACE, "tester");
+    let v1 = export_version(svc, 1, &["notes", "tickets"], &["tickets"]).unwrap();
+    target_object(svc, "desk-binding");
+    target_object(svc, "desk-notes-binding");
+    let installed = install(
+        svc,
+        &v1.envelope_json,
+        &[
+            ("tickets", "desk-tickets", "desk-binding"),
+            ("notes", "desk-notes", "desk-notes-binding"),
+        ],
+    )
+    .unwrap();
+    merge(svc, &installed.proposal_id).await;
+}
+
+/// The titles in the latest version of `dataset_id`.
+fn titles(svc: &SekaiServiceImpl, dataset_id: &str) -> Vec<String> {
+    let db = svc.db.runtime();
+    let version = db.latest_dataset_version_id(dataset_id).unwrap();
+    let mut titles: Vec<String> = db
+        .dataset_version_rows_after(dataset_id, &version, i64::MIN, 100)
+        .unwrap()
+        .into_iter()
+        .map(|(_, row)| row["title"].clone())
+        .collect();
+    titles.sort();
+    titles
+}
+
+#[tokio::test]
+async fn an_upgrade_updates_what_it_installed_and_keeps_what_it_dropped() {
+    let svc = service();
+    installed_v1(&svc).await;
+    // Version 2 carries new rows for tickets and drops notes.
+    svc.db
+        .runtime()
+        .append_rows(
+            "tickets",
+            &[
+                [("title".to_string(), "second-a".to_string())].into(),
+                [("title".to_string(), "second-b".to_string())].into(),
+            ],
+        )
+        .unwrap();
+    let v2 = export_version(&svc, 2, &["tickets"], &["tickets"]).unwrap();
+
+    // Datasets it installed need no mapping.
+    let upgraded = install(&svc, &v2.envelope_json, &[]).unwrap();
+    assert_eq!(upgraded.package_version, 2);
+    // The definitions did not change, so the merged proposal stays.
+    assert_eq!(upgraded.status, "installed");
+    assert_eq!(upgraded.proposal_id, "package/support-desk/v1");
+    let resources: Vec<_> = upgraded
+        .resources
+        .iter()
+        .map(|resource| (resource.entry_id.as_str(), resource.resource_id.as_str()))
+        .collect();
+    assert_eq!(
+        resources,
+        [
+            ("definitions", "package/support-desk/v1"),
+            ("tickets", "desk-tickets")
+        ]
+    );
+    let retained: Vec<_> = upgraded
+        .retained_resources
+        .iter()
+        .map(|resource| (resource.entry_id.as_str(), resource.resource_id.as_str()))
+        .collect();
+    assert_eq!(retained, [("notes", "desk-notes")]);
+    assert!(
+        svc.db
+            .runtime()
+            .get_dataset("desk-notes")
+            .unwrap()
+            .is_some()
+    );
+    let versions = || {
+        svc.db
+            .runtime()
+            .list_dataset_versions("desk-tickets")
+            .unwrap()
+            .len()
+    };
+    // One new version, appending only the rows version 1 lacked.
+    assert_eq!(versions(), 2);
+    assert_eq!(
+        titles(&svc, "desk-tickets"),
+        ["row-data-marker", "second-a", "second-b"]
+    );
+
+    // The upgrade again changes nothing; an older version is refused.
+    assert_eq!(install(&svc, &v2.envelope_json, &[]).unwrap(), upgraded);
+    assert_eq!(versions(), 2);
+    let v1 = export_version(&svc, 1, &["tickets"], &[]).unwrap();
+    assert_eq!(
+        install(&svc, &v1.envelope_json, &[]).unwrap_err().message(),
+        "namespace pkg-target already holds version 2 of package support-desk; an upgrade needs a later version"
+    );
+}
+
+#[tokio::test]
+async fn an_upgrade_refuses_what_changed_outside_the_installation() {
+    let svc = service();
+    installed_v1(&svc).await;
+    let v2 = export_version(&svc, 2, &["tickets"], &["tickets"]).unwrap();
+
+    // A target that moves an installed dataset is refused.
+    let refused = install(
+        &svc,
+        &v2.envelope_json,
+        &[("tickets", "elsewhere-tickets", "desk-binding")],
+    )
+    .unwrap_err();
+    assert_eq!(
+        refused.message(),
+        "entry dataset_version/tickets is installed as dataset desk-tickets, not elsewhere-tickets"
+    );
+    // Rows written to an installed dataset are not overwritten.
+    svc.db
+        .runtime()
+        .append_rows(
+            "desk-tickets",
+            &[[("title".to_string(), "written-elsewhere".to_string())].into()],
+        )
+        .unwrap();
+    let refused = install(&svc, &v2.envelope_json, &[]).unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        refused.message(),
+        "entry dataset_version/tickets: dataset desk-tickets changed outside the installation"
+    );
+    assert_eq!(
+        titles(&svc, "desk-tickets"),
+        ["row-data-marker", "written-elsewhere"]
+    );
+    assert_eq!(
+        installation(&svc, "support-desk")
+            .await
+            .unwrap()
+            .package_version,
+        1
+    );
+}
+
+#[tokio::test]
+async fn an_upgrade_waits_for_the_installed_versions_proposal() {
+    let svc = service();
+    fixture(&svc).await;
+    target_object(&svc, "desk-binding");
+    let v1 = export_version(&svc, 1, &["tickets"], &[]).unwrap();
+    install(
+        &svc,
+        &v1.envelope_json,
+        &[("tickets", "desk-tickets", "desk-binding")],
+    )
+    .unwrap();
+    let v2 = export_version(&svc, 2, &["tickets"], &[]).unwrap();
+    assert_eq!(
+        install(&svc, &v2.envelope_json, &[]).unwrap_err().message(),
+        "proposal package/support-desk/v1 of version 1 is still open; merge or close it before upgrading"
     );
 }
