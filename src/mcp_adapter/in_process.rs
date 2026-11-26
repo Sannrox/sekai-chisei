@@ -589,6 +589,7 @@ fn property(name: &str, required: bool) -> PropertyDef {
         compute_expr: String::new(),
         classification: String::new(),
         struct_fields: vec![],
+        series_dataset: String::new(),
     }
 }
 

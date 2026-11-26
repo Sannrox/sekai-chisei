@@ -715,6 +715,7 @@ mod tests {
             compute_expr: String::new(),
             classification: classification.into(),
             struct_fields: Vec::new(),
+            series_dataset: String::new(),
         }
     }
 

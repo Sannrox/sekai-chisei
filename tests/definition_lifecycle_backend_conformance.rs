@@ -58,6 +58,7 @@ fn prop(name: &str) -> PropertyDef {
         compute_expr: String::new(),
         classification: "public".into(),
         struct_fields: vec![],
+        series_dataset: String::new(),
     }
 }
 

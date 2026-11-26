@@ -276,7 +276,10 @@ fn validate_struct_field_value(
                 return Err(format!("property {field_name}: expected timestamp"));
             }
         }
-        PropertyType::Link | PropertyType::Computed | PropertyType::Struct => {
+        PropertyType::Link
+        | PropertyType::Computed
+        | PropertyType::Struct
+        | PropertyType::Series => {
             return Err(format!(
                 "property {field_name}: unsupported struct field type"
             ));
@@ -558,6 +561,7 @@ fn prop_def_desc(
         compute_expr: String::new(),
         classification: default_property_classification(),
         struct_fields: Vec::new(),
+        series_dataset: String::new(),
     }
 }
 
@@ -582,6 +586,7 @@ fn classified_prop_def(
         compute_expr: String::new(),
         classification: classification.to_string(),
         struct_fields: Vec::new(),
+        series_dataset: String::new(),
     }
 }
 
@@ -603,6 +608,19 @@ fn validate_property_definition(property: &PropertyDef) -> Result<(), String> {
     } else if !property.struct_fields.is_empty() {
         return Err(format!(
             "property {} declares struct_fields but is not struct",
+            property.name
+        ));
+    }
+    let names_dataset = !property.series_dataset.trim().is_empty();
+    if property.prop_type == PropertyType::Series && !names_dataset {
+        return Err(format!(
+            "series property {} requires series_dataset",
+            property.name
+        ));
+    }
+    if property.prop_type != PropertyType::Series && names_dataset {
+        return Err(format!(
+            "property {} declares series_dataset but is not series",
             property.name
         ));
     }
@@ -633,7 +651,10 @@ fn validate_struct_fields(property_name: &str, fields: &[StructFieldDef]) -> Res
                     field.name
                 ));
             }
-            PropertyType::Link | PropertyType::Computed | PropertyType::Struct => {
+            PropertyType::Link
+            | PropertyType::Computed
+            | PropertyType::Struct
+            | PropertyType::Series => {
                 return Err(format!(
                     "struct property {property_name}.{} has unsupported field type: {}",
                     field.name,
@@ -1080,6 +1101,7 @@ mod tests {
             compute_expr: String::new(),
             classification: default_property_classification(),
             struct_fields: vec![],
+            series_dataset: String::new(),
         }
     }
 
@@ -1094,6 +1116,7 @@ mod tests {
             compute_expr: String::new(),
             classification: default_property_classification(),
             struct_fields: vec![],
+            series_dataset: String::new(),
         }
     }
 
@@ -1403,6 +1426,32 @@ mod tests {
         let err = validate_object_type_definition(&object_type, registry.get("widget"), &registry)
             .unwrap_err();
         assert!(err.contains("invalid classification"));
+    }
+
+    #[test]
+    fn test_validate_object_type_binds_series_dataset_to_series_properties() {
+        let registry = SchemaRegistry::new();
+        let validate = |property: PropertyDef| {
+            let object_type = ObjectType {
+                kind: "sensor".into(),
+                description: String::new(),
+                is_builtin: false,
+                implements: vec![],
+                properties: vec![property],
+            };
+            validate_object_type_definition(&object_type, None, &registry)
+        };
+        let mut series = prop("temperature", PropertyType::Series, false);
+        assert!(
+            validate(series.clone())
+                .unwrap_err()
+                .contains("requires series_dataset")
+        );
+        series.series_dataset = "sensor-samples".into();
+        validate(series).unwrap();
+        let mut string = prop("label", PropertyType::String, false);
+        string.series_dataset = "sensor-samples".into();
+        assert!(validate(string).unwrap_err().contains("is not series"));
     }
 
     #[test]

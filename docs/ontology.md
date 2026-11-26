@@ -92,6 +92,15 @@ guarantee. Interface registry CRUD and schema-to-ontology projection are
 internal implementation facilities rather than public 1.0 API. Use
 ontology-first authoring.
 
+**Series properties (ADR 0161):** an ObjectType property of type `series`
+names its samples dataset in `series_dataset`, a dataset whose rows are
+`(series_id, timestamp, value)`. Its value on each object is a `series_id`
+string. `CreateSchemaType` refuses a `series` property without
+`series_dataset`, and any other type that sets it. The field is left out of
+stored definition JSON when empty, so existing definitions keep their bytes
+and digests. Generated clients type the value as a string. A struct field
+cannot be a series, and a local twin cannot generate a required one.
+
 Document versions:
 
 - Domain: `sekai.ontology-product/v1` (`tests/fixtures/product_loop/domain-v1.json`).

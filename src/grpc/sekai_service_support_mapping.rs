@@ -449,6 +449,7 @@ pub(super) fn to_proto_property_def(property: &schema::PropertyDef) -> PropertyD
             .iter()
             .map(to_proto_struct_field_def)
             .collect(),
+        series_dataset: property.series_dataset.clone(),
     }
 }
 pub(super) fn to_proto_struct_field_def(field: &schema::StructFieldDef) -> StructFieldDef {
@@ -497,6 +498,7 @@ pub(super) fn from_proto_property_def(
             .iter()
             .map(from_proto_struct_field_def)
             .collect::<Result<Vec<_>, _>>()?,
+        series_dataset: property.series_dataset.clone(),
     })
 }
 pub(super) fn from_proto_struct_field_def(

@@ -17,6 +17,9 @@ pub enum PropertyType {
     Link,
     Computed,
     Struct,
+    /// Names a series of samples in a governed dataset (ADR 0161). The
+    /// property value on an object is the `series_id`.
+    Series,
 }
 
 impl PropertyType {
@@ -31,6 +34,7 @@ impl PropertyType {
             "link" => Some(Self::Link),
             "computed" => Some(Self::Computed),
             "struct" => Some(Self::Struct),
+            "series" => Some(Self::Series),
             _ => None,
         }
     }
@@ -46,6 +50,7 @@ impl PropertyType {
             Self::Link => "link",
             Self::Computed => "computed",
             Self::Struct => "struct",
+            Self::Series => "series",
         }
     }
 }
@@ -72,6 +77,11 @@ pub struct PropertyDef {
     pub classification: String,
     #[serde(default)]
     pub struct_fields: Vec<StructFieldDef>,
+    /// The samples dataset a `series` property reads (ADR 0161); empty for
+    /// every other type. Omitted from JSON when empty, so the stored bytes
+    /// and digests of existing definitions do not change.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub series_dataset: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,7 +331,10 @@ fn coerce_declared(
     value: PropertyValue,
 ) -> Result<PropertyValue, String> {
     match prop_type {
-        PropertyType::String | PropertyType::Link | PropertyType::Computed => match value {
+        PropertyType::String
+        | PropertyType::Link
+        | PropertyType::Computed
+        | PropertyType::Series => match value {
             PropertyValue::String(text) => Ok(PropertyValue::String(text)),
             other => Ok(PropertyValue::String(other.as_cell())),
         },
@@ -701,6 +714,7 @@ mod tests {
                     compute_expr: String::new(),
                     classification: default_property_classification(),
                     struct_fields: Vec::new(),
+                    series_dataset: String::new(),
                 },
                 PropertyDef {
                     name: "when".into(),
@@ -712,11 +726,28 @@ mod tests {
                     compute_expr: String::new(),
                     classification: default_property_classification(),
                     struct_fields: Vec::new(),
+                    series_dataset: String::new(),
                 },
             ],
             is_builtin: false,
             implements: Vec::new(),
         }
+    }
+
+    #[test]
+    fn series_dataset_is_omitted_when_empty_so_stored_definitions_keep_their_bytes() {
+        let stored = serde_json::to_string(&sample_type().properties[0]).unwrap();
+        assert!(!stored.contains("series_dataset"), "{stored}");
+        let read_back: PropertyDef = serde_json::from_str(&stored).unwrap();
+        assert!(read_back.series_dataset.is_empty());
+
+        let mut series = sample_type().properties[0].clone();
+        series.prop_type = PropertyType::Series;
+        series.series_dataset = "sensor-samples".into();
+        let read_back: PropertyDef =
+            serde_json::from_str(&serde_json::to_string(&series).unwrap()).unwrap();
+        assert_eq!(read_back.prop_type, PropertyType::Series);
+        assert_eq!(read_back.series_dataset, "sensor-samples");
     }
 
     #[test]

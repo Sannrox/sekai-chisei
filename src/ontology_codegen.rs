@@ -513,7 +513,7 @@ fn named_string_set(
 
 fn map_json_schema_type(value: &str) -> Result<String, OntologyCodegenError> {
     Ok(match value {
-        "string" | "timestamp" => "string".into(),
+        "string" | "timestamp" | "series" => "string".into(),
         "integer" | "int" | "number" | "float" => "number".into(),
         "boolean" | "bool" => "boolean".into(),
         "array" => "unknown[]".into(),
@@ -1203,6 +1203,13 @@ mod tests {
             members: members.into_iter().collect(),
             max_scope: None,
         }
+    }
+
+    /// A definition with a series property used to fail generation as an
+    /// unsupported type; its value is the series id (ADR 0161).
+    #[test]
+    fn series_properties_generate_as_their_string_id() {
+        assert_eq!(map_json_schema_type("series").unwrap(), "string");
     }
 
     #[test]

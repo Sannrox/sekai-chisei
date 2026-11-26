@@ -299,6 +299,7 @@ pub fn property(name: &str, prop_type: PropertyType, required: bool) -> Property
         compute_expr: String::new(),
         classification: "public".into(),
         struct_fields: Vec::new(),
+        series_dataset: String::new(),
     }
 }
 

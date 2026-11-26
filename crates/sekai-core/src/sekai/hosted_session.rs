@@ -487,6 +487,7 @@ fn property(name: &str, required: bool, description: &str, classification: &str)
             classification.into()
         },
         struct_fields: Vec::new(),
+        series_dataset: String::new(),
     }
 }
 

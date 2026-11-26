@@ -875,6 +875,7 @@ fn recast_edit_value(
         compute_expr: String::new(),
         classification: crate::object_schema::default_property_classification(),
         struct_fields: Vec::new(),
+        series_dataset: String::new(),
     };
     crate::object_schema::coerce_property_value("", &declared, value).map_err(|_| ())
 }
