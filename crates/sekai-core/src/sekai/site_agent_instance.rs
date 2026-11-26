@@ -303,8 +303,22 @@ pub fn validate_object_write(db: &RuntimeDb, object: &Object, now_ms: i64) -> Re
     {
         return Ok(());
     }
+    require_certified_agent_member(db, &object.namespace, digest, member, now_ms)
+}
+
+/// Fails unless `digest` is a published definition revision in `namespace`
+/// with a current certification and `member` is one of its agent members.
+/// Instances (ADR 0136) and interactive turns (ADR 0173) bind only to such
+/// a revision.
+pub fn require_certified_agent_member(
+    db: &RuntimeDb,
+    namespace: &str,
+    digest: &str,
+    member: &str,
+    now_ms: i64,
+) -> Result<(), String> {
     let revision = db
-        .get_definition_revision(&object.namespace, digest)?
+        .get_definition_revision(namespace, digest)?
         .filter(|revision| revision.published)
         .ok_or_else(|| {
             format!("definition revision {digest} is not published in this namespace")
@@ -317,7 +331,7 @@ pub fn validate_object_write(db: &RuntimeDb, object: &Object, now_ms: i64) -> Re
         ));
     }
     let certified = db
-        .get_agent_definition_certification(&object.namespace, digest)?
+        .get_agent_definition_certification(namespace, digest)?
         .is_some_and(|certification| certification.gate(now_ms).admitted);
     if !certified {
         return Err(format!(
@@ -336,7 +350,7 @@ fn property<'a>(object: &'a Object, name: &str) -> Option<&'a str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::sekai::action_instance_admission::{
         ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionRequest,
@@ -353,7 +367,7 @@ mod tests {
 
     /// A published revision with one agent member `triage`, certified when
     /// `certified`. Returns its digest.
-    fn published_revision(runtime: &RuntimeDb, parent: &str, certified: bool) -> String {
+    pub(crate) fn published_revision(runtime: &RuntimeDb, parent: &str, certified: bool) -> String {
         let member = DefinitionMemberInput {
             member_kind: MEMBER_KIND_AGENT.into(),
             member_id: "triage".into(),

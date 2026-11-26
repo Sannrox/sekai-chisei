@@ -1523,6 +1523,21 @@
       "product_tier": "experimental"
     },
     {
+      "rpc": "AdmitInteractiveAgentTurn",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.graph"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/interactive_agent_turn.rs",
+        "docs/decisions/0173-interactive-agent-turns-act-as-the-requesting-member.md"
+      ],
+      "durable_dependencies": [
+        "sekai.graph"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ListSiteAgentInstanceTurns",
       "kind": "persistent",
       "surfaces": [

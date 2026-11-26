@@ -212,6 +212,19 @@ service principal whose registration lists the capability `agent_turn_worker`
 in its registered namespaces only, and needs no Action types of its own: it
 submits Actions only with a turn's token, as the turn's instance principal.
 
+A member can admit an interactive turn that acts as that member, bound to a
+published, certified definition revision and one of its agent members
+(experimental, ADR 0173, #3046). `AdmitInteractiveAgentTurn` takes the
+namespace, `definition_revision_digest`, `agent_member`, a `request_id`
+(one turn per request id) and a required `trace_id`. Only the member admits
+their own turn: agent principals, registered service principals, machine
+credentials, runtime tokens and delegated callers are refused, and the
+member needs write access to the namespace. The turn has cause
+`interactive`, no `instance_id`, the member as `principal_id`, and an id
+starting with `iturn-`. Interactive turns are stored apart from instance
+turns and are not claimable yet: the claim slice adds the
+`accepts_interactive` opt-in.
+
 A turn whose Action parks for approval acks `parked` with that Action's id
 (ADR 0142, #2007): the Action must have been submitted under the same claim
 and either still await approval or already have a standing decision. The

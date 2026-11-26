@@ -1646,15 +1646,18 @@ message HeartbeatTransformClaimResponse {
   TransformWork work = 1;
 }
 // A site agent instance's turn and, once finished, its receipt (ADR 0137).
+// An interactive turn (ADR 0173) has no instance and acts as its member.
 message AgentTurn {
   string turn_id = 1;
   string namespace = 2;
+  // Empty for an interactive turn.
   string instance_id = 3;
-  // The instance's principal; the turn acts as it.
+  // The principal the turn acts as: the instance's principal, or the member
+  // of an interactive turn.
   string principal_id = 4;
-  // schedule, object_change or manual.
+  // schedule, object_change, manual or interactive.
   string cause = 5;
-  // Schedule due time, change window, or manual request id.
+  // Schedule due time, change window, or manual or interactive request id.
   string cause_ref = 6;
   int64 due_at_ms = 7;
   string admitted_by = 8;
@@ -1674,6 +1677,12 @@ message AgentTurn {
   // Experimental (ADR 0157). What the turn's worker reported it did. Set by
   // ListSiteAgentInstanceTurns; unset when the worker recorded nothing.
   AgentTurnTranscript transcript = 19;
+  // Experimental (ADR 0173). Set for an interactive turn: the published,
+  // certified definition revision it runs, the agent member of that
+  // revision, and the caller-supplied trace id of the run.
+  string definition_revision_digest = 20;
+  string agent_member = 21;
+  string trace_id = 22;
 }
 // Experimental (ADR 0157). The model route and token counts the turn's
 // worker last reported; a later report replaces an earlier one.
@@ -1747,6 +1756,24 @@ message WakeSiteAgentInstanceRequest {
   string request_id = 3;
 }
 message WakeSiteAgentInstanceResponse {
+  AgentTurn turn = 1;
+}
+// Experimental (ADR 0173). Admits an interactive turn that acts as the
+// caller. Only the member admits their own turn: agent, service-principal,
+// machine-credential and delegated callers are refused, and the caller needs
+// write access to the namespace. The revision must be published and
+// certified in the namespace, with agent_member one of its agent members.
+message AdmitInteractiveAgentTurnRequest {
+  string namespace = 1;
+  string definition_revision_digest = 2;
+  string agent_member = 3;
+  // Idempotency key: one turn per caller, revision, agent member and
+  // request id. A retry returns the first turn unchanged.
+  string request_id = 4;
+  // Required. Named on the turn and its receipts.
+  string trace_id = 5;
+}
+message AdmitInteractiveAgentTurnResponse {
   AgentTurn turn = 1;
 }
 message ListClaimableAgentTurnsRequest {
@@ -7039,6 +7066,8 @@ service SekaiService {
     option deprecated = true;
   }
   rpc WakeSiteAgentInstance(WakeSiteAgentInstanceRequest) returns (WakeSiteAgentInstanceResponse);
+  // Experimental (ADR 0173). Admitted turns are not claimable yet.
+  rpc AdmitInteractiveAgentTurn(AdmitInteractiveAgentTurnRequest) returns (AdmitInteractiveAgentTurnResponse);
   rpc ListSiteAgentInstanceTurns(ListSiteAgentInstanceTurnsRequest) returns (ListSiteAgentInstanceTurnsResponse);
   // Deprecated (#2286): use ListClaimableWork, ClaimWork, HeartbeatWorkClaim and
   // AckWork with WORK_KIND_AGENT_TURN. Served until 5.0.0.

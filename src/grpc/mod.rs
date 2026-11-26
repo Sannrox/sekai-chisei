@@ -982,6 +982,8 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "FederatedAggregate"
             // Manual agent wakes (#1950): namespace admin per call.
             | "WakeSiteAgentInstance"
+            // Interactive agent turns (ADR 0173): namespace write per call.
+            | "AdmitInteractiveAgentTurn"
             // Operator read of an instance's turns (#2001): same marking as
             // GetObject of the instance.
             | "ListSiteAgentInstanceTurns"

@@ -96,6 +96,7 @@ pub mod handoff;
 pub mod handoff_lifecycle;
 pub mod hosted_session;
 pub mod image;
+pub mod interactive_agent_turn;
 pub mod security_package;
 pub mod security_precision;
 pub mod security_remediation;
