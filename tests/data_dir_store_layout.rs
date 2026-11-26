@@ -110,6 +110,21 @@ fn the_server_image_boots_from_the_data_dir() {
 }
 
 #[test]
+fn the_server_image_does_not_ship_the_gateway_binary() {
+    let image = include_str!("../build/server-image/Dockerfile");
+    assert!(image.contains("COPY sekai-chisei sekaictl"));
+    assert!(!image.contains("chisei-gateway"));
+}
+
+#[test]
+fn the_gateway_image_ships_only_the_gateway_binary() {
+    let image = include_str!("../build/gateway-image/Dockerfile");
+    assert!(image.contains("COPY chisei-gateway"));
+    assert!(!image.contains("sekai-chisei"));
+    assert!(!image.contains("sekaictl"));
+}
+
+#[test]
 fn each_plane_derives_only_its_own_file_from_the_data_dir() {
     let cwd = tempdir().unwrap();
     let sekai_dir = cwd.path().join("sekai-data");

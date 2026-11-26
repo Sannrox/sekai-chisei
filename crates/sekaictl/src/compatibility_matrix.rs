@@ -33,6 +33,11 @@ pub const PROVIDED_CONTRACTS: &[(&str, &str)] = &[
 /// Tenkai products that must declare [`PROVIDED_CONTRACTS`] at release.
 pub const TENKAI_PRODUCTS: &[&str] = &["deploy/tenkai.toml", "deploy/kubernetes/tenkai.toml"];
 
+/// Inclusive crate-version range of `chisei-gateway` this control plane launches.
+/// Max must match `crates/chisei-gateway/Cargo.toml`; `from_workspace` checks it.
+pub const MINIMUM_COMPATIBLE_GATEWAY: &str = "1.0.0";
+pub const GATEWAY_PACKAGE_VERSION: &str = "1.0.0";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompatibilityMatrix {
@@ -40,6 +45,8 @@ pub struct CompatibilityMatrix {
     pub server_version: String,
     pub proto_revision: String,
     pub minimum_compatible_server: String,
+    #[serde(default)]
+    pub minimum_compatible_gateway: String,
     #[serde(default)]
     pub identity_assertion_contract: String,
     pub packages: CompatibilityPackages,
@@ -56,6 +63,8 @@ struct CompatibilityMatrixFile {
     proto_revision: String,
     minimum_compatible_server: String,
     #[serde(default)]
+    minimum_compatible_gateway: String,
+    #[serde(default)]
     identity_assertion_contract: String,
     #[serde(default)]
     contracts: BTreeMap<String, String>,
@@ -71,6 +80,8 @@ pub struct CompatibilityPackages {
     pub sekai_proto: String,
     #[serde(rename = "sekai-client")]
     pub sekai_client: String,
+    #[serde(rename = "chisei-gateway", default)]
+    pub chisei_gateway: String,
     pub typescript: String,
     pub python: String,
 }
@@ -139,6 +150,7 @@ impl CompatibilityMatrix {
             server_version: file.server_version,
             proto_revision: file.proto_revision,
             minimum_compatible_server: file.minimum_compatible_server,
+            minimum_compatible_gateway: file.minimum_compatible_gateway,
             identity_assertion_contract: file.identity_assertion_contract,
             packages: file.packages,
         };
@@ -151,6 +163,12 @@ impl CompatibilityMatrix {
         let server_version = cargo_package_version(&root.join("Cargo.toml"))?;
         let sekai_proto = cargo_package_version(&root.join("crates/sekai-proto/Cargo.toml"))?;
         let sekai_client = cargo_package_version(&root.join("crates/sekai-client/Cargo.toml"))?;
+        let chisei_gateway = cargo_package_version(&root.join("crates/chisei-gateway/Cargo.toml"))?;
+        if chisei_gateway != GATEWAY_PACKAGE_VERSION {
+            return Err(format!(
+                "chisei-gateway crate version {chisei_gateway} must match GATEWAY_PACKAGE_VERSION {GATEWAY_PACKAGE_VERSION}"
+            ));
+        }
         let typescript = json_package_version(&root.join("sdk/typescript/package.json"))?;
         let python = pyproject_project_version(&root.join("sdk/python/pyproject.toml"))?;
         let proto_revision = protocol_revision(root)?;
@@ -159,12 +177,14 @@ impl CompatibilityMatrix {
             server_version: server_version.clone(),
             proto_revision,
             minimum_compatible_server: server_version.clone(),
+            minimum_compatible_gateway: MINIMUM_COMPATIBLE_GATEWAY.to_string(),
             identity_assertion_contract:
                 chisei_core::identity_assertion::IDENTITY_ASSERTION_VERSION.into(),
             packages: CompatibilityPackages {
                 sekai_chisei: server_version,
                 sekai_proto,
                 sekai_client,
+                chisei_gateway,
                 typescript,
                 python,
             },
@@ -180,6 +200,7 @@ impl CompatibilityMatrix {
             server_version: self.server_version.clone(),
             proto_revision: self.proto_revision.clone(),
             minimum_compatible_server: self.minimum_compatible_server.clone(),
+            minimum_compatible_gateway: self.minimum_compatible_gateway.clone(),
             identity_assertion_contract: self.identity_assertion_contract.clone(),
             contracts: PROVIDED_CONTRACTS
                 .iter()
@@ -199,6 +220,13 @@ impl CompatibilityMatrix {
         }
         require_token("server_version", &self.server_version)?;
         require_token("minimum_compatible_server", &self.minimum_compatible_server)?;
+        if !self.packages.chisei_gateway.is_empty() || !self.minimum_compatible_gateway.is_empty() {
+            require_token("chisei-gateway", &self.packages.chisei_gateway)?;
+            require_token(
+                "minimum_compatible_gateway",
+                &self.minimum_compatible_gateway,
+            )?;
+        }
         require_token("sekai-chisei", &self.packages.sekai_chisei)?;
         require_token("sekai-proto", &self.packages.sekai_proto)?;
         require_token("sekai-client", &self.packages.sekai_client)?;
@@ -233,6 +261,7 @@ impl CompatibilityMatrix {
             "sekai-client" => Some(&self.packages.sekai_client),
             "sekai-proto" => Some(&self.packages.sekai_proto),
             "sekai-chisei" => Some(&self.packages.sekai_chisei),
+            "chisei-gateway" => Some(&self.packages.chisei_gateway),
             _ => None,
         }
     }
@@ -1164,12 +1193,14 @@ mod tests {
             server_version: "1.0.1".into(),
             proto_revision: "sha256:proto".into(),
             minimum_compatible_server: "1.0.1".into(),
+            minimum_compatible_gateway: MINIMUM_COMPATIBLE_GATEWAY.into(),
             identity_assertion_contract:
                 chisei_core::identity_assertion::IDENTITY_ASSERTION_VERSION.into(),
             packages: CompatibilityPackages {
                 sekai_chisei: "1.0.1".into(),
                 sekai_proto: "1.0.1".into(),
                 sekai_client: "0.1.2".into(),
+                chisei_gateway: GATEWAY_PACKAGE_VERSION.into(),
                 typescript: "0.1.0".into(),
                 python: "0.1.0".into(),
             },

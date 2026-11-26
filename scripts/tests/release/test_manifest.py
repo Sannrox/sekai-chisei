@@ -69,6 +69,20 @@ class Record(unittest.TestCase):
         got = record.with_image(self.BASE, "ghcr.io/example/sekai-chisei:v1.4.0", "sha256:" + "c" * 64)
         self.assertEqual(got["images"], [{"name": "ghcr.io/example/sekai-chisei:v1.4.0", "digest": "sha256:" + "c" * 64}])
 
+    def test_image_records_server_and_gateway(self):
+        server = "ghcr.io/example/sekai-chisei:v1.4.0"
+        gateway = "ghcr.io/example/sekai-chisei/chisei-gateway:v1.4.0"
+        digest = "sha256:" + "c" * 64
+        got = record.with_image(self.BASE, server, digest)
+        got = record.with_image(got, gateway, digest)
+        self.assertEqual(
+            got["images"],
+            [
+                {"name": gateway, "digest": digest},
+                {"name": server, "digest": digest},
+            ],
+        )
+
     def test_image_refuses_latest_and_a_non_sha256_digest(self):
         for name, digest in (
             ("ghcr.io/example/sekai-chisei:latest", "sha256:" + "c" * 64),

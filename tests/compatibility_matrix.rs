@@ -24,6 +24,14 @@ fn workspace_matrix_projects_the_contract_and_proto_revision() {
         );
     }
     assert_eq!(
+        generated.packages.chisei_gateway,
+        compatibility_matrix::GATEWAY_PACKAGE_VERSION
+    );
+    assert_eq!(
+        generated.minimum_compatible_gateway,
+        compatibility_matrix::MINIMUM_COMPATIBLE_GATEWAY
+    );
+    assert_eq!(
         generated.proto_revision,
         protocol_revision(".").expect("proto revision")
     );

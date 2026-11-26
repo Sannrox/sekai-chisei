@@ -3,7 +3,7 @@
 
     python3 scripts/release/record.py image MANIFEST NAME DIGEST
 
-``image`` sets the one published image; it refuses a ``latest`` tag or a
+``image`` upserts one published image by name; it refuses a ``latest`` tag or a
 digest that is not ``sha256:``. The manifest's ``attestations`` list stays
 empty: the release attests the final manifest and SHA256SUMS after this last
 patch, so no attestation URL can be recorded inside them. Verify by digest
@@ -30,7 +30,10 @@ def with_image(manifest: dict, name: str, digest: str) -> dict:
         raise SystemExit("images must not use a latest tag")
     if not digest.startswith("sha256:"):
         raise SystemExit("image digest must be sha256:...")
-    patched = {**manifest, "images": [{"name": name, "digest": digest}]}
+    images = [image for image in manifest.get("images", []) if image.get("name") != name]
+    images.append({"name": name, "digest": digest})
+    images.sort(key=lambda image: image["name"])
+    patched = {**manifest, "images": images}
     if "latest" in json.dumps(patched):
         raise SystemExit("manifest must not mention latest")
     return patched

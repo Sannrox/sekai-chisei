@@ -1,7 +1,8 @@
 # Running with Docker
 
-The runtime image is Debian bookworm with `sekai-chisei`, `chisei-gateway`,
-and `sekaictl`. The builder is pinned `rust:1.98.1-bookworm`.
+The server image is Debian bookworm with `sekai-chisei` and `sekaictl`. The
+gateway image is the same base with `chisei-gateway` only. The builder is
+pinned `rust:1.98.1-bookworm`.
 
 ```bash
 cargo fmt-check
@@ -13,9 +14,11 @@ docker compose --env-file _output/compose.env up
 
 Cargo is the gate. `./build/release-images.sh` is the only image build. The tag
 is git describe (no `:local`). A dirty tree is refused. `./build/release.sh` pushes that same tag to
-`DOCKER_REGISTRY`. Compose uses `sekai-chisei:${GIT_VERSION}`. The image binaries
-are stamped from `SEKAI_GIT_VERSION` / `SEKAI_GIT_COMMIT`; plain cargo builds
-report `<crate version>-dev` and commit `unknown`, so commits never force rebuilds.
+`DOCKER_REGISTRY` (server) and `${DOCKER_REGISTRY}/chisei-gateway` (gateway).
+Compose uses `sekai-chisei:${GIT_VERSION}` and `chisei-gateway:${GIT_VERSION}`.
+The image binaries are stamped from `SEKAI_GIT_VERSION` / `SEKAI_GIT_COMMIT`;
+plain cargo builds report `<crate version>-dev` and commit `unknown`, so
+commits never force rebuilds.
 
 ## Quickstart
 
@@ -165,7 +168,7 @@ startup.
 - Seed setup data:
 
 ```bash
-docker compose --env-file _output/compose.env run --rm gateway sekaictl admin gateway setup --help
+docker compose --env-file _output/compose.env run --rm server sekaictl admin gateway setup --help
 ```
 
 - Generate an attribution/report from shared state:

@@ -22,8 +22,7 @@ services:
       retries: 30
 
   gateway:
-    image: sekai-chisei:${GIT_VERSION}
-    command: ["chisei-gateway"]
+    image: chisei-gateway:${GIT_VERSION}
     depends_on:
       server:
         condition: service_healthy

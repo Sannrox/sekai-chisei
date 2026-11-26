@@ -7,6 +7,8 @@ use sekai_admin_client::gateway_setup::{GatewaySetupConfig, run_setup};
 use sekai_domain::gateway_keys::hash_gateway_key;
 use serde_json::json;
 
+use crate::compatibility_matrix::{GATEWAY_PACKAGE_VERSION, MINIMUM_COMPATIBLE_GATEWAY};
+
 const SERVER_BIN: &str = "sekai-chisei";
 const GATEWAY_BIN: &str = "chisei-gateway";
 const LOG_DIR: &str = "./data/logs";
@@ -272,6 +274,7 @@ pub async fn run_launch(
     // Refuse retired single-store variables (shell or `.env`) before
     // onboarding writes a credential into a store the server would refuse.
     chisei_core::combined_stores::refuse_legacy_store_env()?;
+    require_supported_gateway_version(&installed_gateway_version()?)?;
     // The Sekai file the server opens: SEKAI_DB_PATH, else
     // `<SEKAI_DATA_DIR>/sekai.db`.
     let db_path = chisei_core::combined_stores::default_sekai_sqlite_path();
@@ -1108,6 +1111,75 @@ fn connect_addr(bind: &str) -> String {
     bind.replacen("0.0.0.0", "127.0.0.1", 1)
 }
 
+fn installed_gateway_version() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let output = match service_command(GATEWAY_BIN)? {
+        ServiceCommand::Binary(path) => Command::new(path).arg("--version").output()?,
+        ServiceCommand::CargoRun => Command::new("cargo")
+            .args(["run", "--quiet", "--bin", GATEWAY_BIN, "--", "--version"])
+            .output()?,
+    };
+    if !output.status.success() {
+        return Err(format!(
+            "chisei-gateway --version failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    parse_gateway_version_line(&String::from_utf8_lossy(&output.stdout)).map_err(Into::into)
+}
+
+fn parse_gateway_version_line(stdout: &str) -> Result<String, String> {
+    let line = stdout.lines().next().unwrap_or("").trim();
+    let mut parts = line.split_whitespace();
+    let name = parts.next().unwrap_or("");
+    let version = parts.next().unwrap_or("");
+    if name != GATEWAY_BIN || version.is_empty() {
+        return Err(format!(
+            "chisei-gateway --version printed {line:?}; expected `{GATEWAY_BIN} <version>`"
+        ));
+    }
+    Ok(version.to_string())
+}
+
+fn require_supported_gateway_version(installed: &str) -> Result<(), String> {
+    require_gateway_version_in_range(
+        installed,
+        MINIMUM_COMPATIBLE_GATEWAY,
+        GATEWAY_PACKAGE_VERSION,
+    )
+}
+
+fn require_gateway_version_in_range(installed: &str, min: &str, max: &str) -> Result<(), String> {
+    let got = parse_semver_triple(installed)?;
+    let lo = parse_semver_triple(min)?;
+    let hi = parse_semver_triple(max)?;
+    if got < lo || got > hi {
+        return Err(format!(
+            "chisei-gateway {installed} is outside the supported range {min}..={max}"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_semver_triple(version: &str) -> Result<(u64, u64, u64), String> {
+    let mut parts = version.split('.');
+    let major = parse_semver_part(parts.next(), version)?;
+    let minor = parse_semver_part(parts.next(), version)?;
+    let patch = parse_semver_part(parts.next(), version)?;
+    if parts.next().is_some() {
+        return Err(format!(
+            "chisei-gateway version {version} is not major.minor.patch"
+        ));
+    }
+    Ok((major, minor, patch))
+}
+
+fn parse_semver_part(part: Option<&str>, version: &str) -> Result<u64, String> {
+    part.ok_or_else(|| format!("chisei-gateway version {version} is not major.minor.patch"))?
+        .parse()
+        .map_err(|_| format!("chisei-gateway version {version} is not major.minor.patch"))
+}
+
 fn spawn_service(
     name: &str,
     envs: &[(String, String)],
@@ -1239,6 +1311,26 @@ fn parse_dotenv(contents: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_refuses_a_gateway_outside_the_supported_range() {
+        require_gateway_version_in_range("1.0.0", "1.0.0", "1.0.0").unwrap();
+        let err = require_gateway_version_in_range("0.9.0", "1.0.0", "1.0.0").unwrap_err();
+        assert!(err.contains("0.9.0"), "{err}");
+        assert!(err.contains("1.0.0"), "{err}");
+        let err = require_gateway_version_in_range("1.1.0", "1.0.0", "1.0.0").unwrap_err();
+        assert!(err.contains("1.1.0"), "{err}");
+        assert!(err.contains("1.0.0"), "{err}");
+    }
+
+    #[test]
+    fn launch_reads_the_crate_version_from_gateway_version_output() {
+        assert_eq!(
+            parse_gateway_version_line("chisei-gateway 1.0.0 (v3.1.0)\n").unwrap(),
+            "1.0.0"
+        );
+        assert!(parse_gateway_version_line("not-a-version\n").is_err());
+    }
 
     #[test]
     fn parses_launch_args() {
