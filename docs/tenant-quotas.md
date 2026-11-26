@@ -134,6 +134,11 @@ so a retried or reclaimed claim records each breach once. When the decision
 cannot be written, the claim gives its admission back and fails, and a later
 claim retries it.
 
+A run reads back with these breaches as `TransformRun.quota_breaches`, one
+`{ scope_id, metric, would }` per scope, metric and `would`, read from the
+run's decisions; no other table stores them. The list is empty when the tenant
+enforces or the run fit. Older clients ignore the field.
+
 Receipt-safe summary: `TenantQuotaReceiptNote` (own tenant id, assignment
 version, admitted metrics only).
 
@@ -146,6 +151,7 @@ version, admitted metrics only).
 | No capacity leak on complete | Concurrency release test |
 | Receipt without foreign usage | `TenantQuotaReceiptNote` |
 | Report-only admits and records each breach | Report-only admission and audit tests |
+| Report-only breach on the run | gRPC test reading `quota_breaches` back |
 
 ## Non-goals
 

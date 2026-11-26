@@ -1263,6 +1263,19 @@ message TransformRun {
   // Set while the run waits in a concurrency queue (#3044): its dispatch
   // status stays pending until a claim admits it.
   TransformRunQueue queue = 29;
+  // Each tenant quota limit a report-only claim of this run would have
+  // applied and did not (#3044, ADR 0168). Read from the run's audit
+  // decisions; empty when the tenant enforces or the run fit.
+  repeated TransformRunQuotaBreach quota_breaches = 30;
+}
+// A refusal or queue that report-only mode recorded instead of applying.
+message TransformRunQuotaBreach {
+  // The budget scope: tenant:{id} or tenant:{id}/namespace:{ns}.
+  string scope_id = 1;
+  // The quota metric, such as requests, concurrency or compute_seconds.
+  string metric = 2;
+  // What enforcing would have done: refuse or queue.
+  string would = 3;
 }
 // Why and where a pending run waits (#3044, ADR 0168).
 message TransformRunQueue {

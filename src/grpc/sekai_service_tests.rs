@@ -26796,10 +26796,9 @@ async fn an_isolated_run_larger_than_the_whole_tenant_budget_is_refused_for_good
 }
 
 #[tokio::test]
-async fn a_report_only_tenant_claims_a_run_larger_than_its_budget_and_audits_it() {
+async fn a_report_only_run_larger_than_its_budget_is_claimed_and_reads_back_its_breaches() {
     use crate::chisei::budget::PeriodType;
-    use crate::chisei::tenant_quota::{QUOTA_REPORT_ONLY_ACTION, QuotaMode, TenantQuotaLimits};
-    use crate::chisei_store::ChiseiDecisionStore;
+    use crate::chisei::tenant_quota::{QuotaMode, TenantQuotaLimits};
 
     let svc = isolated_claim_service(false);
     let gate =
@@ -26838,33 +26837,37 @@ async fn a_report_only_tenant_claims_a_run_larger_than_its_budget_and_audits_it(
         .work
         .unwrap();
     assert_eq!(claimed.transform_id, "t-iso-report");
-    let store =
-        crate::chisei_store::ChiseiStore::try_from_shared_runtime(svc.db.runtime_arc()).unwrap();
-    let recorded = store
-        .list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
-            action: Some(QUOTA_REPORT_ONLY_ACTION.into()),
-            target_id: Some(format!("transform-claim:{}", claimed.run_id)),
-            limit: 10,
-            ..Default::default()
-        })
+    // The run reads back with each breach its audit decisions recorded.
+    let run = svc
+        .get_governed_transform_run(with_tenant_admin(
+            GetGovernedTransformRunRequest {
+                run_id: claimed.run_id,
+            },
+            "tenant-a",
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .run
         .unwrap();
-    let reasons: Vec<_> = recorded
+    let breaches: Vec<_> = run
+        .quota_breaches
         .iter()
-        .map(|decision| {
+        .map(|breach| {
             (
-                decision.evidence["reason"].as_str(),
-                decision.evidence["would"].as_str(),
+                breach.scope_id.as_str(),
+                breach.metric.as_str(),
+                breach.would.as_str(),
             )
         })
         .collect();
-    assert!(
-        reasons.contains(&(
-            crate::composition::transform_run_admission::REFUSAL_LARGER_THAN_BUDGET,
-            "refuse"
-        )),
-        "{reasons:?}"
+    assert_eq!(
+        breaches,
+        [
+            ("tenant:tenant-a", "concurrency", "queue"),
+            ("tenant:tenant-a", "concurrency", "refuse"),
+        ]
     );
-    assert!(reasons.contains(&("concurrency", "queue")), "{reasons:?}");
 }
 
 #[tokio::test]

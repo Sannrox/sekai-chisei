@@ -4648,7 +4648,7 @@ fn admit_claimed_isolated_process(
         &transform_quota_gate(service.quota_runtime())?,
         owner,
         &work.namespace,
-        &claim_run_key(work),
+        &claim_run_key(&work.run_id),
         DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS,
         reclaim,
     )? {
@@ -4704,7 +4704,7 @@ fn queued_ahead(
         transform_quota_gate(service.quota_runtime())?
             .report_breaches(
                 tenant_id,
-                &claim_run_key(work),
+                &claim_run_key(&work.run_id),
                 &[crate::composition::transform_run_admission::queue_breach(
                     &scope_id,
                 )],
@@ -4817,15 +4817,16 @@ fn tenant_budget_refusal(
         .breach_larger_than_budget(&tenant.tenant_id, DEFAULT_ISOLATED_PROCESS_ESTIMATE_SECONDS)
     {
         transform_quota_gate(quota.clone())?
-            .report_breaches(&tenant.tenant_id, &claim_run_key(work), &[breach])
+            .report_breaches(&tenant.tenant_id, &claim_run_key(&work.run_id), &[breach])
             .map_err(map_quota_error)?;
     }
     Ok(None)
 }
 
-/// The quota idempotency key of a claim of `work`.
-fn claim_run_key(work: &crate::sekai::governed_transform::TransformWork) -> String {
-    format!("transform-claim:{}", work.run_id)
+/// The quota idempotency key of a claim of the run `run_id`, and the target of
+/// its report-only decisions.
+fn claim_run_key(run_id: &str) -> String {
+    format!("transform-claim:{run_id}")
 }
 
 /// Admits a transform run in `namespace` against its tenant's and its
@@ -5750,7 +5751,40 @@ fn with_run_outcome(
             position,
         });
     }
+    proto.quota_breaches = reported_quota_breaches(service, &run.run_id)?;
     Ok(proto)
+}
+
+/// The limits report-only claims of `run_id` would have applied, from the
+/// `tenant_quota_report_only` decisions they recorded (ADR 0168). Several
+/// reasons for one scope and metric read as one breach.
+fn reported_quota_breaches(
+    service: &SekaiServiceImpl,
+    run_id: &str,
+) -> Result<Vec<TransformRunQuotaBreach>, Status> {
+    let decisions = service
+        .quota_runtime()
+        .list_decisions(&crate::chisei::decision_ledger::DecisionFilter {
+            action: Some(crate::chisei::tenant_quota::QUOTA_REPORT_ONLY_ACTION.into()),
+            target_id: Some(claim_run_key(run_id)),
+            ..Default::default()
+        })
+        .map_err(Status::internal)?;
+    let breaches: std::collections::BTreeSet<_> = decisions
+        .into_iter()
+        .map(|mut decision| {
+            let mut take = |key: &str| decision.evidence.remove(key).unwrap_or_default();
+            (take("scope_id"), take("metric"), take("would"))
+        })
+        .collect();
+    Ok(breaches
+        .into_iter()
+        .map(|(scope_id, metric, would)| TransformRunQuotaBreach {
+            scope_id,
+            metric,
+            would,
+        })
+        .collect())
 }
 
 fn to_proto_transform_run(
@@ -5795,6 +5829,7 @@ fn to_proto_transform_run(
         compute_seconds: None,
         input_versions: run.input_versions.clone().into_iter().collect(),
         queue: None,
+        quota_breaches: Vec::new(),
     }
 }
 

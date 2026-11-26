@@ -61,8 +61,11 @@ The maintainer accepted the shape on 2026-11-24:
      enforcing would, so usage keeps counting and later breaches show. Each
      would-be refusal or queue, including a run larger than its whole budget
      and one behind an older held run, is one idempotent audit decision, and
-     the run is admitted. Recording it on the run itself needs a stored
-     field and a `proto/` field and is not part of 1c.
+     the run is admitted.
+   - **1d:** the breach on the run (maintainer decision, 2026-11-26). A
+     run reads back with `quota_breaches`, one `{ scope_id, metric, would }`
+     per scope, metric and `would`, read from its report-only audit
+     decisions. No table is added: the decisions are the record.
    - **2a:** budgets refuse. A claim that finds a request or token budget
      of the run's tenant or namespace spent marks the run `refused` with
      the code `quota_budget_exhausted` and the detail `metric`, through the
@@ -110,7 +113,7 @@ The maintainer accepted the shape on 2026-11-24:
   refused for good instead of waiting for the next period. From 2b the same
   holds for a compute budget, which only a new assignment sets.
 - A namespace assignment has no effect on admission until 1b.
-- Parts 1 and 2 change no `proto/`. 2b adds the hold's `reserved_compute_seconds` column,
+- Parts 1a to 1c and 2 change no `proto/`. 2b adds the hold's `reserved_compute_seconds` column,
   default zero; a hold an older plane wrote has no compute to settle. An
   older plane ignores `compute_seconds` rows and admits without them, and a
   hold it releases leaves the newer claim's reservation charged until the
@@ -128,6 +131,9 @@ The maintainer accepted the shape on 2026-11-24:
 - 1c adds the `mode` column (SQLite on open, PostgreSQL migration 189). An
   older plane ignores it and enforces a report-only tenant, which refuses or
   queues what this version would admit. Rollback leaves the column unread.
+- 1d adds `TransformRun.quota_breaches` to `proto/`. Older clients ignore
+  it, and an older plane returns it empty although the decisions exist.
+  Rollback changes no stored state.
 - Rollback leaves namespace rows that nothing reads, and refused runs stay
   refused. Held runs wait until a plane of this version claims them again;
   raise the concurrency limit and let the queue drain before rolling back.
@@ -164,6 +170,7 @@ The maintainer accepted the shape on 2026-11-24:
   concurrency limit, reserves nothing for either, and records each once; a
   run that fits reserves and records nothing.
 - Over gRPC, a report-only tenant's run larger than its whole budget is
-  claimed, and the would-be refusal and queue are audited.
+  claimed and reads back with the would-be refusal and queue in
+  `quota_breaches`.
 - A limit table without `mode` gains it on SQLite and PostgreSQL, older
   rows read as `enforce`, and a row written later enforces the tenant.
