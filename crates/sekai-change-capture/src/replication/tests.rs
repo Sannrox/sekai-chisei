@@ -254,9 +254,12 @@ fn refuses_a_transaction_that_does_not_advance() {
     assert_eq!(decoder.decode(&begin(200)), Err(DecodeError::OutOfOrder));
     assert_eq!(decoder.decode(&begin(150)), Err(DecodeError::OutOfOrder));
 
-    let mut resumed = Decoder::resuming_after(200);
+    // Resuming after that transaction's end: the next commit record may
+    // start exactly there.
+    let mut resumed = Decoder::resuming_after(208);
     assert_eq!(resumed.decode(&begin(200)), Err(DecodeError::OutOfOrder));
-    assert_eq!(resumed.decode(&begin(201)), Ok(None));
+    assert_eq!(resumed.decode(&begin(207)), Err(DecodeError::OutOfOrder));
+    assert_eq!(resumed.decode(&begin(208)), Ok(None));
 }
 
 #[test]

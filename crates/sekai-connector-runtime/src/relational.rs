@@ -628,7 +628,7 @@ fn record(
     })
 }
 
-fn digest_of(properties: &BTreeMap<String, PropertyValue>) -> String {
+pub(crate) fn digest_of(properties: &BTreeMap<String, PropertyValue>) -> String {
     let cells: BTreeMap<&str, String> = properties
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_cell()))
@@ -1040,7 +1040,7 @@ fn registered_token(value: &str) -> bool {
         && !value.contains('/')
 }
 
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.as_bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_') {

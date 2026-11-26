@@ -62,6 +62,7 @@ impl From<ConnectorFailure> for SyncFailure {
             ConnectorFailure::AuthFailed => Self::AuthFailed,
             ConnectorFailure::PermissionMissing => Self::PermissionMissing,
             ConnectorFailure::Conflict => Self::Conflict,
+            ConnectorFailure::Unavailable => Self::Unavailable,
             _ => Self::Invalid,
         }
     }
@@ -258,10 +259,11 @@ impl Connectors {
     }
 
     /// Reads one ordered change page after the plane's `committed_offset`
-    /// in `source_feed_epoch`. Blocking.
+    /// in `source_feed_epoch`, from its `committed_cursor`. Blocking.
     pub fn read_changes(
         &self,
         prepared: &Prepared,
+        committed_cursor: &str,
         source_feed_epoch: &str,
         committed_offset: u64,
         max_records: usize,
@@ -269,9 +271,12 @@ impl Connectors {
         if !prepared.connector.supports(Operation::ReadChanges) {
             return Err(SyncFailure::Unsupported);
         }
-        Ok(self
-            .open(prepared)?
-            .read_changes(source_feed_epoch, committed_offset, max_records)?)
+        Ok(self.open(prepared)?.read_changes_from(
+            committed_cursor,
+            source_feed_epoch,
+            committed_offset,
+            max_records,
+        )?)
     }
 
     /// Delivers one verified saved-export artifact through a prepared

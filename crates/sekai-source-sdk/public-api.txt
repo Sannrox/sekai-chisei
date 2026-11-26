@@ -304,6 +304,7 @@ connector::Connector::check(&mut self) -> Result<(),ConnectorFailure>
 connector::Connector::deliver(&mut self,&ExportArtifact<'_>) -> Result<(),ConnectorFailure>
 connector::Connector::discover(&mut self) -> Result<SourceDiscovery,ConnectorFailure>
 connector::Connector::read_changes(&mut self,&str,u64,usize) -> Result<ChangeFeedPage,ConnectorFailure>
+connector::Connector::read_changes_from(&mut self,&str,&str,u64,usize) -> Result<ChangeFeedPage,ConnectorFailure>
 connector::Connector::read_page(&mut self,Option<&str>,usize) -> Result<SnapshotRead,ConnectorFailure>
 connector::Connector::read_page_with_plane(&mut self,Option<&str>,usize,&mut dyn PlaneView) -> Result<SnapshotRead,ConnectorFailure>
 connector::Connector::read_snapshot_page(&mut self,Option<&str>,usize) -> Result<GenerationSnapshotPage,ConnectorFailure>
@@ -313,6 +314,7 @@ connector::ConnectorFailure::AuthFailed
 connector::ConnectorFailure::Conflict
 connector::ConnectorFailure::Invalid
 connector::ConnectorFailure::PermissionMissing
+connector::ConnectorFailure::Unavailable
 connector::ConnectorFailure::Unreachable
 connector::ConnectorFailure::Unsupported
 connector::ConnectorType

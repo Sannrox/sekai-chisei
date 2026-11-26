@@ -13,6 +13,7 @@
 //! holds on this host; the runtime offers change capture only where it
 //! passes, and never off Linux.
 
+use std::io::BufRead;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -22,13 +23,13 @@ use std::time::Duration;
 use sekai_source_sdk::{Destination, EgressAllowlist};
 use serde::Deserialize;
 
-use crate::child::{self, Bounds, ChildError, Finished};
+use crate::child::{self, Bounds, ChildError, Finished, Streamed};
 
 /// The child executable's name, installed beside the runtime's.
 pub const CAPTURE_CHILD_NAME: &str = "sekai-change-capture";
 
 /// The child's exit status when the host cannot apply its sandbox.
-const EXIT_UNAVAILABLE: i32 = 3;
+pub(crate) const EXIT_UNAVAILABLE: i32 = 3;
 /// The most a self-test may write: a short JSON report.
 const MAX_SELF_TEST_OUTPUT: u64 = 64 * 1024;
 const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -75,7 +76,17 @@ pub struct CaptureChild {
 impl CaptureChild {
     /// The child installed beside this runtime, if there is one.
     pub fn beside_runtime() -> Option<Self> {
-        child::beside_runtime(CAPTURE_CHILD_NAME).map(|path| Self { path })
+        child::beside_runtime(CAPTURE_CHILD_NAME).map(Self::at)
+    }
+
+    /// The child executable at `path`.
+    pub fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// The child's own executable, which its sandbox must keep readable.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Runs the child's self-test over a loopback connection with a
@@ -113,15 +124,33 @@ impl CaptureChild {
         start: &[u8],
         timeout: Duration,
     ) -> Result<Finished, ChildError> {
-        let fd = socket.as_raw_fd();
-        let mut command = Command::new(&self.path);
-        command.args([mode, "--socket-fd", &fd.to_string()]);
-        child::inherit_fd(&mut command, fd);
         let bounds = Bounds {
             timeout,
             max_output: MAX_SELF_TEST_OUTPUT,
         };
-        child::run_bounded(command, start, bounds)
+        child::run_bounded(self.command(mode, socket), start, bounds)
+    }
+
+    /// Starts the child in `mode` over `socket` with `start` on stdin, and
+    /// hands its output lines to `read` as they arrive, within `timeout`
+    /// ([`child::run_streaming`]).
+    pub(crate) fn stream<T: Send>(
+        &self,
+        mode: &str,
+        socket: &TcpStream,
+        start: &[u8],
+        timeout: Duration,
+        read: impl FnOnce(&mut dyn BufRead) -> T + Send,
+    ) -> Result<Streamed<T>, ChildError> {
+        child::run_streaming(self.command(mode, socket), start, timeout, read)
+    }
+
+    fn command(&self, mode: &str, socket: &TcpStream) -> Command {
+        let fd = socket.as_raw_fd();
+        let mut command = Command::new(&self.path);
+        command.args([mode, "--socket-fd", &fd.to_string()]);
+        child::inherit_fd(&mut command, fd);
+        command
     }
 }
 

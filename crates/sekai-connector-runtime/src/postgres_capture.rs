@@ -1,0 +1,932 @@
+//! The `postgres_capture` connector type (ADR 0170): `check` and ordered
+//! change pages through the sandboxed change-capture child of [`capture`].
+//!
+//! Every operation dials the Source's `endpoint` after the egress check
+//! ([`capture::connect_admitted`]) and starts one child over that socket,
+//! with the Source's `password` once in its start message. The child reads
+//! one bounded page from the Source's replication slot and writes JSON
+//! lines; this module turns them into records of the Source's
+//! `record_kind`, numbered from the plane's committed offset.
+//!
+//! The source position lives only in the plane's cursor (ADR 0118):
+//! `pg1/<lsn>` is the end of the last transaction the plane holds whole,
+//! and `pg1/<lsn>/<commit>/<index>` adds that it also holds the changes
+//! before `index` of the transaction committing at `commit`, when a
+//! transaction did not fit one page. The child streams only committed
+//! transactions, so a page may end inside one; the next page streams that
+//! transaction again from `lsn` and skips what the plane holds. The child
+//! confirms to the server only `lsn`, so a restarted child, or another
+//! runtime after a takeover, resumes from the committed cursor without
+//! duplicates or gaps.
+//!
+//! The publication carries one table, whose replica identity is its key.
+//! Each change is one record whose `external_id` is the key's values in
+//! column-name order, percent-encoded and joined by `~`; properties are
+//! the row's non-null text values, without columns whose names suggest a
+//! secret. A delete is a tombstone, and an update that changes the key is
+//! a tombstone of the old key and the row under the new one. Fail closed,
+//! as `invalid`: a truncate, an update that leaves a large value out of
+//! the stream (`unchanged`), a row of another table, a key that is
+//! missing, null or empty, and any line the child should not write.
+//!
+//! Supervision: a child that dies, overruns its deadline, or finds the
+//! slot still held by the previous child is restarted with backoff, three
+//! times at most, before the run fails as `unavailable` (or
+//! `unreachable`). A host whose sandbox cannot apply fails `unavailable`
+//! at once. Refusals map onto the Source's health by name: a refused
+//! password is `auth_failed`, a role without replication permission
+//! `permission_missing`, and every other refusal `invalid`, including a
+//! certificate that does not verify and a slot gone or ahead of the
+//! cursor. Nothing here offers the type yet; the snapshot lands first.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::io::{BufRead, Read};
+use std::path::Path;
+use std::time::Duration;
+
+use sekai_source_sdk::{
+    ChangeFeedPage, ConfigValue, Connector, ConnectorFailure, Destination, EgressAllowlist,
+    PropertyValue, SourceRecord, column_name_suggests_sensitive,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::capture::{self, CaptureChild, ConnectRefused, EXIT_UNAVAILABLE};
+use crate::child::{ChildError, Streamed};
+use crate::credentials::Secret;
+use crate::relational::{digest_of, percent_encode};
+use crate::rest::now_ms;
+use crate::sync::Prepared;
+
+/// The PostgreSQL port an endpoint without one connects to.
+const DEFAULT_PORT: u16 = 5432;
+
+/// How long one child run may take. The child stops a page once the
+/// stream idles, well inside this.
+const RUN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The waits before each restart of a child that died.
+const RESTARTS: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+
+/// The longest line the child writes, newline included.
+const MAX_LINE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Paths the child reads under its sandbox besides its own executable:
+/// the usual system trust roots.
+const TRUST_ROOTS: [&str; 3] = ["/etc/ssl", "/usr/lib/ssl", "/etc/pki"];
+
+/// What every capture Source of this runtime shares: the installed child
+/// and the operator's CA (PEM), trusted beside the system roots.
+#[derive(Debug, Clone)]
+pub struct Capture {
+    child: CaptureChild,
+    ca_pem: Option<String>,
+}
+
+impl Capture {
+    pub fn new(child: CaptureChild, ca_pem: Option<String>) -> Self {
+        Self { child, ca_pem }
+    }
+}
+
+/// Opens the type for a prepared Source; register it with
+/// `Connectors::with(&POSTGRES_CAPTURE_CONNECTOR, move |prepared| postgres_capture::open(prepared, &capture))`.
+pub fn open(
+    prepared: &Prepared,
+    capture: &Capture,
+) -> Result<Box<dyn Connector + Send>, ConnectorFailure> {
+    let text = |name: &str| match prepared.config.get(name) {
+        Some(ConfigValue::Text(value)) if !value.is_empty() => Ok(value.clone()),
+        _ => Err(ConnectorFailure::Invalid),
+    };
+    let mut endpoint = Destination::parse(&text("endpoint")?).ok_or(ConnectorFailure::Invalid)?;
+    endpoint.port = Some(endpoint.port.unwrap_or(DEFAULT_PORT));
+    let password = prepared
+        .credentials
+        .get("password")
+        .ok_or(ConnectorFailure::AuthFailed)?
+        .clone();
+    Ok(Box::new(PostgresCapture {
+        child: capture.child.clone(),
+        settings: Settings {
+            server_name: endpoint.host.clone(),
+            user: text("user")?,
+            database: text("database")?,
+            ca_pem: capture.ca_pem.clone(),
+            slot: text("slot")?,
+            publication: text("publication")?,
+            resume_lsn: 0,
+            max_commits: 0,
+        },
+        endpoint,
+        egress: prepared.egress.clone(),
+        password,
+        record_kind: text("record_kind")?,
+    }))
+}
+
+struct PostgresCapture {
+    child: CaptureChild,
+    endpoint: Destination,
+    egress: EgressAllowlist,
+    password: Secret,
+    settings: Settings,
+    record_kind: String,
+}
+
+/// The PostgreSQL part of the child's start message.
+#[derive(Debug, Clone, Serialize)]
+struct Settings {
+    server_name: String,
+    user: String,
+    database: String,
+    ca_pem: Option<String>,
+    slot: String,
+    publication: String,
+    resume_lsn: u64,
+    max_commits: u32,
+}
+
+impl Connector for PostgresCapture {
+    fn check(&mut self) -> Result<(), ConnectorFailure> {
+        self.supervised("check", &self.settings, |out| match next_line(out) {
+            Next::Line(Line::Checked) => Outcome::Done(()),
+            Next::Line(other) => other.outcome(),
+            Next::End => Outcome::Ended(None),
+            Next::Invalid => Outcome::Invalid,
+        })
+    }
+
+    fn read_changes_from(
+        &mut self,
+        committed_cursor: &str,
+        _source_feed_epoch: &str,
+        committed_offset: u64,
+        max_records: usize,
+    ) -> Result<ChangeFeedPage, ConnectorFailure> {
+        let from = Cursor::parse(committed_cursor).ok_or(ConnectorFailure::Invalid)?;
+        if max_records == 0 {
+            return Err(ConnectorFailure::Invalid);
+        }
+        let settings = Settings {
+            resume_lsn: from.lsn,
+            // Every transaction carries a change of the one table.
+            max_commits: u32::try_from(max_records).unwrap_or(u32::MAX),
+            ..self.settings.clone()
+        };
+        let reading = Reading {
+            from,
+            offset: committed_offset,
+            max_records,
+            record_kind: &self.record_kind,
+            now_ms: now_ms(),
+        };
+        let page = self.supervised("changes", &settings, |out| reading.read(out))?;
+        Ok(ChangeFeedPage {
+            offset_start: committed_offset,
+            records: page.records,
+            proposed_next_cursor: page.next.to_string(),
+            collected_at_ms: reading.now_ms,
+            caught_up: page.caught_up,
+        })
+    }
+}
+
+impl PostgresCapture {
+    /// Runs the child in `mode` until `read` concludes, restarting a child
+    /// that died with [`RESTARTS`] backoff.
+    fn supervised<T: Send>(
+        &self,
+        mode: &str,
+        settings: &Settings,
+        read: impl Fn(&mut dyn BufRead) -> Outcome<T> + Sync,
+    ) -> Result<T, ConnectorFailure> {
+        let start = serde_json::json!({
+            "credential": self.password.expose(),
+            "read_paths": self.read_paths(),
+            "postgres": settings,
+        })
+        .to_string()
+        .into_bytes();
+        let mut waits = RESTARTS.iter();
+        loop {
+            match self.attempt(mode, &start, &read) {
+                Attempt::Done(value) => return Ok(value),
+                Attempt::Failed(failure) => return Err(failure),
+                Attempt::Died(failure) => match waits.next() {
+                    Some(wait) => std::thread::sleep(*wait),
+                    None => return Err(failure),
+                },
+            }
+        }
+    }
+
+    fn attempt<T: Send>(
+        &self,
+        mode: &str,
+        start: &[u8],
+        read: &(impl Fn(&mut dyn BufRead) -> Outcome<T> + Sync),
+    ) -> Attempt<T> {
+        let socket = match capture::connect_admitted(&self.endpoint, &self.egress) {
+            Ok(socket) => socket,
+            Err(ConnectRefused::Egress) => return Attempt::Failed(ConnectorFailure::Invalid),
+            Err(ConnectRefused::Unreachable) => {
+                return Attempt::Died(ConnectorFailure::Unreachable);
+            }
+        };
+        match self.child.stream(mode, &socket, start, RUN_TIMEOUT, read) {
+            Ok(Streamed { status, read }) => {
+                let code = status.and_then(|status| status.code());
+                read.settle(code)
+            }
+            Err(ChildError::Spawn) => Attempt::Failed(ConnectorFailure::Unavailable),
+            Err(ChildError::Overran) => Attempt::Died(ConnectorFailure::Unavailable),
+        }
+    }
+
+    fn read_paths(&self) -> Vec<&Path> {
+        std::iter::once(self.child.path())
+            .chain(TRUST_ROOTS.iter().map(Path::new))
+            .collect()
+    }
+}
+
+/// One child run's result.
+enum Attempt<T> {
+    Done(T),
+    /// Final: restarting would not help.
+    Failed(ConnectorFailure),
+    /// The child died or was turned away for now; restart it, or fail
+    /// with this once the restarts are spent.
+    Died(ConnectorFailure),
+}
+
+/// What a reader made of the child's output.
+#[derive(Debug, PartialEq)]
+enum Outcome<T> {
+    /// The reader has what it needs, whatever the child does next.
+    Done(T),
+    Refused(String),
+    /// The host cannot apply the child's sandbox.
+    Unavailable,
+    /// The output ended. `Some` is complete if the child exited cleanly.
+    Ended(Option<T>),
+    Invalid,
+}
+
+impl<T> Outcome<T> {
+    /// The run's result, given the child's exit code (`None` when it was
+    /// stopped or killed by a signal).
+    fn settle(self, code: Option<i32>) -> Attempt<T> {
+        match self {
+            Self::Done(value) => Attempt::Done(value),
+            Self::Ended(Some(value)) if code == Some(0) => Attempt::Done(value),
+            Self::Unavailable => Attempt::Failed(ConnectorFailure::Unavailable),
+            Self::Ended(_) if code == Some(EXIT_UNAVAILABLE) => {
+                Attempt::Failed(ConnectorFailure::Unavailable)
+            }
+            Self::Ended(_) => Attempt::Died(ConnectorFailure::Unavailable),
+            Self::Refused(reason) => refused(&reason),
+            Self::Invalid => Attempt::Failed(ConnectorFailure::Invalid),
+        }
+    }
+}
+
+/// A refusal the child named, as the Source's health records it.
+fn refused<T>(reason: &str) -> Attempt<T> {
+    match reason {
+        "auth_failed" | "auth_method_unsupported" => Attempt::Failed(ConnectorFailure::AuthFailed),
+        "replication_permission_missing" => Attempt::Failed(ConnectorFailure::PermissionMissing),
+        "connection_closed" => Attempt::Died(ConnectorFailure::Unreachable),
+        // The previous child's session still holds the slot, or another
+        // runtime created it a moment ago.
+        "slot_in_use" | "slot_conflict" => Attempt::Died(ConnectorFailure::Unavailable),
+        _ => Attempt::Failed(ConnectorFailure::Invalid),
+    }
+}
+
+/// One line the child writes, as far as the runtime reads it.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Line {
+    Change {
+        commit_lsn: u64,
+        index: u32,
+        relation: String,
+        op: Op,
+        key: BTreeMap<String, Option<String>>,
+        row: BTreeMap<String, Option<String>>,
+        unchanged: Vec<String>,
+    },
+    Truncate {},
+    Commit {
+        end_lsn: u64,
+    },
+    SlotCreated {},
+    CaughtUp {},
+    Checked,
+    Refused {
+        reason: String,
+    },
+    Unavailable {},
+}
+
+impl Line {
+    /// The outcome of a line that ends a reader that did not expect it.
+    fn outcome<T>(self) -> Outcome<T> {
+        match self {
+            Self::Refused { reason } => Outcome::Refused(reason),
+            Self::Unavailable {} => Outcome::Unavailable,
+            _ => Outcome::Invalid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Op {
+    Insert,
+    Update,
+    Delete,
+}
+
+enum Next {
+    Line(Line),
+    End,
+    Invalid,
+}
+
+/// The next whole line. A line cut short by the end of the output is the
+/// end: the child died writing it.
+fn next_line(out: &mut dyn BufRead) -> Next {
+    let mut line = Vec::new();
+    match (&mut *out)
+        .take(MAX_LINE_BYTES)
+        .read_until(b'\n', &mut line)
+    {
+        Ok(0) => Next::End,
+        Ok(_) if line.last() == Some(&b'\n') => serde_json::from_slice(&line)
+            .map(Next::Line)
+            .unwrap_or(Next::Invalid),
+        Ok(_) if line.len() as u64 == MAX_LINE_BYTES => Next::Invalid,
+        Ok(_) => Next::End,
+        Err(_) => Next::End,
+    }
+}
+
+/// The feed position in the plane's cursor; see the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cursor {
+    /// The end of the last transaction the plane holds whole.
+    lsn: u64,
+    /// The transaction after it that the plane holds in part: its commit
+    /// position and the index of its first change the plane lacks.
+    within: Option<(u64, u32)>,
+}
+
+impl Cursor {
+    fn parse(text: &str) -> Option<Self> {
+        let mut parts = text.strip_prefix("pg1/")?.split('/');
+        let lsn = parts.next()?.parse().ok().filter(|lsn| *lsn > 0)?;
+        let within = match (parts.next(), parts.next(), parts.next()) {
+            (None, _, _) => None,
+            (Some(commit), Some(index), None) => Some((commit.parse().ok()?, index.parse().ok()?)),
+            _ => return None,
+        };
+        // A transaction the plane holds in part commits after `lsn`.
+        within
+            .is_none_or(|(commit, _)| commit >= lsn)
+            .then_some(Self { lsn, within })
+    }
+}
+
+impl fmt::Display for Cursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "pg1/{}", self.lsn)?;
+        if let Some((commit, index)) = self.within {
+            write!(formatter, "/{commit}/{index}")?;
+        }
+        Ok(())
+    }
+}
+
+/// One change page as read.
+#[derive(Debug, PartialEq)]
+struct Page {
+    records: Vec<SourceRecord>,
+    next: Cursor,
+    caught_up: bool,
+}
+
+/// What one change page reads after the plane's state.
+struct Reading<'a> {
+    from: Cursor,
+    offset: u64,
+    max_records: usize,
+    record_kind: &'a str,
+    now_ms: i64,
+}
+
+impl Reading<'_> {
+    /// Reads the child's lines into one page: whole transactions while
+    /// they fit, then the changes of the next one that fit.
+    fn read(&self, out: &mut dyn BufRead) -> Outcome<Page> {
+        let mut page = Page {
+            records: Vec::new(),
+            next: Cursor {
+                lsn: self.from.lsn,
+                within: None,
+            },
+            caught_up: false,
+        };
+        // The one table's name, from its first change.
+        let mut table: Option<String> = None;
+        // Whether the first transaction read has been checked against the
+        // one the cursor holds in part.
+        let mut first = true;
+        loop {
+            let line = match next_line(out) {
+                Next::Line(line) => line,
+                // The child stops on its own after `max_commits`.
+                Next::End => return Outcome::Ended(Some(page)),
+                Next::Invalid => return Outcome::Invalid,
+            };
+            match line {
+                Line::Change {
+                    commit_lsn,
+                    index,
+                    relation,
+                    op,
+                    key,
+                    row,
+                    unchanged,
+                } => {
+                    if first {
+                        first = false;
+                        if self
+                            .from
+                            .within
+                            .is_some_and(|(commit, _)| commit != commit_lsn)
+                        {
+                            return Outcome::Invalid;
+                        }
+                    }
+                    if self
+                        .from
+                        .within
+                        .is_some_and(|(commit, next)| commit == commit_lsn && index < next)
+                    {
+                        continue;
+                    }
+                    if table.get_or_insert_with(|| relation.clone()) != &relation
+                        || !unchanged.is_empty()
+                    {
+                        return Outcome::Invalid;
+                    }
+                    let version = format!("{commit_lsn}.{index}");
+                    let Some(records) = self.records(op, &key, &row, &version) else {
+                        return Outcome::Invalid;
+                    };
+                    if page.records.len() + records.len() > self.max_records {
+                        if page.records.is_empty() {
+                            return Outcome::Invalid;
+                        }
+                        page.next.within = Some((commit_lsn, index));
+                        return Outcome::Done(page);
+                    }
+                    for mut record in records {
+                        record.source_sequence = Some(self.offset + page.records.len() as u64 + 1);
+                        page.records.push(record);
+                    }
+                }
+                Line::Commit { end_lsn } => {
+                    first = false;
+                    page.next = Cursor {
+                        lsn: end_lsn,
+                        within: None,
+                    };
+                    if page.records.len() == self.max_records {
+                        return Outcome::Done(page);
+                    }
+                }
+                // The transaction the cursor is inside must come first.
+                Line::CaughtUp {} if first && self.from.within.is_some() => {
+                    return Outcome::Invalid;
+                }
+                Line::CaughtUp {} => {
+                    page.caught_up = true;
+                    return Outcome::Done(page);
+                }
+                other => return other.outcome(),
+            }
+        }
+    }
+
+    /// The records one change makes; `None` when it cannot be one.
+    fn records(
+        &self,
+        op: Op,
+        key: &BTreeMap<String, Option<String>>,
+        row: &BTreeMap<String, Option<String>>,
+        version: &str,
+    ) -> Option<Vec<SourceRecord>> {
+        let old = external_id(key.iter().map(|(column, value)| (column, value.as_deref())))?;
+        if op == Op::Delete {
+            return Some(vec![self.record(old, version, BTreeMap::new(), true)]);
+        }
+        let new = external_id(
+            key.keys()
+                .map(|column| (column, row.get(column).and_then(Option::as_deref))),
+        )?;
+        let properties = row
+            .iter()
+            .filter(|(column, _)| !column_name_suggests_sensitive(column))
+            .filter_map(|(column, value)| {
+                Some((column.clone(), PropertyValue::String(value.clone()?)))
+            })
+            .collect();
+        let upsert = self.record(new.clone(), version, properties, false);
+        Some(if new == old {
+            vec![upsert]
+        } else {
+            vec![self.record(old, version, BTreeMap::new(), true), upsert]
+        })
+    }
+
+    fn record(
+        &self,
+        external_id: String,
+        version: &str,
+        properties: BTreeMap<String, PropertyValue>,
+        deleted: bool,
+    ) -> SourceRecord {
+        SourceRecord {
+            source: String::new(),
+            source_instance: String::new(),
+            display_name: external_id.clone(),
+            external_id,
+            source_version: version.to_owned(),
+            type_name: self.record_kind.to_owned(),
+            payload_digest: digest_of(&properties),
+            properties,
+            deleted,
+            observed_at_ms: self.now_ms,
+            source_sequence: None,
+            payload: None,
+            object_key: None,
+        }
+    }
+}
+
+/// The key's values in column order, percent-encoded and joined by `~`;
+/// `None` when there is no key or a value is null or empty.
+fn external_id<'a>(
+    key: impl ExactSizeIterator<Item = (&'a String, Option<&'a str>)>,
+) -> Option<String> {
+    if key.len() == 0 {
+        return None;
+    }
+    key.map(|(_, value)| value.filter(|value| !value.is_empty()).map(percent_encode))
+        .collect::<Option<Vec<_>>>()
+        .map(|parts| parts.join("~"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    const ITEMS: &str = "public.items";
+
+    fn reading(from: &str, offset: u64, max_records: usize) -> Reading<'static> {
+        Reading {
+            from: Cursor::parse(from).unwrap(),
+            offset,
+            max_records,
+            record_kind: "Item",
+            now_ms: 1,
+        }
+    }
+
+    fn change(commit: u64, index: u32, op: &str, id: &str, name: Option<&str>) -> String {
+        serde_json::json!({
+            "kind": "change", "commit_lsn": commit, "index": index, "relation": ITEMS,
+            "op": op, "key": { "id": id },
+            "row": if op == "delete" { serde_json::json!({}) } else { serde_json::json!({ "id": id, "name": name }) },
+            "unchanged": [],
+        })
+        .to_string()
+    }
+
+    fn commit(commit: u64, end: u64) -> String {
+        serde_json::json!({ "kind": "commit", "commit_lsn": commit, "end_lsn": end }).to_string()
+    }
+
+    const CAUGHT_UP: &str = r#"{"kind":"caught_up","wal_end":900}"#;
+
+    fn read(reading: &Reading<'_>, lines: &[String]) -> Outcome<Page> {
+        let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        reading.read(&mut text.as_bytes())
+    }
+
+    fn ids(page: &Page) -> Vec<(String, Option<u64>, bool)> {
+        page.records
+            .iter()
+            .map(|record| {
+                (
+                    record.external_id.clone(),
+                    record.source_sequence,
+                    record.deleted,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cursors_carry_the_last_whole_transaction_and_a_part_of_the_next() {
+        for text in ["pg1/208", "pg1/208/300/2"] {
+            assert_eq!(Cursor::parse(text).unwrap().to_string(), text);
+        }
+        for text in [
+            "",
+            "pg1/0",
+            "pg1/x",
+            "pg2/1",
+            "pg1/208/300",
+            "pg1/208/100/1",
+            "pg1/1/2/3/4",
+        ] {
+            assert_eq!(Cursor::parse(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn whole_transactions_are_numbered_from_the_offset_until_caught_up() {
+        let lines = [
+            change(300, 0, "insert", "1", Some("a")),
+            change(300, 1, "insert", "a/b", None),
+            commit(300, 308),
+            change(400, 0, "update", "1", Some("b")),
+            change(400, 1, "delete", "a/b", None),
+            commit(400, 408),
+            CAUGHT_UP.to_owned(),
+        ];
+        let Outcome::Done(page) = read(&reading("pg1/208", 9, 10), &lines) else {
+            panic!();
+        };
+        assert_eq!(
+            ids(&page),
+            [
+                ("1".into(), Some(10), false),
+                ("a%2Fb".into(), Some(11), false),
+                ("1".into(), Some(12), false),
+                ("a%2Fb".into(), Some(13), true),
+            ]
+        );
+        assert!(page.caught_up);
+        assert_eq!(page.next.to_string(), "pg1/408");
+        let updated = &page.records[2];
+        assert_eq!(updated.source_version, "400.0");
+        assert_eq!(updated.type_name, "Item");
+        assert_eq!(
+            updated.properties.get("name"),
+            Some(&PropertyValue::String("b".into()))
+        );
+        assert!(
+            !page.records[1].properties.contains_key("name"),
+            "a null is no property"
+        );
+    }
+
+    /// A transaction larger than a page is delivered in parts: the cursor
+    /// keeps the last whole end and where the next page goes on inside it.
+    #[test]
+    fn a_transaction_over_a_page_resumes_inside_it_without_repeats() {
+        let big = [
+            change(300, 0, "insert", "1", Some("a")),
+            change(300, 1, "insert", "2", Some("a")),
+            change(300, 2, "insert", "3", Some("a")),
+            commit(300, 308),
+            CAUGHT_UP.to_owned(),
+        ];
+        let Outcome::Done(first) = read(&reading("pg1/208", 0, 2), &big) else {
+            panic!();
+        };
+        assert_eq!(first.records.len(), 2);
+        assert!(!first.caught_up);
+        assert_eq!(first.next.to_string(), "pg1/208/300/2");
+
+        let Outcome::Done(rest) = read(&reading(&first.next.to_string(), 2, 2), &big) else {
+            panic!();
+        };
+        assert_eq!(ids(&rest), [("3".into(), Some(3), false)]);
+        assert_eq!(rest.next.to_string(), "pg1/308");
+
+        // The stream must start with the transaction the cursor is inside.
+        let other = [change(500, 0, "insert", "9", None), commit(500, 508)];
+        assert_eq!(
+            read(&reading("pg1/208/300/2", 2, 2), &other),
+            Outcome::Invalid
+        );
+    }
+
+    #[test]
+    fn a_changed_key_is_a_tombstone_and_the_row_under_its_new_key() {
+        let moved = serde_json::json!({
+            "kind": "change", "commit_lsn": 300, "index": 0, "relation": ITEMS, "op": "update",
+            "key": { "id": "1" }, "row": { "id": "2", "name": "a" }, "unchanged": [],
+        })
+        .to_string();
+        let Outcome::Done(page) = read(
+            &reading("pg1/208", 0, 10),
+            &[moved, commit(300, 308), CAUGHT_UP.into()],
+        ) else {
+            panic!();
+        };
+        assert_eq!(
+            ids(&page),
+            [("1".into(), Some(1), true), ("2".into(), Some(2), false)]
+        );
+    }
+
+    #[test]
+    fn what_cannot_be_a_record_fails_closed() {
+        let line = |change: serde_json::Value| vec![change.to_string(), commit(300, 308)];
+        let base = serde_json::json!({
+            "kind": "change", "commit_lsn": 300, "index": 0, "relation": ITEMS, "op": "update",
+            "key": { "id": "1" }, "row": { "id": "1" }, "unchanged": [],
+        });
+        let with = |field: &str, value: serde_json::Value| {
+            let mut change = base.clone();
+            change[field] = value;
+            line(change)
+        };
+        for lines in [
+            with("unchanged", serde_json::json!(["blob"])),
+            with("key", serde_json::json!({})),
+            with("key", serde_json::json!({ "id": null })),
+            with("key", serde_json::json!({ "id": "" })),
+            vec![
+                change(300, 0, "insert", "1", None),
+                with("relation", serde_json::json!("public.other")).remove(0),
+            ],
+            vec![r#"{"kind":"truncate","commit_lsn":300,"index":0,"relations":[]}"#.into()],
+            vec![r#"{"kind":"slot_created","consistent_lsn":1}"#.into()],
+            vec!["not json".into()],
+        ] {
+            assert_eq!(
+                read(&reading("pg1/208", 0, 10), &lines),
+                Outcome::Invalid,
+                "{lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_output_cut_short_is_complete_only_when_the_child_exits_cleanly() {
+        let lines = [change(300, 0, "insert", "1", None), commit(300, 308)];
+        let Outcome::Ended(Some(page)) = read(&reading("pg1/208", 0, 10), &lines) else {
+            panic!();
+        };
+        assert_eq!(page.next.to_string(), "pg1/308");
+        let ended = || read(&reading("pg1/208", 0, 10), &lines);
+        assert!(matches!(ended().settle(Some(0)), Attempt::Done(_)));
+        assert!(matches!(
+            ended().settle(None),
+            Attempt::Died(ConnectorFailure::Unavailable)
+        ));
+        assert!(matches!(
+            ended().settle(Some(EXIT_UNAVAILABLE)),
+            Attempt::Failed(ConnectorFailure::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn named_refusals_map_onto_the_sources_health() {
+        for (reason, failure, restart) in [
+            ("auth_failed", ConnectorFailure::AuthFailed, false),
+            (
+                "replication_permission_missing",
+                ConnectorFailure::PermissionMissing,
+                false,
+            ),
+            ("tls_handshake_failed", ConnectorFailure::Invalid, false),
+            ("slot_ahead", ConnectorFailure::Invalid, false),
+            ("retention_lost", ConnectorFailure::Invalid, false),
+            ("slot_in_use", ConnectorFailure::Unavailable, true),
+            ("connection_closed", ConnectorFailure::Unreachable, true),
+        ] {
+            match refused::<()>(reason) {
+                Attempt::Failed(found) if !restart => assert_eq!(found, failure, "{reason}"),
+                Attempt::Died(found) if restart => assert_eq!(found, failure, "{reason}"),
+                _ => panic!("{reason}"),
+            }
+        }
+    }
+
+    /// A stand-in child: it counts its runs in a file beside it, checks it
+    /// got the start message, and behaves as `$1` asks.
+    const STAND_IN: &str = r#"#!/bin/bash
+here="$(dirname "$0")"
+start="$(cat)"
+case "$start" in *'"resume_lsn":208'*) ;; *) exit 9 ;; esac
+case "$start" in *'"max_commits":10'*) ;; *) exit 9 ;; esac
+runs=$(( $(cat "$here/runs" 2>/dev/null || echo 0) + 1 ))
+echo "$runs" > "$here/runs"
+case "$(cat "$here/mode")" in
+  dies-once) [ "$runs" = 1 ] && kill -9 $$ ;;
+  dies) kill -9 $$ ;;
+  unavailable) echo '{"kind":"unavailable","reason":"landlock"}'; exit 3 ;;
+  refused) echo '{"kind":"refused","reason":"auth_failed"}'; exit 4 ;;
+esac
+echo '{"kind":"change","commit_lsn":300,"index":0,"relation":"public.items","op":"insert","key":{"id":"1"},"row":{"id":"1"},"unchanged":[]}'
+echo '{"kind":"commit","commit_lsn":300,"end_lsn":308}'
+echo '{"kind":"caught_up","wal_end":308}'
+"#;
+
+    /// The stand-in child as a Source's capture, dialing a listener whose
+    /// connections queue in its backlog while it lives.
+    fn stand_in(directory: &Path, mode: &str) -> (PostgresCapture, std::net::TcpListener) {
+        let path = directory.join(capture::CAPTURE_CHILD_NAME);
+        std::fs::write(&path, STAND_IN).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(directory.join("mode"), mode).unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let capture = PostgresCapture {
+            child: CaptureChild::at(path),
+            endpoint: Destination::parse(&format!("127.0.0.1:{port}")).unwrap(),
+            egress: EgressAllowlist::parse(&["127.0.0.1"]).unwrap(),
+            password: Secret(format!("value-{}", std::process::id())),
+            settings: Settings {
+                server_name: "127.0.0.1".into(),
+                user: "u".into(),
+                database: "d".into(),
+                ca_pem: None,
+                slot: "s".into(),
+                publication: "p".into(),
+                resume_lsn: 0,
+                max_commits: 0,
+            },
+            record_kind: "Item".into(),
+        };
+        (capture, listener)
+    }
+
+    fn runs(directory: &Path) -> String {
+        std::fs::read_to_string(directory.join("runs"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
+    }
+
+    #[test]
+    fn a_child_that_dies_is_restarted_and_one_that_keeps_dying_is_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut capture, _listener) = stand_in(directory.path(), "dies-once");
+        let page = capture.read_changes_from("pg1/208", "e", 4, 10).unwrap();
+        assert_eq!(runs(directory.path()), "2");
+        assert_eq!(page.offset_start, 4);
+        assert_eq!(page.records[0].source_sequence, Some(5));
+        assert_eq!(page.proposed_next_cursor, "pg1/308");
+        assert!(page.caught_up);
+
+        let directory = tempfile::tempdir().unwrap();
+        let (mut capture, _listener) = stand_in(directory.path(), "dies");
+        assert_eq!(
+            capture.read_changes_from("pg1/208", "e", 4, 10),
+            Err(ConnectorFailure::Unavailable)
+        );
+        assert_eq!(runs(directory.path()), (RESTARTS.len() + 1).to_string());
+    }
+
+    #[test]
+    fn a_sandbox_that_cannot_apply_or_a_refusal_is_not_restarted() {
+        for (mode, failure) in [
+            ("unavailable", ConnectorFailure::Unavailable),
+            ("refused", ConnectorFailure::AuthFailed),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut capture, _listener) = stand_in(directory.path(), mode);
+            assert_eq!(
+                capture.read_changes_from("pg1/208", "e", 0, 10),
+                Err(failure)
+            );
+            assert_eq!(runs(directory.path()), "1", "{mode}");
+        }
+    }
+
+    #[test]
+    fn a_destination_outside_the_allowlist_starts_no_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut capture, _listener) = stand_in(directory.path(), "ok");
+        capture.egress = EgressAllowlist::parse(&["127.0.0.2"]).unwrap();
+        assert_eq!(capture.check(), Err(ConnectorFailure::Invalid));
+        assert_eq!(runs(directory.path()), "");
+    }
+}

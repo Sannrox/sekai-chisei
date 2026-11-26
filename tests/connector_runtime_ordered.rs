@@ -42,6 +42,7 @@ fn spec() -> SourceSpec {
             ("user".into(), text("capture")),
             ("slot".into(), text("sekai_orders")),
             ("publication".into(), text("sekai_orders")),
+            ("record_kind".into(), text("Order")),
             ("type_digest".into(), text(&descriptor().digest)),
         ]),
         credential_ref: "ops/db".into(),

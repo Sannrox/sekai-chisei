@@ -19,7 +19,8 @@
 //! and [`object_storage`] (rows of the objects under one bucket prefix,
 //! mirrored against the plane's live records: sync).
 //! Change capture starts the sandboxed child of [`capture`] over a
-//! connection the runtime dialed (Linux only).
+//! connection the runtime dialed (Linux only); [`postgres_capture`] reads
+//! its change pages.
 //! Given a gateway route, it also runs the row-wise model steps of
 //! `llm-rows` transforms ([`llm_rows`]).
 
@@ -37,6 +38,8 @@ pub mod llm_rows;
 pub mod object_storage;
 mod ordered;
 pub mod pages;
+#[cfg(unix)]
+pub mod postgres_capture;
 pub mod relational;
 pub mod rest;
 pub mod runtime;
