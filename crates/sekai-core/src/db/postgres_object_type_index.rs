@@ -271,12 +271,17 @@ impl PostgresDb {
                 after_id = 0;
             }
         }
+        // The join follows this apply key by key only when it is complete for
+        // the current generation. Clearing readiness below fences that: a
+        // crash before the join commits leaves it not ready, and the next
+        // apply rebuilds it whole.
+        let join_follows = !full_rebuild && self.join_current(namespace, kind)?;
         self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
         let mut rewritten = 0i32;
         let mut skipped = 0i32;
         let mut touched_source_keys = Vec::new();
         let mut last_row_id = after_id;
-        self.project_log_overlays_into_edits(namespace, kind)?;
+        self.project_log_overlays_into_edits(namespace, kind, after_id)?;
         let edits: BTreeMap<String, ObjectTypeIndexEdit> = self
             .list_object_type_index_edits(namespace, kind)?
             .into_iter()
@@ -285,10 +290,9 @@ impl PostgresDb {
         let object_type = self.get_object_type(kind)?;
         let mut members: BTreeMap<String, ObjectTypeIndexMember> = BTreeMap::new();
         if !binding.edits_only {
-            for (row_id, data) in self.list_dataset_row_records(&binding.dataset_id)? {
-                if row_id <= after_id {
-                    continue;
-                }
+            for (row_id, data) in
+                self.list_dataset_row_records_after(&binding.dataset_id, after_id)?
+            {
                 last_row_id = last_row_id.max(row_id);
                 let mut member = match member_from_row(&binding, &data) {
                     Ok(member) => {
@@ -397,7 +401,12 @@ impl PostgresDb {
             Some(touched_source_keys.as_slice())
         };
         self.rematerialize_source_objects_from_index(namespace, kind, now_ms, rematerialize_keys)?;
-        self.rebuild_kind_join(namespace, kind, now_ms)?;
+        self.rebuild_kind_join(
+            namespace,
+            kind,
+            now_ms,
+            join_follows.then_some(touched_source_keys.as_slice()),
+        )?;
         self.stamp_datasource_to_published(namespace, kind)?;
         Ok(ReindexReport {
             rewritten_keys: rewritten,
@@ -832,8 +841,13 @@ impl PostgresDb {
         Ok(sources)
     }
 
-    fn project_log_overlays_into_edits(&self, namespace: &str, kind: &str) -> Result<(), String> {
-        let keys = self.index_overlay_keys(namespace, kind)?;
+    fn project_log_overlays_into_edits(
+        &self,
+        namespace: &str,
+        kind: &str,
+        after_id: i64,
+    ) -> Result<(), String> {
+        let keys = self.index_overlay_keys(namespace, kind, after_id)?;
         let object_type = self.get_object_type(kind)?;
         for edit in crate::sekai::object_log::load_index_overlays(namespace, kind, &keys)? {
             let edit = coerce_index_edit(object_type.as_ref(), edit)
@@ -843,7 +857,15 @@ impl PostgresDb {
         Ok(())
     }
 
-    fn index_overlay_keys(&self, namespace: &str, kind: &str) -> Result<Vec<String>, String> {
+    /// Keys whose object log overlays an apply projects. Dataset rows at or
+    /// below `after_id` were scanned by an earlier apply, which left their
+    /// keys in the members or the edits, so only later rows are read.
+    fn index_overlay_keys(
+        &self,
+        namespace: &str,
+        kind: &str,
+        after_id: i64,
+    ) -> Result<Vec<String>, String> {
         let mut keys = BTreeMap::new();
         for edit in self.list_object_type_index_edits(namespace, kind)? {
             keys.insert(edit.source_key, ());
@@ -858,7 +880,9 @@ impl PostgresDb {
         if let Some(binding) = self.get_object_type_datasource(namespace, kind)?
             && !binding.edits_only
         {
-            for (_row_id, data) in self.list_dataset_row_records(&binding.dataset_id)? {
+            for (_row_id, data) in
+                self.list_dataset_row_records_after(&binding.dataset_id, after_id)?
+            {
                 if let Some(key) = data.get(&binding.key_column) {
                     let key = key.trim();
                     if !key.is_empty() {
@@ -995,13 +1019,75 @@ impl PostgresDb {
             .unwrap_or_default())
     }
 
-    fn rebuild_kind_join(&self, namespace: &str, kind: &str, now_ms: i64) -> Result<(), String> {
+    /// Whether the join of a kind is ready for the current generation.
+    fn join_current(&self, namespace: &str, kind: &str) -> Result<bool, String> {
         let generation = self.hop_rebuild_generation(namespace, kind)?;
-        let members = self.list_visible_index_members(
-            namespace,
-            kind,
-            &crate::sekai::dataset::RowQuery::default(),
-        )?;
+        let status = self
+            .connection()?
+            .query_opt(
+                "SELECT ready, generation FROM sekai_object_type_index_join_status
+                 WHERE namespace=$1 AND kind=$2",
+                &[&namespace, &kind],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(
+            status
+                .is_some_and(|row| row.get::<_, bool>(0) && row.get::<_, String>(1) == generation),
+        )
+    }
+
+    /// The visible members among `source_keys`; a hidden or missing key has
+    /// none.
+    fn visible_index_members_for_keys(
+        &self,
+        namespace: &str,
+        kind: &str,
+        source_keys: &[String],
+    ) -> Result<Vec<ObjectTypeIndexMember>, String> {
+        self.connection()?
+            .query(
+                "SELECT source_key, properties FROM sekai_object_type_index_member
+                 WHERE namespace=$1 AND kind=$2 AND source_key = ANY($3) AND hidden=FALSE
+                 ORDER BY source_key",
+                &[&namespace, &kind, &source_keys],
+            )
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| {
+                let properties: String = row.get(1);
+                Ok(ObjectTypeIndexMember {
+                    namespace: namespace.into(),
+                    kind: kind.into(),
+                    source_key: row.get(0),
+                    properties: crate::sekai::object_type_index::project_member_properties(
+                        &properties,
+                        None,
+                    )?,
+                    ..ObjectTypeIndexMember::default()
+                })
+            })
+            .collect()
+    }
+
+    /// Rebuild the join rows of a kind from its visible members: every member
+    /// when `source_keys` is `None`, else only those keys, whose rows are
+    /// replaced through `sekai_object_type_index_join_member`.
+    fn rebuild_kind_join(
+        &self,
+        namespace: &str,
+        kind: &str,
+        now_ms: i64,
+        source_keys: Option<&[String]>,
+    ) -> Result<(), String> {
+        let generation = self.hop_rebuild_generation(namespace, kind)?;
+        let members = match source_keys {
+            Some(keys) => self.visible_index_members_for_keys(namespace, kind, keys)?,
+            None => self.list_visible_index_members(
+                namespace,
+                kind,
+                &crate::sekai::dataset::RowQuery::default(),
+            )?,
+        };
         let mut conn = self.connection()?;
         let mut tx = conn.transaction().map_err(|error| error.to_string())?;
         tx.execute(
@@ -1015,10 +1101,17 @@ impl PostgresDb {
             &[&namespace, &kind, &false, &now_ms, &""],
         )
         .map_err(|error| error.to_string())?;
-        tx.execute(
-            "DELETE FROM sekai_object_type_index_join WHERE namespace=$1 AND kind=$2",
-            &[&namespace, &kind],
-        )
+        match source_keys {
+            Some(keys) => tx.execute(
+                "DELETE FROM sekai_object_type_index_join
+                 WHERE namespace=$1 AND kind=$2 AND source_key = ANY($3)",
+                &[&namespace, &kind, &keys],
+            ),
+            None => tx.execute(
+                "DELETE FROM sekai_object_type_index_join WHERE namespace=$1 AND kind=$2",
+                &[&namespace, &kind],
+            ),
+        }
         .map_err(|error| error.to_string())?;
         for member in &members {
             for (property, value) in &member.properties {

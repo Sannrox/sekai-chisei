@@ -355,14 +355,15 @@ fn store_bytes(dir: &std::path::Path) -> u64 {
         .sum()
 }
 
-// #3509, ADR 0172: a landed source batch writes only what it changed, so the
-// store grows linearly with landed records. Before span versions every batch
-// copied the whole dataset, and the last window grew the store over five
-// times as much as the second. Landing rate is printed, not asserted: the
-// object type index still rebuilds its join over every row per batch.
+// #3509, ADR 0172: a landed source batch writes only what it changed, and the
+// object type index updates only the keys it touched, so landing rate stays
+// flat and the store grows linearly with landed records. Before, every batch
+// copied the whole dataset and rebuilt the index join: the last window landed
+// over four times slower and grew the store over three times as much as the
+// second.
 #[test]
 #[ignore = "wall-clock landing loop; run by hand when dataset versions change"]
-fn source_batch_store_grows_linearly_from_5k_to_50k_records() {
+fn source_batch_landing_stays_flat_from_5k_to_50k_records() {
     const BATCH: usize = 500;
     const WINDOW: usize = 5_000;
     const TOTAL: usize = 50_000;
@@ -392,12 +393,23 @@ fn source_batch_store_grows_linearly_from_5k_to_50k_records() {
         let growth = bytes.saturating_sub(bytes_before);
         bytes_before = bytes;
         println!("landed {landed}: {rate:.0} records/s, store {bytes} bytes (+{growth})");
-        windows.push(growth);
+        windows.push((rate, growth));
     }
     // The first window pays for creating the dataset; compare from the second.
-    let (second, last) = (windows[1], windows[windows.len() - 1]);
+    // One window can land slowly when the machine is busy; a regression
+    // slows every later window, so the last is held to half the best.
+    let best = windows[1..]
+        .iter()
+        .map(|(rate, _)| *rate)
+        .fold(0.0, f64::max);
+    let (last_rate, last_growth) = windows[windows.len() - 1];
     assert!(
-        last * 2 <= second * 3,
+        last_rate >= best / 2.0,
+        "landing slowed from {best:.0} to {last_rate:.0} records/s: {windows:?}"
+    );
+    let (_, second_growth) = windows[1];
+    assert!(
+        last_growth * 2 <= second_growth * 3,
         "store growth per window is not linear: {windows:?}"
     );
 }

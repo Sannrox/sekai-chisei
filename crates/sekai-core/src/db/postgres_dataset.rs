@@ -192,10 +192,18 @@ impl PostgresDb {
         &self,
         dataset_id: &str,
     ) -> Result<Vec<crate::sekai::dataset::DatasetRowRecord>, String> {
+        self.list_dataset_row_records_after(dataset_id, 0)
+    }
+
+    pub fn list_dataset_row_records_after(
+        &self,
+        dataset_id: &str,
+        after_id: i64,
+    ) -> Result<Vec<crate::sekai::dataset::DatasetRowRecord>, String> {
         self.connection()?
             .query(
-                "SELECT id, data FROM sekai_dataset_rows WHERE dataset_id=$1 ORDER BY id",
-                &[&dataset_id],
+                "SELECT id, data FROM sekai_dataset_rows WHERE dataset_id=$1 AND id>$2 ORDER BY id",
+                &[&dataset_id, &after_id],
             )
             .map_err(|error| error.to_string())?
             .into_iter()
