@@ -97,6 +97,24 @@ export declare const HTTP_UNARY_METHODS: readonly [{
     readonly rpc: "PutObjectTypeIndexEdit";
 }, {
     readonly service: "sekai.SekaiService";
+    readonly rpc: "PutGovernedTransform";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "RunGovernedTransform";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "PreviewGovernedTransform";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "GetGovernedTransformRun";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ListGovernedTransforms";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "ListGovernedTransformRuns";
+}, {
+    readonly service: "sekai.SekaiService";
     readonly rpc: "ListClaimableWork";
 }, {
     readonly service: "sekai.SekaiService";
@@ -107,6 +125,24 @@ export declare const HTTP_UNARY_METHODS: readonly [{
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "AckWork";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "TickGovernedTransforms";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "GetTransformOutputState";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "CancelGovernedTransformRun";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "PutTransformChain";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "RunTransformChain";
+}, {
+    readonly service: "sekai.SekaiService";
+    readonly rpc: "GetTransformChainRun";
 }, {
     readonly service: "sekai.SekaiService";
     readonly rpc: "AdmitGovernedDocument";
@@ -346,3 +382,6 @@ export declare const HTTP_UNARY_METHODS: readonly [{
     readonly rpc: "ResolveEvaluationPlan";
 }];
 export declare function invokeHttpJson<T>(baseUrl: string, service: string, rpc: string, body: unknown, authorization: string, headers?: Record<string, string>): Promise<T>;
+export declare function pageHttpJson<T extends {
+    nextPageToken?: string;
+}>(baseUrl: string, service: string, rpc: string, body: Record<string, unknown>, authorization: string, headers?: Record<string, string>): AsyncGenerator<T, void, void>;

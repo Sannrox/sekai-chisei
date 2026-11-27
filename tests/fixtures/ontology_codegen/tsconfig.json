@@ -6,7 +6,16 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "allowImportingTsExtensions": true
+    "allowImportingTsExtensions": true,
+    "baseUrl": ".",
+    "paths": {
+      "@sannrox/sekai-chisei-sdk/http": ["../../../sdk/typescript/http.ts"]
+    }
   },
-  "include": ["./scoped_client.v1.ts", "./scoped_http_client.v1.ts", "./compile_check.ts"]
+  "include": [
+    "./scoped_client.v1.ts",
+    "./scoped_http_client.v1.ts",
+    "./compile_check.ts",
+    "./compile_check_http.ts"
+  ]
 }

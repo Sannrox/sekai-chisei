@@ -34,10 +34,22 @@ export const HTTP_UNARY_METHODS = [
     { service: "sekai.SekaiService", rpc: "Search" },
     { service: "sekai.SekaiService", rpc: "GetSearchIndexStatus" },
     { service: "sekai.SekaiService", rpc: "PutObjectTypeIndexEdit" },
+    { service: "sekai.SekaiService", rpc: "PutGovernedTransform" },
+    { service: "sekai.SekaiService", rpc: "RunGovernedTransform" },
+    { service: "sekai.SekaiService", rpc: "PreviewGovernedTransform" },
+    { service: "sekai.SekaiService", rpc: "GetGovernedTransformRun" },
+    { service: "sekai.SekaiService", rpc: "ListGovernedTransforms" },
+    { service: "sekai.SekaiService", rpc: "ListGovernedTransformRuns" },
     { service: "sekai.SekaiService", rpc: "ListClaimableWork" },
     { service: "sekai.SekaiService", rpc: "ClaimWork" },
     { service: "sekai.SekaiService", rpc: "HeartbeatWorkClaim" },
     { service: "sekai.SekaiService", rpc: "AckWork" },
+    { service: "sekai.SekaiService", rpc: "TickGovernedTransforms" },
+    { service: "sekai.SekaiService", rpc: "GetTransformOutputState" },
+    { service: "sekai.SekaiService", rpc: "CancelGovernedTransformRun" },
+    { service: "sekai.SekaiService", rpc: "PutTransformChain" },
+    { service: "sekai.SekaiService", rpc: "RunTransformChain" },
+    { service: "sekai.SekaiService", rpc: "GetTransformChainRun" },
     { service: "sekai.SekaiService", rpc: "AdmitGovernedDocument" },
     { service: "sekai.SekaiService", rpc: "AttachGovernedDocumentRendition" },
     { service: "sekai.SekaiService", rpc: "GetGovernedDocument" },
@@ -147,4 +159,15 @@ export async function invokeHttpJson(baseUrl, service, rpc, body, authorization,
         throw new Error(`${response.status} ${response.statusText}`);
     }
     return (await response.json());
+}
+export async function* pageHttpJson(baseUrl, service, rpc, body, authorization, headers = {}) {
+    let pageToken = typeof body.pageToken === "string" ? body.pageToken : "";
+    for (;;) {
+        const page = await invokeHttpJson(baseUrl, service, rpc, { ...body, pageToken }, authorization, headers);
+        yield page;
+        const next = page.nextPageToken ?? "";
+        if (!next)
+            return;
+        pageToken = next;
+    }
 }

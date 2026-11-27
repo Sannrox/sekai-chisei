@@ -171,3 +171,24 @@ def invoke_http_json(
         if not isinstance(payload, dict):
             raise RuntimeError(f"{error.status} {error.reason}") from error
         raise RuntimeError(payload.get("message") or error.reason) from error
+
+
+def page_http_json(
+    base_url: str,
+    service: str,
+    rpc: str,
+    body: dict[str, Any] | None,
+    authorization: str,
+    headers: dict[str, str] | None = None,
+):
+    payload = {} if body is None else dict(body)
+    page_token = payload.get("pageToken") or ""
+    while True:
+        payload["pageToken"] = page_token
+        page = invoke_http_json(base_url, service, rpc, payload, authorization, headers)
+        yield page
+        if not isinstance(page, dict):
+            return
+        page_token = page.get("nextPageToken") or ""
+        if not page_token:
+            return
