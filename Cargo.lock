@@ -3210,6 +3210,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "metrics",
+ "reqwest 0.12.28",
  "sekai-chisei",
  "sekai-source-sdk",
  "serde",
