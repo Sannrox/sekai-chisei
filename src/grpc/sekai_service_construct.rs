@@ -115,6 +115,15 @@ impl SekaiServiceImpl {
         self.object_log_dual_read = dual_read;
         self
     }
+
+    /// Selects the EvaluateObjectSet serving engine for this process.
+    pub fn with_object_index_engine(
+        mut self,
+        engine: crate::sekai::object_index_engine::ObjectIndexEngineKind,
+    ) -> Self {
+        self.object_index_engine = engine;
+        self
+    }
 }
 
 #[cfg(test)]

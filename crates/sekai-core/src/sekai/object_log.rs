@@ -4,7 +4,7 @@
 //! the SQL projection to in-process mikura `ObjectSet::evaluate` (ADR 0081).
 //! ADR 0091 / ADR 0112: the log owns identity generations keyed by
 //! `(namespace, kind, key)`. EvaluateObjectSet keeps the SQL serving
-//! projection unless `SEKAI_OBJECT_INDEX_ENGINE=object-log` (#2290).
+//! projection unless `SEKAI_OBJECT_INDEX_ENGINE=object-log` (#2290, #3510).
 
 use crate::domain::Object;
 use crate::sekai::object_schema::{PropertyValue, property_values_equivalent};
@@ -12,11 +12,11 @@ use crate::sekai::object_security::ObjectSecurityPolicy;
 use crate::sekai::object_set::{ObjectSetAggregateRow, ObjectSetAggregation, ObjectSetDescriptor};
 use crate::sekai::object_type_index::{
     ObjectTypeIndexEdit, ObjectTypeIndexMember, carry_index_edits, merge_index_edits,
-    parse_property_edit_times,
+    parse_property_edit_times, sourced_object_id,
 };
 use mikura::{
     Aggregate, Breakdown, ComputeError, EvaluateRequest, EvaluateResponse, Hop, LocalCompute,
-    ObjectRecord, ObjectSet, OverlayPatch, Predicate, PropertyAcl, Store, VersionOrigin,
+    ObjectRecord, ObjectSet, OverlayPatch, Predicate, PropertyAcl, Sort, Store, VersionOrigin,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
@@ -31,6 +31,9 @@ pub const SAMPLE_ENV: &str = "SEKAI_OBJECT_LOG_DUAL_READ_SAMPLE";
 pub const DEFAULT_LOG_FILE: &str = "objects.mikura";
 const DEFAULT_SAMPLE_N: u32 = 32;
 const BACKFILL_MARKER_SUFFIX: &str = ".backfill-complete";
+/// Empty SQL `order_by` is `ORDER BY source_key`. A missing sort property
+/// tie-breaks on identity key, which is that order.
+const IDENTITY_SORT_PROPERTY: &str = "__sekai_identity";
 
 static SAMPLE_TICK: AtomicU64 = AtomicU64::new(0);
 
@@ -461,17 +464,7 @@ pub fn map_evaluate_request(
     Ok(EvaluateRequest {
         namespace: descriptor.namespace.clone(),
         root_kind: descriptor.kind.clone(),
-        hops: hops
-            .iter()
-            .map(|hop| Hop {
-                far_kind: hop.far_kind.clone(),
-                join_property: hop.join_property.clone(),
-                // Both stores follow an incoming hop from the frontier's join
-                // property to the far key (#2412).
-                incoming: hop.is_incoming(),
-                ..Hop::default()
-            })
-            .collect(),
+        hops: map_hops(hops),
         sum_kind,
         sum_property,
         aggregate: Aggregate::CountAndSum,
@@ -480,6 +473,96 @@ pub fn map_evaluate_request(
         predicate,
         // No object bound, sort, or cursor.
         ..EvaluateRequest::default()
+    })
+}
+
+/// Member-page evaluate: sort, `page_size`, snapshot cursor, and
+/// `object_bound` (#3510). Aggregates stay on [`map_evaluate_request`].
+pub fn map_member_evaluate_request(
+    descriptor: &ObjectSetDescriptor,
+    hops: &[crate::sekai::object_set::ObjectSetTraversal],
+    page_token: &str,
+    acl: PropertyAcl,
+) -> Result<EvaluateRequest, ObjectLogCompareError> {
+    if descriptor.spatial.is_some() {
+        return Err(ObjectLogCompareError::Unsupported("spatial predicates"));
+    }
+    let predicate = map_root_filters(&descriptor.property_filters)?;
+    let sort = map_member_sort(descriptor)?;
+    let object_bound = if descriptor.cost_limit.max_rows_scanned > 0 {
+        descriptor.cost_limit.max_rows_scanned as usize
+    } else {
+        crate::sekai::object_set::DEFAULT_MAX_ROWS_SCANNED as usize
+    };
+    let page_size = if descriptor.limit > 0 {
+        descriptor.limit as usize
+    } else {
+        crate::sekai::object_set::DEFAULT_EVALUATE_LIMIT as usize
+    };
+    let sum_kind = hops
+        .last()
+        .map(|hop| hop.far_kind.clone())
+        .unwrap_or_else(|| descriptor.kind.clone());
+    Ok(EvaluateRequest {
+        namespace: descriptor.namespace.clone(),
+        root_kind: descriptor.kind.clone(),
+        hops: map_hops(hops),
+        sum_kind,
+        sum_property: String::new(),
+        aggregate: Aggregate::CountAndSum,
+        acl,
+        predicate,
+        object_bound,
+        sort: Some(sort),
+        page_size,
+        cursor: (!page_token.is_empty()).then(|| page_token.to_string()),
+        ..EvaluateRequest::default()
+    })
+}
+
+fn map_hops(hops: &[crate::sekai::object_set::ObjectSetTraversal]) -> Vec<Hop> {
+    hops.iter()
+        .map(|hop| Hop {
+            far_kind: hop.far_kind.clone(),
+            join_property: hop.join_property.clone(),
+            // Both stores follow an incoming hop from the frontier's join
+            // property to the far key (#2412).
+            incoming: hop.is_incoming(),
+            ..Hop::default()
+        })
+        .collect()
+}
+
+fn map_member_sort(descriptor: &ObjectSetDescriptor) -> Result<Sort, ObjectLogCompareError> {
+    let order_by = descriptor.order_by.trim();
+    if order_by.is_empty() {
+        return Ok(Sort {
+            property: IDENTITY_SORT_PROPERTY.into(),
+            descending: descriptor.descending,
+            nearest: None,
+        });
+    }
+    let normalized = order_by.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "name" | "created" | "updated") {
+        return Err(ObjectLogCompareError::Unsupported(
+            "sort on name, created, or updated",
+        ));
+    }
+    let Some(("property", key)) = order_by.split_once(':') else {
+        return Err(ObjectLogCompareError::Unsupported(
+            "SQL object-set order_by is one key; the object-log sorts up to three keys",
+        ));
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(ObjectLogCompareError::Unsupported(
+            "SQL object-set order_by is one key; the object-log sorts up to three keys",
+        ));
+    }
+    Ok(Sort {
+        property: key.into(),
+        descending: descriptor.descending,
+        nearest: None,
     })
 }
 
@@ -843,23 +926,67 @@ pub fn evaluate_from_source(
     deny: &[(String, String)],
 ) -> Result<EvaluateResponse, ObjectLogCompareError> {
     let request = map_evaluate_request(descriptor, hops, aggregation, acl)?;
+    evaluate_mapped(source, request, deny)
+}
+
+/// Serve one member-page evaluate from the configured object log (#3510).
+pub fn evaluate_members_from_source(
+    source: &ObjectLogEvaluateSource,
+    descriptor: &ObjectSetDescriptor,
+    hops: &[crate::sekai::object_set::ObjectSetTraversal],
+    page_token: &str,
+    acl: PropertyAcl,
+    deny: &[(String, String)],
+) -> Result<EvaluateResponse, ObjectLogCompareError> {
+    let request = map_member_evaluate_request(descriptor, hops, page_token, acl)?;
+    evaluate_mapped(source, request, deny)
+}
+
+fn evaluate_mapped(
+    source: &ObjectLogEvaluateSource,
+    request: EvaluateRequest,
+    deny: &[(String, String)],
+) -> Result<EvaluateResponse, ObjectLogCompareError> {
     let unknown_namespace = format!("unknown namespace {}", request.namespace);
     match source {
         ObjectLogEvaluateSource::Host(host) => match host.evaluate(&request, deny) {
             Ok(response) => Ok(response),
-            Err(error) if error.contains(&unknown_namespace) => Ok(EvaluateResponse {
-                two_hop_count: 0,
-                sum_amount: 0,
-                objects: Vec::new(),
-                cursor: None,
-                groups: Vec::new(),
-            }),
+            Err(error) if error.contains(&unknown_namespace) => Ok(empty_evaluate_response()),
             Err(error) if error.contains("unreachable") => Err(ObjectLogCompareError::MissingLog),
-            Err(error) => Err(ObjectLogCompareError::Evaluate(error)),
+            Err(error) => Err(map_host_evaluate_error(error)),
         },
         ObjectLogEvaluateSource::Path(path) => {
             evaluate_from_path(path, &request, &unknown_namespace)
         }
+    }
+}
+
+fn empty_evaluate_response() -> EvaluateResponse {
+    EvaluateResponse {
+        two_hop_count: 0,
+        sum_amount: 0,
+        objects: Vec::new(),
+        cursor: None,
+        groups: Vec::new(),
+    }
+}
+
+fn map_host_evaluate_error(error: String) -> ObjectLogCompareError {
+    if let Some(reason) = named_evaluate_limit(&error) {
+        ObjectLogCompareError::Unsupported(reason)
+    } else {
+        ObjectLogCompareError::Evaluate(error)
+    }
+}
+
+/// Limits the log names in evaluate errors: object bound, sort, and pages.
+fn named_evaluate_limit(error: &str) -> Option<&'static str> {
+    if error.contains("ObjectBound") || error.to_ascii_lowercase().contains("object bound") {
+        Some("object_bound")
+    } else if error.contains("Page(") || error.to_ascii_lowercase().contains("sort") {
+        Some("sort")
+    } else {
+        None
     }
 }
 
@@ -877,19 +1004,17 @@ fn evaluate_from_path(
             .evaluate(store, request)
             .or_else(|error| match error {
                 ComputeError::Load(message) if message == unknown_namespace => {
-                    Ok(EvaluateResponse {
-                        two_hop_count: 0,
-                        sum_amount: 0,
-                        objects: Vec::new(),
-                        cursor: None,
-                        groups: Vec::new(),
-                    })
+                    Ok(empty_evaluate_response())
                 }
+                ComputeError::ObjectBound { bound, count } => {
+                    Err(format!("ObjectBound {{ bound: {bound}, count: {count} }}"))
+                }
+                ComputeError::Page(reason) => Err(format!("Page({reason})")),
                 error => Err(format!("{error:?}")),
             })
     }) {
         Ok(log) => Ok(log),
-        Err(error) => Err(ObjectLogCompareError::Evaluate(error)),
+        Err(error) => Err(map_host_evaluate_error(error)),
     }
 }
 
@@ -967,10 +1092,28 @@ pub fn aggregate_rows_from_log(
         .collect()
 }
 
+/// Member objects in the SQL index identity (`kind:key`) so the page matches
+/// the relational engines (#3510).
+pub fn members_from_log(log: &EvaluateResponse) -> Vec<Object> {
+    log.objects
+        .iter()
+        .map(|record| Object {
+            id: sourced_object_id(&record.kind, &record.key),
+            kind: record.kind.clone(),
+            name: record.key.clone(),
+            namespace: record.namespace.clone(),
+            external_id: record.key.clone(),
+            properties: record.props.clone(),
+            created: 0,
+            updated: 0,
+        })
+        .collect()
+}
+
 /// Kind policies the log restriction cannot evaluate (ADR 0174): a required
 /// purpose, value-instance grants, or a rule that is not allow-all. Property
-/// grants are projected into deny pairs. Per-object grants, markings, and
-/// hidden rows stay on #3510.
+/// grants are projected into deny pairs. Per-object grants and markings stay
+/// fail-closed here; hidden identities are omitted from member pages (#3510).
 fn policy_exceeds_log_restriction(policy: &ObjectSecurityPolicy) -> bool {
     policy
         .required_purpose
@@ -3016,6 +3159,127 @@ mod tests {
         assert_eq!(
             ObjectLogCompareError::MissingLog.serving_message(),
             "object-log host is unreachable"
+        );
+    }
+
+    #[test]
+    fn log_engine_pages_visible_members_and_omits_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("members.mikura");
+        let mut store = Store::create(&log).unwrap();
+        BatchIngest::run(
+            &mut store,
+            vec![
+                ObjectRecord {
+                    action_id: None,
+                    r#gen: 1,
+                    namespace: "sales".into(),
+                    kind: "Customer".into(),
+                    key: "c-b".into(),
+                    hidden: false,
+                    props: HashMap::from([("region".into(), "us".into())]),
+                    schema_version: 1,
+                    source_version: 0,
+                },
+                ObjectRecord {
+                    action_id: None,
+                    r#gen: 1,
+                    namespace: "sales".into(),
+                    kind: "Customer".into(),
+                    key: "c-a".into(),
+                    hidden: false,
+                    props: HashMap::from([("region".into(), "eu".into())]),
+                    schema_version: 1,
+                    source_version: 0,
+                },
+                ObjectRecord {
+                    action_id: None,
+                    r#gen: 1,
+                    namespace: "sales".into(),
+                    kind: "Customer".into(),
+                    key: "c-hidden".into(),
+                    hidden: true,
+                    props: HashMap::from([("region".into(), "eu".into())]),
+                    schema_version: 1,
+                    source_version: 0,
+                },
+            ],
+        )
+        .unwrap();
+        drop(store);
+        let source = ObjectLogEvaluateSource::Path(log);
+        let mut descriptor = ObjectSetDescriptor {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            limit: 1,
+            ..ObjectSetDescriptor::default()
+        };
+        let first = evaluate_members_from_source(
+            &source,
+            &descriptor,
+            &[],
+            "",
+            PropertyAcl::allow_all(),
+            &[],
+        )
+        .unwrap();
+        let members = members_from_log(&first);
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].id, "Customer:c-a");
+        assert_eq!(members[0].properties["region"], "eu");
+        assert_eq!(first.two_hop_count, 2);
+        let token = first.cursor.expect("next page");
+        let second = evaluate_members_from_source(
+            &source,
+            &descriptor,
+            &[],
+            &token,
+            PropertyAcl::allow_all(),
+            &[],
+        )
+        .unwrap();
+        let rest = members_from_log(&second);
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id, "Customer:c-b");
+        assert!(second.cursor.is_none());
+        assert!(
+            members
+                .iter()
+                .chain(&rest)
+                .all(|member| !member.id.contains("hidden"))
+        );
+
+        let mut denied = PropertyAcl::allow_all();
+        denied.insert_deny("Customer", "region").unwrap();
+        let withheld = evaluate_members_from_source(
+            &source,
+            &descriptor,
+            &[],
+            "",
+            denied,
+            &[("Customer".into(), "region".into())],
+        )
+        .unwrap();
+        assert!(
+            members_from_log(&withheld)
+                .iter()
+                .all(|member| !member.properties.contains_key("region"))
+        );
+
+        descriptor.order_by = "name".into();
+        let sort = evaluate_members_from_source(
+            &source,
+            &descriptor,
+            &[],
+            "",
+            PropertyAcl::allow_all(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            sort.serving_message().contains("sort"),
+            "{}",
+            sort.serving_message()
         );
     }
 

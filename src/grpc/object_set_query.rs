@@ -108,6 +108,28 @@ impl SekaiServiceImpl {
             }
             None => "legacy".into(),
         };
+        let hops = crate::sekai::object_set::resolved_hops(&bound.descriptor);
+        if self.object_index_engine
+            == crate::sekai::object_index_engine::ObjectIndexEngineKind::ObjectLog
+            && bound.descriptor.aggregation.is_none()
+        {
+            if hops.len() > 1 {
+                return Err(Status::invalid_argument(
+                    "object-set aggregation required for multi-hop evaluate",
+                ));
+            }
+            if authority.tenant_context.is_some() {
+                return Err(Status::failed_precondition(
+                    "object-log engine cannot evaluate tenant-constrained requests",
+                ));
+            }
+            return self.evaluate_object_log_members(
+                &bound,
+                &hops,
+                &inner.page_token,
+                &attribution,
+            );
+        }
         let mut filter = bound.filter.clone();
         if !inner.page_token.is_empty() {
             let cursor = crate::sekai::object_security::ObjectQueryCursor::decode(
@@ -126,15 +148,6 @@ impl SekaiServiceImpl {
                 ));
             }
             filter.offset = cursor.offset;
-        }
-        let hops = crate::sekai::object_set::resolved_hops(&bound.descriptor);
-        if self.object_index_engine
-            == crate::sekai::object_index_engine::ObjectIndexEngineKind::ObjectLog
-            && bound.descriptor.aggregation.is_none()
-        {
-            return Err(Status::failed_precondition(
-                "object-log engine cannot serve member pages",
-            ));
         }
         if bound.descriptor.aggregation.is_some() || hops.len() > 1 {
             return self.evaluate_aggregated_object_set(
@@ -1441,6 +1454,86 @@ impl SekaiServiceImpl {
             attribution,
         )
     }
+
+    fn evaluate_object_log_members(
+        &self,
+        bound: &BoundObjectSet,
+        hops: &[crate::sekai::object_set::ObjectSetTraversal],
+        page_token: &str,
+        attribution: &QueryAttribution,
+    ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
+        if bound.spatial.is_some() {
+            return Err(Status::failed_precondition(
+                "object-log engine cannot answer: spatial predicates",
+            ));
+        }
+        let mut read_properties = member_read_properties(
+            &bound.descriptor.kind,
+            &bound.descriptor.property_filters,
+            hops,
+        );
+        if let Some(order) = bound.descriptor.order_by.strip_prefix("property:") {
+            read_properties
+                .entry(bound.descriptor.kind.as_str())
+                .or_default()
+                .insert(order.trim().to_string());
+        }
+        let mut kinds = vec![bound.descriptor.kind.as_str()];
+        kinds.extend(hops.iter().map(|hop| hop.far_kind.as_str()));
+        let schema = self
+            .schema_definitions
+            .snapshot()
+            .map_err(map_schema_definition_lifecycle_error)?;
+        let mut policies = Vec::new();
+        for kind in &kinds {
+            policies.push(
+                self.db
+                    .runtime()
+                    .active_object_policy(&bound.descriptor.namespace, kind)
+                    .map_err(Status::internal)?,
+            );
+        }
+        let (acl, deny) =
+            crate::sekai::object_log::object_log_deny_pairs(kinds.iter().zip(policies.iter()).map(
+                |(kind, policy)| crate::sekai::object_log::ObjectLogAclKind {
+                    kind,
+                    policy: policy.as_ref(),
+                    schema_properties: schema.get(kind).map(|object_type| {
+                        object_type
+                            .properties
+                            .iter()
+                            .map(|property| property.name.clone())
+                            .collect()
+                    }),
+                    read_properties: read_properties.get(kind).cloned().unwrap_or_default(),
+                },
+            ))
+            .map_err(|error| Status::failed_precondition(error.serving_message()))?;
+        let source = crate::sekai::object_log::ObjectLogEvaluateSource::from_configured(
+            self.object_log_dual_read.log_path.clone(),
+        )
+        .map_err(|error| Status::failed_precondition(error.serving_message()))?;
+        let log = crate::sekai::object_log::evaluate_members_from_source(
+            &source,
+            &bound.descriptor,
+            hops,
+            page_token,
+            acl,
+            &deny,
+        )
+        .map_err(|error| Status::failed_precondition(error.serving_message()))?;
+        let members = crate::sekai::object_log::members_from_log(&log);
+        let total = i32::try_from(log.two_hop_count).unwrap_or(i32::MAX);
+        self.object_set_page(
+            bound,
+            members,
+            total,
+            log.cursor.unwrap_or_default(),
+            Vec::new(),
+            crate::sekai::object_set::EVALUATE_SOURCE_OBJECT_LOG.into(),
+            attribution,
+        )
+    }
 }
 
 impl SekaiServiceImpl {
@@ -1525,6 +1618,22 @@ impl SekaiServiceImpl {
         }
         Ok(visible)
     }
+}
+
+fn member_read_properties<'a>(
+    root_kind: &'a str,
+    filters: &[crate::domain::PropertyFilter],
+    hops: &'a [crate::sekai::object_set::ObjectSetTraversal],
+) -> std::collections::BTreeMap<&'a str, std::collections::BTreeSet<String>> {
+    aggregate_read_properties(
+        root_kind,
+        &crate::sekai::object_set::ObjectSetAggregation {
+            function: "count".into(),
+            ..crate::sekai::object_set::ObjectSetAggregation::default()
+        },
+        filters,
+        hops,
+    )
 }
 
 fn aggregate_read_properties<'a>(
@@ -4864,7 +4973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn object_log_engine_serves_aggregates_and_refuses_member_pages() {
+    async fn object_log_engine_serves_aggregates_and_member_pages() {
         let mut svc = service();
         grant_namespace(&svc, "sales", "alice");
         grant_namespace(&svc, "sales", "local");
@@ -4932,6 +5041,47 @@ mod tests {
                         namespace: "sales".into(),
                         kind: "Customer".into(),
                         definition_digest: digest.clone(),
+                        limit: 10,
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            members.source,
+            crate::sekai::object_set::EVALUATE_SOURCE_OBJECT_LOG
+        );
+        assert_eq!(members.total, 1);
+        assert_eq!(members.members.len(), 1);
+        assert_eq!(members.members[0].id, "Customer:c1");
+        assert_eq!(
+            members.members[0]
+                .properties
+                .get("region")
+                .map(String::as_str),
+            Some("eu")
+        );
+        assert!(
+            members
+                .members
+                .iter()
+                .all(|member| !member.id.contains("hidden"))
+        );
+
+        let sort = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest.clone(),
+                        order_by: "name".into(),
                         ..Default::default()
                     }),
                     page_token: String::new(),
@@ -4941,12 +5091,8 @@ mod tests {
             ))
             .await
             .unwrap_err();
-        assert_eq!(members.code(), tonic::Code::FailedPrecondition);
-        assert!(
-            members.message().contains("member pages"),
-            "{}",
-            members.message()
-        );
+        assert_eq!(sort.code(), tonic::Code::FailedPrecondition);
+        assert!(sort.message().contains("sort"), "{}", sort.message());
 
         svc.object_log_dual_read.log_path = Some(dir.path().join("missing.mikura"));
         let unreachable = svc
