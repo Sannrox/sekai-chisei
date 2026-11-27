@@ -41,6 +41,7 @@ use sekai_chisei::sekai::dataset::{ColumnDef, Dataset};
 use sekai_chisei::sekai::definition_branch::{
     DefinitionMemberInput, DefinitionRevisionMember, prepare_revision,
 };
+use sekai_chisei::sekai::object_index_engine::ObjectIndexEngineKind;
 use sekai_chisei::sekai::object_log::{CANARY_OUTCOMES_METRIC, ObjectLogDualRead};
 use sekai_chisei::sekai::object_set::CONTRACT_VERSION_V2;
 use sekai_chisei::sekai::object_type_index::{CONTRACT_VERSION, ObjectTypeDatasource};
@@ -269,6 +270,32 @@ impl Case {
             })
             .collect()
     }
+
+    /// Member pages use a separate stream so aggregate seeds stay stable.
+    fn member_queries(&self, index: usize) -> Vec<MemberQuery> {
+        let mut rng = Rng::new(self.seed ^ (index as u64 + 1).wrapping_mul(0xA5A5_A5A5_A5A5_A5A5));
+        (0..2)
+            .map(|_| MemberQuery {
+                namespace: rng.below(self.schema.namespaces),
+                root: rng.below(self.schema.kinds),
+                filter: (rng.below(4) == 0).then(|| PropertyFilter {
+                    key: "tag".into(),
+                    op: "eq".into(),
+                    value: TAGS[rng.below(TAGS.len())].into(),
+                }),
+                limit: [1, 2][rng.below(2)],
+            })
+            .collect()
+    }
+}
+
+/// A 0-hop member page compared across engines (#3510).
+#[derive(Clone, Debug)]
+struct MemberQuery {
+    namespace: usize,
+    root: usize,
+    filter: Option<PropertyFilter>,
+    limit: i32,
 }
 
 /// A new version's properties. A link names a live parent in the same
@@ -385,6 +412,12 @@ async fn run(case: &Case, ops: usize, tally: &mut Tally) -> Result<(), Mismatch>
                 outcome => panic!("gate recorded {outcome:?} without failing {query:?}"),
             }
         }
+        let log_engine = service
+            .clone()
+            .with_object_index_engine(ObjectIndexEngineKind::ObjectLog);
+        for query in case.member_queries(checkpoint) {
+            evaluate_members(&service, &log_engine, &query, &digests[query.namespace]).await?;
+        }
     }
     Ok(())
 }
@@ -438,6 +471,85 @@ async fn evaluate(service: &SekaiServiceImpl, query: &Query, digest: &str) -> Re
         }
         Err(status) => panic!("request the generator should not make: {query:?}: {status}"),
     }
+}
+
+/// SQL vs object-log member pages, following each engine's own token.
+async fn evaluate_members(
+    sql: &SekaiServiceImpl,
+    log: &SekaiServiceImpl,
+    query: &MemberQuery,
+    digest: &str,
+) -> Result<(), Mismatch> {
+    let sql_page = collect_member_pages(sql, query, digest).await?;
+    let log_page = collect_member_pages(log, query, digest).await?;
+    if sql_page == log_page {
+        return Ok(());
+    }
+    Err(Mismatch(format!(
+        "member page mismatch for {query:?}: sql={sql_page:?} log={log_page:?}"
+    )))
+}
+
+async fn collect_member_pages(
+    service: &SekaiServiceImpl,
+    query: &MemberQuery,
+    digest: &str,
+) -> Result<Vec<(String, BTreeMap<String, String>)>, Mismatch> {
+    let mut token = String::new();
+    let mut members = Vec::new();
+    for _ in 0..64 {
+        let mut request = Request::new(EvaluateObjectSetRequest {
+            descriptor: Some(ObjectSetDescriptor {
+                contract_version: CONTRACT_VERSION_V2.into(),
+                namespace: NAMESPACES[query.namespace].into(),
+                kind: Schema::kind(query.root),
+                definition_digest: digest.into(),
+                property_filters: query
+                    .filter
+                    .iter()
+                    .map(|filter| sekai_chisei::grpc::pb::sekai::PropertyFilter {
+                        key: filter.key.clone(),
+                        op: filter.op.clone(),
+                        value: filter.value.clone(),
+                    })
+                    .collect(),
+                limit: query.limit,
+                cost_limit: Some(ObjectSetCostLimit {
+                    max_rows_scanned: 1_000_000,
+                    max_depth: 3,
+                    max_time_ms: 0,
+                }),
+                ..Default::default()
+            }),
+            page_token: token,
+            required_freshness_ms: 0,
+        });
+        request
+            .metadata_mut()
+            .insert("x-principal", MetadataValue::from_static(PRINCIPAL));
+        let page = match service.evaluate_object_set(request).await {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.message().starts_with("object-log ") => {
+                return Err(Mismatch(format!("{} for {query:?}", status.message())));
+            }
+            Err(status) => {
+                panic!("member request the generator should not make: {query:?}: {status}")
+            }
+        };
+        members.extend(page.members.into_iter().map(|member| {
+            (
+                member.id,
+                member.properties.into_iter().collect::<BTreeMap<_, _>>(),
+            )
+        }));
+        if page.next_page_token.is_empty() {
+            return Ok(members);
+        }
+        token = page.next_page_token;
+    }
+    Err(Mismatch(format!(
+        "member page did not finish for {query:?}"
+    )))
 }
 
 /// What the gate recorded for one request.

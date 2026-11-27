@@ -31,7 +31,9 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use mikura::{EvaluateRequest, EvaluateResponse, Group, ObjectRecord, OverlayPatch, Predicate};
+use mikura::{
+    EvaluateRequest, EvaluateResponse, Group, ObjectRecord, OverlayPatch, Predicate, Sort,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -102,6 +104,10 @@ struct EvaluateWire {
     two_hop_count: usize,
     sum_amount: i64,
     #[serde(default)]
+    objects: Vec<ObjectRecord>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
     groups: Vec<EvaluateGroupWire>,
 }
 
@@ -123,8 +129,8 @@ impl EvaluateWire {
         EvaluateResponse {
             two_hop_count: self.two_hop_count,
             sum_amount: self.sum_amount,
-            objects: Vec::new(),
-            cursor: None,
+            objects: self.objects,
+            cursor: self.cursor,
             groups: self
                 .groups
                 .into_iter()
@@ -521,7 +527,7 @@ impl ObjectLogHost {
         Self::require_ok(self.write(request, Repeat::Idempotent)?).map(|_| ())
     }
 
-    /// Namespace-scoped count/sum/breakdown from the host (#2290).
+    /// Namespace-scoped evaluate from the host (#2290, #3510).
     /// `deny` is the host's property-deny shorthand for the log restriction.
     pub fn evaluate(
         &self,
@@ -562,7 +568,33 @@ fn evaluate_wire(request: &EvaluateRequest, deny: &[(String, String)]) -> Value 
             "distinct": breakdown.distinct,
         });
     }
+    if request.object_bound > 0 {
+        body["object_bound"] = json!(request.object_bound);
+    }
+    if let Some(sort) = &request.sort {
+        body["sort"] = sort_wire(sort);
+    }
+    if !request.then_by.is_empty() {
+        body["then_by"] = json!(request.then_by.iter().map(sort_wire).collect::<Vec<_>>());
+    }
+    if request.page_size > 0 {
+        body["page_size"] = json!(request.page_size);
+    }
+    if let Some(cursor) = &request.cursor {
+        body["cursor"] = json!(cursor);
+    }
     json!({ "op": "evaluate", "request": body })
+}
+
+fn sort_wire(sort: &Sort) -> Value {
+    let mut body = json!({
+        "property": sort.property,
+        "descending": sort.descending,
+    });
+    if let Some(nearest) = &sort.nearest {
+        body["nearest"] = json!(nearest);
+    }
+    body
 }
 
 fn predicate_wire(predicate: &Predicate) -> Value {
@@ -720,6 +752,21 @@ mod tests {
         let page = host.evaluate(&request, &[]).unwrap();
         assert_eq!(page.two_hop_count, 2);
         assert!(page.groups.is_empty());
+        assert!(page.objects.is_empty());
+
+        let mut members = request.clone();
+        members.object_bound = 8;
+        members.sort = Some(Sort::by("region"));
+        members.page_size = 1;
+        let first = host.evaluate(&members, &[]).unwrap();
+        assert_eq!(first.objects.len(), 1);
+        assert_eq!(first.two_hop_count, 2);
+        let token = first.cursor.expect("next page");
+        members.cursor = Some(token);
+        let second = host.evaluate(&members, &[]).unwrap();
+        assert_eq!(second.objects.len(), 1);
+        assert_ne!(first.objects[0].key, second.objects[0].key);
+        assert!(second.cursor.is_none());
 
         let closed = TcpListener::bind("127.0.0.1:0").unwrap();
         let gone = closed.local_addr().unwrap();

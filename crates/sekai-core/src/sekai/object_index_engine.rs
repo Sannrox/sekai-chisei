@@ -3,8 +3,8 @@
 //! `hop-projection` is the shipping default: a rebuildable join-key
 //! projection from the #889 envelope. `nested-loop` is the original
 //! in-process scan, also used for bounded joins over authorized members.
-//! `object-log` answers count, sum, and breakdown evaluates from the
-//! configured object-log host (#2290). The SQL engines are not object
+//! `object-log` answers count, sum, breakdown, and member-page evaluates
+//! from the configured object-log host (#2290, #3510). The SQL engines are not object
 //! authority. Switching engines is a rebuild of the join projection.
 
 use crate::sekai::object_set::{CostMeter, ObjectSetError};
@@ -20,7 +20,7 @@ pub const OBJECT_LOG: &str = "object-log";
 pub enum ObjectIndexEngineKind {
     NestedLoop,
     HopProjection,
-    /// Namespace-scoped aggregates from the object-log host (#2290).
+    /// Namespace-scoped aggregates and member pages from the object-log host (#2290, #3510).
     ObjectLog,
 }
 
