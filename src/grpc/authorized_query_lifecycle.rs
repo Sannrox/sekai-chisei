@@ -22,6 +22,7 @@ impl SekaiServiceImpl {
         &self,
         req: Request<GetObjectRequest>,
     ) -> Result<Response<GetObjectResponse>, Status> {
+        let turn_namespace = self.authorize_turn_read(&req)?;
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);
@@ -43,6 +44,13 @@ impl SekaiServiceImpl {
             )?;
             return Err(Status::not_found("not found"));
         };
+        // A turn reads only its own namespace; elsewhere is not there.
+        if turn_namespace
+            .as_deref()
+            .is_some_and(|namespace| namespace != obj.namespace)
+        {
+            return Err(Status::not_found("not found"));
+        }
         let namespace = obj.namespace.clone();
         let obj_kind = obj.kind.clone();
         require_purpose_for_kind(
@@ -66,8 +74,10 @@ impl SekaiServiceImpl {
             Err(status) if status.code() == tonic::Code::PermissionDenied => {
                 // A site agent instance or hosted session object the caller
                 // may not read is indistinguishable from a missing one,
-                // activated policy or not (ADR 0136, #2132).
-                let activated = crate::sekai::site_agent_memory::is_action_only_kind(&obj_kind)
+                // activated policy or not (ADR 0136, #2132), and so is any
+                // object an interactive turn's member may not read (ADR 0173).
+                let activated = turn_namespace.is_some()
+                    || crate::sekai::site_agent_memory::is_action_only_kind(&obj_kind)
                     || crate::sekai::hosted_session::is_action_only_kind(&obj_kind)
                     || self
                         .db
@@ -135,6 +145,18 @@ impl SekaiServiceImpl {
         &self,
         req: Request<ListObjectsRequest>,
     ) -> Result<Response<ListObjectsResponse>, Status> {
+        if let Some(namespace) = self.authorize_turn_read(&req)? {
+            let listed = req
+                .get_ref()
+                .filter
+                .as_ref()
+                .map(|filter| filter.namespace.as_str());
+            if listed != Some(namespace.as_str()) {
+                return Err(Status::permission_denied(
+                    "runtime token lists only its turn's namespace",
+                ));
+            }
+        }
         let principals = caller_principals(&req);
         let policy_context = principal_policy_context(&req);
         let purpose = request_purpose_presentation(&req, &principals);

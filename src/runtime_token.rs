@@ -48,6 +48,11 @@ pub const TURN_TOKEN_METHODS: &[&str] = &[
     "ListSiteAgentWorkingMemory",
 ];
 
+/// Object reads a turn token also authenticates on an interactive turn
+/// (ADR 0173): they run as the member, with the member's live access, in
+/// the turn's namespace.
+pub const INTERACTIVE_TURN_READ_METHODS: &[&str] = &["GetObject", "ListObjects"];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeTokenClaims {
@@ -205,12 +210,12 @@ impl RuntimeTokenClaims {
 
     /// Whether this token authenticates calls to `method`.
     pub fn admits(&self, method: &str) -> bool {
-        let methods = if self.is_turn() {
-            TURN_TOKEN_METHODS
-        } else {
-            RUNTIME_TOKEN_METHODS
-        };
-        methods.contains(&method)
+        if !self.is_turn() {
+            return RUNTIME_TOKEN_METHODS.contains(&method);
+        }
+        TURN_TOKEN_METHODS.contains(&method)
+            || (crate::sekai::interactive_agent_turn::is_interactive_turn_id(&self.turn_id)
+                && INTERACTIVE_TURN_READ_METHODS.contains(&method))
     }
 
     /// Whether this token covers a call on turn `turn_id` in `namespace` by

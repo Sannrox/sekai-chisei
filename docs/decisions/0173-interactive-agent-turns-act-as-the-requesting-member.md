@@ -82,9 +82,9 @@ would also retire such a row as "site agent instance is gone".
    because no claim path reads the table. The next slice adds the opt-in
    claim and listing, the member-subject token, the Action type bound,
    receipt attributes (`ActionInstance.agent_turn`) and the freeze test.
-   The third slice adds parking and tool-binding approval. Turn-token
-   reads (transcript and working memory) follow. Until a slice lands, its
-   calls are refused on interactive turns.
+   The third slice adds parking and tool-binding approval; the fourth,
+   object reads as the member. Until a slice lands, its calls are refused
+   on interactive turns.
 
 ## Clarifications
 
@@ -100,6 +100,16 @@ would also retire such a row as "site agent instance is gone".
   binding's approval does. The policy name labels the rule; the Action
   type's approvers decide it, and the submitting member cannot. Query and
   gateway tools keep their policies at the gateway.
+- 2026-11-27 (#3046): For decision 2, an interactive turn's token also
+  admits `GetObject` and `ListObjects`, as its member with the member's
+  live access, in the turn's namespace only. The token is checked as for
+  other calls (live claim, tenant, member namespace access; a member who
+  lost access fails the turn). An object the member may not read, or one in
+  another namespace, is `NOT_FOUND`, whether or not object security is
+  activated; listing another namespace is refused. The revision bounds
+  writes, not reads: reads change nothing and the member may make them
+  directly. Instance turn tokens still admit no object reads, and
+  transcript and working-memory calls stay outside interactive turns.
 
 ## Alternatives considered
 

@@ -465,6 +465,26 @@ impl SekaiServiceImpl {
         Ok(())
     }
 
+    /// A read with a turn token: the turn must be interactive and still
+    /// claimed by the token, and its member must still hold the namespace
+    /// (ADR 0173). Returns the turn's namespace, which bounds the read,
+    /// `None` without a turn token.
+    pub(crate) fn authorize_turn_read<T: 'static>(
+        &self,
+        req: &Request<T>,
+    ) -> Result<Option<String>, Status> {
+        let Some(claims) = req.extensions().get::<RuntimeTokenClaims>() else {
+            return Ok(None);
+        };
+        let refused = || Status::permission_denied("runtime token does not cover this read");
+        if !claims.is_turn() || !interactive_agent_turn::is_interactive_turn_id(&claims.turn_id) {
+            return Err(refused());
+        }
+        let turn = AnyTurn::load(self.db.runtime(), &claims.turn_id)?.ok_or_else(refused)?;
+        self.authorize_turn_token(req, claims, &turn)?;
+        Ok(Some(turn.namespace().to_string()))
+    }
+
     /// An interactive turn acts with its member's access as it stands now
     /// (ADR 0173 decision 3). A member who lost write access to the
     /// namespace fails the turn with the refusal as its reason.

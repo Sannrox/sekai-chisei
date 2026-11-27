@@ -769,3 +769,94 @@ async fn a_tool_approval_parks_the_turn_until_decided() {
     assert_eq!(continuation.approval_decision, "grant");
     assert_ne!(continuation.status, "parked");
 }
+
+/// The turn's token reads objects as its member, in its namespace only: a
+/// marked object the member lacks clearance for, and an object elsewhere,
+/// are not found, and listing another namespace is refused.
+#[tokio::test]
+async fn an_interactive_turn_reads_only_what_its_member_can() {
+    let (plane, digest) = token_plane().await;
+    let svc = &plane.svc;
+    for (id, namespace, classification) in [
+        ("open", NS, None),
+        ("marked", NS, Some("confidential")),
+        ("elsewhere", "other", None),
+    ] {
+        svc.db
+            .runtime()
+            .create_object(&domain::Object {
+                id: id.into(),
+                kind: "ticket".into(),
+                name: id.into(),
+                namespace: namespace.into(),
+                external_id: format!("ticket:{id}"),
+                properties: classification
+                    .map(|value| {
+                        HashMap::from([(
+                            markings::OBJECT_CLASSIFICATION_PROPERTY.into(),
+                            value.to_string(),
+                        )])
+                    })
+                    .unwrap_or_default(),
+                created: 0,
+                updated: 0,
+            })
+            .unwrap();
+    }
+    let turn_id = svc
+        .admit_interactive_agent_turn(with_named_principal(request(&digest), "alice"))
+        .await
+        .unwrap()
+        .into_inner()
+        .turn
+        .unwrap()
+        .turn_id;
+    let token = svc
+        .claim_agent_turn(as_worker("local", claim_request(&turn_id, true)))
+        .await
+        .unwrap()
+        .into_inner()
+        .runtime_token;
+    let get = |id: &str| {
+        svc.get_object(with_token(
+            &plane,
+            &token,
+            "GetObject",
+            GetObjectRequest { id: id.into() },
+        ))
+    };
+    assert_eq!(
+        get("open").await.unwrap().into_inner().object.unwrap().id,
+        "open"
+    );
+    for hidden in ["marked", "elsewhere", "missing"] {
+        let status = get(hidden).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound, "{hidden}: {status:?}");
+    }
+    let list = |namespace: &str| {
+        svc.list_objects(with_token(
+            &plane,
+            &token,
+            "ListObjects",
+            ListObjectsRequest {
+                filter: Some(ListFilter {
+                    namespace: namespace.into(),
+                    kind: "ticket".into(),
+                    ..Default::default()
+                }),
+                page_token: String::new(),
+            },
+        ))
+    };
+    let listed: Vec<String> = list(NS)
+        .await
+        .unwrap()
+        .into_inner()
+        .objects
+        .into_iter()
+        .map(|object| object.id)
+        .collect();
+    assert_eq!(listed, ["open"]);
+    let other = list("other").await.unwrap_err();
+    assert_eq!(other.code(), tonic::Code::PermissionDenied, "{other:?}");
+}

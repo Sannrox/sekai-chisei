@@ -238,9 +238,12 @@ member's `allowed_action_types` at the turn's revision, and the admitted
 instance's `agent_turn` names the turn, revision, agent member and trace id.
 When the agent member binds that Action type as an `action` tool with an
 `approval_policy`, the Action parks for its type's approvers under the rule
-`agent_tool:{agent member}:{policy}`. Interactive turns park and resume as
+`agent_tool:{agent member}:{policy}`. The token also reads with
+`GetObject` and `ListObjects` as the member, in the turn's namespace only:
+an object the member may not read, or one elsewhere, is `NOT_FOUND`, and
+listing another namespace is refused. Interactive turns park and resume as
 instance turns do, below. Transcript and working-memory calls do not cover
-them yet.
+them.
 
 A turn whose Action parks for approval acks `parked` with that Action's id
 (ADR 0142, #2007): the Action must have been submitted under the same claim
