@@ -3,7 +3,9 @@
 //! `hop-projection` is the shipping default: a rebuildable join-key
 //! projection from the #889 envelope. `nested-loop` is the original
 //! in-process scan, also used for bounded joins over authorized members.
-//! Neither is object authority. Switching engines is a rebuild of the join projection.
+//! `object-log` answers count, sum, and breakdown evaluates from the
+//! configured object-log host (#2290). The SQL engines are not object
+//! authority. Switching engines is a rebuild of the join projection.
 
 use crate::sekai::object_set::{CostMeter, ObjectSetError};
 use crate::sekai::object_type_index::ObjectTypeIndexMember;
@@ -12,11 +14,14 @@ use std::env;
 
 pub const NESTED_LOOP: &str = "nested-loop";
 pub const HOP_PROJECTION: &str = "hop-projection";
+pub const OBJECT_LOG: &str = "object-log";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectIndexEngineKind {
     NestedLoop,
     HopProjection,
+    /// Namespace-scoped aggregates from the object-log host (#2290).
+    ObjectLog,
 }
 
 impl ObjectIndexEngineKind {
@@ -24,8 +29,9 @@ impl ObjectIndexEngineKind {
         match raw.trim() {
             NESTED_LOOP => Ok(Self::NestedLoop),
             HOP_PROJECTION | "" => Ok(Self::HopProjection),
+            OBJECT_LOG => Ok(Self::ObjectLog),
             other => Err(format!(
-                "unsupported SEKAI_OBJECT_INDEX_ENGINE {other:?}; expected {NESTED_LOOP} or {HOP_PROJECTION}"
+                "unsupported SEKAI_OBJECT_INDEX_ENGINE {other:?}; expected {NESTED_LOOP}, {HOP_PROJECTION}, or {OBJECT_LOG}"
             )),
         }
     }
@@ -51,6 +57,7 @@ impl ObjectIndexEngineKind {
         match self {
             Self::NestedLoop => NESTED_LOOP,
             Self::HopProjection => HOP_PROJECTION,
+            Self::ObjectLog => OBJECT_LOG,
         }
     }
 }
@@ -378,6 +385,10 @@ mod tests {
         assert_eq!(
             ObjectIndexEngineKind::parse(HOP_PROJECTION).unwrap(),
             ObjectIndexEngineKind::HopProjection
+        );
+        assert_eq!(
+            ObjectIndexEngineKind::parse(OBJECT_LOG).unwrap(),
+            ObjectIndexEngineKind::ObjectLog
         );
         assert!(ObjectIndexEngineKind::parse("lucene").is_err());
         assert_eq!(
