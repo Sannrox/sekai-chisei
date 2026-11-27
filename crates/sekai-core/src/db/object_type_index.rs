@@ -397,12 +397,17 @@ impl SekaiDb {
                 after_id = 0;
             }
         }
+        // The join follows this apply key by key only when it is complete for
+        // the current generation. Clearing readiness below fences that: a
+        // crash before the join commits leaves it not ready, and the next
+        // apply rebuilds it whole.
+        let join_follows = !full_rebuild && self.join_current(namespace, kind)?;
         self.set_hop_projection_ready(namespace, kind, false, now_ms)?;
         let mut rewritten = 0i32;
         let mut skipped = 0i32;
         let mut touched_source_keys = Vec::new();
         let mut last_row_id = after_id;
-        self.project_log_overlays_into_edits(namespace, kind)?;
+        self.project_log_overlays_into_edits(namespace, kind, after_id)?;
         let edits: BTreeMap<String, ObjectTypeIndexEdit> = self
             .list_object_type_index_edits(namespace, kind)?
             .into_iter()
@@ -411,11 +416,8 @@ impl SekaiDb {
         let object_type = self.get_object_type(kind)?;
         let mut members: BTreeMap<String, ObjectTypeIndexMember> = BTreeMap::new();
         if !binding.edits_only {
-            let rows = self.list_dataset_row_records(&binding.dataset_id)?;
+            let rows = self.list_dataset_row_records_after(&binding.dataset_id, after_id)?;
             for (row_id, data) in rows {
-                if row_id <= after_id {
-                    continue;
-                }
                 last_row_id = last_row_id.max(row_id);
                 let mut member = match member_from_row(&binding, &data) {
                     Ok(member) => {
@@ -529,7 +531,12 @@ impl SekaiDb {
             Some(touched_source_keys.as_slice())
         };
         self.rematerialize_source_objects_from_index(namespace, kind, now_ms, rematerialize_keys)?;
-        self.rebuild_kind_join(namespace, kind, now_ms)?;
+        self.rebuild_kind_join(
+            namespace,
+            kind,
+            now_ms,
+            join_follows.then_some(touched_source_keys.as_slice()),
+        )?;
         self.stamp_datasource_to_published(namespace, kind)?;
         Ok(ReindexReport {
             rewritten_keys: rewritten,
@@ -993,8 +1000,13 @@ impl SekaiDb {
         Ok(sources)
     }
 
-    fn project_log_overlays_into_edits(&self, namespace: &str, kind: &str) -> Result<(), String> {
-        let keys = self.index_overlay_keys(namespace, kind)?;
+    fn project_log_overlays_into_edits(
+        &self,
+        namespace: &str,
+        kind: &str,
+        after_id: i64,
+    ) -> Result<(), String> {
+        let keys = self.index_overlay_keys(namespace, kind, after_id)?;
         let object_type = self.get_object_type(kind)?;
         for edit in crate::sekai::object_log::load_index_overlays(namespace, kind, &keys)? {
             let edit = coerce_index_edit(object_type.as_ref(), edit)
@@ -1004,7 +1016,15 @@ impl SekaiDb {
         Ok(())
     }
 
-    fn index_overlay_keys(&self, namespace: &str, kind: &str) -> Result<Vec<String>, String> {
+    /// Keys whose object log overlays an apply projects. Dataset rows at or
+    /// below `after_id` were scanned by an earlier apply, which left their
+    /// keys in the members or the edits, so only later rows are read.
+    fn index_overlay_keys(
+        &self,
+        namespace: &str,
+        kind: &str,
+        after_id: i64,
+    ) -> Result<Vec<String>, String> {
         let mut keys = BTreeMap::new();
         for edit in self.list_object_type_index_edits(namespace, kind)? {
             keys.insert(edit.source_key, ());
@@ -1019,7 +1039,9 @@ impl SekaiDb {
         if let Some(binding) = self.get_object_type_datasource(namespace, kind)?
             && !binding.edits_only
         {
-            for (_row_id, data) in self.list_dataset_row_records(&binding.dataset_id)? {
+            for (_row_id, data) in
+                self.list_dataset_row_records_after(&binding.dataset_id, after_id)?
+            {
                 if let Some(key) = data.get(&binding.key_column) {
                     let key = key.trim();
                     if !key.is_empty() {
@@ -1151,13 +1173,78 @@ impl SekaiDb {
             .unwrap_or_default())
     }
 
-    fn rebuild_kind_join(&self, namespace: &str, kind: &str, now_ms: i64) -> Result<(), String> {
+    /// Whether the join of a kind is ready for the current generation.
+    fn join_current(&self, namespace: &str, kind: &str) -> Result<bool, String> {
         let generation = self.hop_rebuild_generation(namespace, kind)?;
-        let members = self.list_visible_index_members(
-            namespace,
-            kind,
-            &crate::sekai::dataset::RowQuery::default(),
-        )?;
+        let status: Option<(i64, String)> = self
+            .conn()
+            .query_row(
+                "SELECT ready, generation FROM sekai_object_type_index_join_status
+                 WHERE namespace = ?1 AND kind = ?2",
+                params![namespace, kind],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional_row()
+            .map_err(|error| error.to_string())?;
+        Ok(status.is_some_and(|(ready, current)| ready != 0 && current == generation))
+    }
+
+    /// The visible members among `source_keys`; a hidden or missing key has
+    /// none.
+    fn visible_index_members_for_keys(
+        &self,
+        namespace: &str,
+        kind: &str,
+        source_keys: &[String],
+    ) -> Result<Vec<ObjectTypeIndexMember>, String> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT properties FROM sekai_object_type_index_member
+                 WHERE namespace = ?1 AND kind = ?2 AND source_key = ?3 AND hidden = 0",
+            )
+            .map_err(|error| error.to_string())?;
+        let mut members = Vec::new();
+        for source_key in source_keys {
+            let properties: Option<String> = stmt
+                .query_row(params![namespace, kind, source_key], |row| row.get(0))
+                .optional_row()
+                .map_err(|error| error.to_string())?;
+            if let Some(properties) = properties {
+                members.push(ObjectTypeIndexMember {
+                    namespace: namespace.into(),
+                    kind: kind.into(),
+                    source_key: source_key.clone(),
+                    properties: crate::sekai::object_type_index::project_member_properties(
+                        &properties,
+                        None,
+                    )?,
+                    ..ObjectTypeIndexMember::default()
+                });
+            }
+        }
+        Ok(members)
+    }
+
+    /// Rebuild the join rows of a kind from its visible members: every member
+    /// when `source_keys` is `None`, else only those keys, whose rows are
+    /// replaced through `sekai_object_type_index_join_member`.
+    fn rebuild_kind_join(
+        &self,
+        namespace: &str,
+        kind: &str,
+        now_ms: i64,
+        source_keys: Option<&[String]>,
+    ) -> Result<(), String> {
+        let generation = self.hop_rebuild_generation(namespace, kind)?;
+        let members = match source_keys {
+            Some(keys) => self.visible_index_members_for_keys(namespace, kind, keys)?,
+            None => self.list_visible_index_members(
+                namespace,
+                kind,
+                &crate::sekai::dataset::RowQuery::default(),
+            )?,
+        };
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         tx.execute(
@@ -1166,11 +1253,28 @@ impl SekaiDb {
             params![namespace, kind, 0i64, now_ms, ""],
         )
         .map_err(|error| error.to_string())?;
-        tx.execute(
-            "DELETE FROM sekai_object_type_index_join WHERE namespace = ?1 AND kind = ?2",
-            params![namespace, kind],
-        )
-        .map_err(|error| error.to_string())?;
+        match source_keys {
+            Some(keys) => {
+                let mut delete = tx
+                    .prepare_cached(
+                        "DELETE FROM sekai_object_type_index_join
+                         WHERE namespace = ?1 AND kind = ?2 AND source_key = ?3",
+                    )
+                    .map_err(|error| error.to_string())?;
+                for key in keys {
+                    delete
+                        .execute(params![namespace, kind, key])
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            None => {
+                tx.execute(
+                    "DELETE FROM sekai_object_type_index_join WHERE namespace = ?1 AND kind = ?2",
+                    params![namespace, kind],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
         for member in &members {
             for (property, value) in &member.properties {
                 let cell = value.as_cell();
@@ -3074,6 +3178,56 @@ mod tests {
             expected
         );
         assert!(db.hop_projection_ready("sales", "Customer").unwrap());
+    }
+
+    fn join_rows(db: &SekaiDb) -> Vec<(String, String, String)> {
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT property, value, source_key FROM sekai_object_type_index_join
+                 WHERE namespace = 'sales' AND kind = 'Customer' ORDER BY 1, 2, 3",
+            )
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn customer(id: &str, region: &str, hidden: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("customer_id".into(), id.into()),
+            ("region".into(), region.into()),
+            ("hidden".into(), hidden.into()),
+        ])
+    }
+
+    // A crash between the member commit and the join commit leaves the join
+    // not ready, so the next apply rebuilds it whole instead of patching it.
+    #[test]
+    fn join_left_not_ready_is_rebuilt_whole() {
+        let db = db();
+        db.create_dataset(&dataset(
+            "ds-customers",
+            &["customer_id", "region", "hidden"],
+        ))
+        .unwrap();
+        db.append_rows("ds-customers", &[customer("c1", "eu", "0")])
+            .unwrap();
+        db.register_object_type_datasource(&binding(), 10).unwrap();
+        db.apply_object_type_index_without_join_rebuild("sales", "Customer", true, 20)
+            .unwrap();
+        db.append_rows("ds-customers", &[customer("c2", "us", "0")])
+            .unwrap();
+        db.apply_object_type_index("sales", "Customer", false, 30)
+            .unwrap();
+        assert_eq!(
+            join_rows(&db),
+            vec![
+                ("region".into(), "eu".into(), "c1".into()),
+                ("region".into(), "us".into(), "c2".into()),
+            ]
+        );
     }
 
     #[test]

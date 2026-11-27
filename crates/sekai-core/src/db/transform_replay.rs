@@ -612,7 +612,7 @@ mod tests {
             &|dataset_id| {
                 let conn = db.conn();
                 conn.execute(
-                    "DELETE FROM sekai_dataset_version_rows WHERE dataset_id = ?1",
+                    "DELETE FROM sekai_dataset_row_spans WHERE dataset_id = ?1",
                     rusqlite::params![dataset_id],
                 )
                 .unwrap();
@@ -662,7 +662,7 @@ mod tests {
             &|dataset_id| {
                 let mut conn = db.connection().unwrap();
                 conn.execute(
-                    "DELETE FROM sekai_dataset_version_rows WHERE dataset_id = $1",
+                    "DELETE FROM sekai_dataset_row_spans WHERE dataset_id = $1",
                     &[&dataset_id],
                 )
                 .unwrap();

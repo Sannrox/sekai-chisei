@@ -91,6 +91,25 @@ pub fn row_for_record(
     row
 }
 
+/// The rows that land from one batch: the last row of each external id, in
+/// batch order. A row without an id always lands.
+pub fn last_row_per_key(rows: &[HashMap<String, String>]) -> Vec<&HashMap<String, String>> {
+    let mut last = HashMap::new();
+    for (index, row) in rows.iter().enumerate() {
+        if let Some(key) = row.get(KEY_COLUMN) {
+            last.insert(key.as_str(), index);
+        }
+    }
+    rows.iter()
+        .enumerate()
+        .filter(|(index, row)| {
+            row.get(KEY_COLUMN)
+                .is_none_or(|key| last.get(key.as_str()) == Some(index))
+        })
+        .map(|(_, row)| row)
+        .collect()
+}
+
 pub fn identity_mapping(columns: &[ColumnDef]) -> BTreeMap<String, String> {
     columns
         .iter()

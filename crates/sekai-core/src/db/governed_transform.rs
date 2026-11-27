@@ -7045,7 +7045,7 @@ mod tests {
         {
             let conn = db.conn();
             conn.execute(
-                "DELETE FROM sekai_dataset_version_rows WHERE dataset_id = 'in'",
+                "DELETE FROM sekai_dataset_row_spans WHERE dataset_id = 'in'",
                 [],
             )
             .unwrap();
@@ -7125,7 +7125,7 @@ mod tests {
         {
             let conn = db.conn();
             conn.execute(
-                "DELETE FROM sekai_dataset_version_rows WHERE dataset_id = 'in'",
+                "DELETE FROM sekai_dataset_row_spans WHERE dataset_id = 'in'",
                 [],
             )
             .unwrap();

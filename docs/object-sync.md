@@ -32,7 +32,11 @@ An out-of-process adapter follows this loop:
    key, batch digest, and proposed cursor.
 
 An accepted batch commits mapped rows to a dataset version bound to the source
-binding (`srcds:{binding_id}:{kind}`) and derives the type through
+binding (`srcds:{binding_id}:{kind}`). The version is an `append` when every
+external id in the batch is new and an `update` otherwise: an update replaces
+the earlier row of each external id, so the dataset holds one row per record
+while earlier versions keep the rows they held (ADR 0172). The batch then
+derives the type through
 `RegisterObjectTypeDatasource` plus `ReindexObjectType`. Ordinary dataset RPCs
 (`QueryRows`, `AppendRows`, `CreateDataset`, `UpdateDataset`) refuse those
 ids; land and reindex use the internal dataset path. Clerk objects and

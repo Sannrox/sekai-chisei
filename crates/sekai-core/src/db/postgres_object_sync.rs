@@ -1716,7 +1716,7 @@ fn land_source_batch_dataset_rows_pg(
     now_ms: i64,
 ) -> Result<(), ApplyError> {
     use crate::db::postgres_dataset::{
-        add_dataset_columns_tx, append_dataset_rows_tx, create_dataset_tx,
+        add_dataset_columns_tx, create_dataset_tx, land_source_rows_pg,
     };
     use crate::db::source_batch_dataset;
     use crate::sekai::dataset::Dataset;
@@ -1761,7 +1761,7 @@ fn land_source_batch_dataset_rows_pg(
         let rows = prepared_dataset_rows(&prepared.records, &kind)?;
         if !rows.is_empty() {
             let (from, to) =
-                append_dataset_rows_tx(tx, &dataset_id, &rows).map_err(ApplyError::storage)?;
+                land_source_rows_pg(tx, &dataset_id, &rows).map_err(ApplyError::storage)?;
             if row_from == 0 {
                 row_from = from;
             }
@@ -1847,14 +1847,14 @@ fn backfill_source_dataset_from_committed_pg(
     kind: &str,
     jsons: &[String],
 ) -> Result<(), ApplyError> {
-    use crate::db::postgres_dataset::{add_dataset_columns_tx, append_dataset_rows_tx};
+    use crate::db::postgres_dataset::{add_dataset_columns_tx, land_source_rows_pg};
 
     let (columns, rows) = committed_source_dataset_backfill(mapper, jsons.iter().cloned(), kind)?;
     if !columns.is_empty() {
         add_dataset_columns_tx(tx, dataset_id, &columns).map_err(ApplyError::storage)?;
     }
     if !rows.is_empty() {
-        append_dataset_rows_tx(tx, dataset_id, &rows).map_err(ApplyError::storage)?;
+        land_source_rows_pg(tx, dataset_id, &rows).map_err(ApplyError::storage)?;
     }
     Ok(())
 }
