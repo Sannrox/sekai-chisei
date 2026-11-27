@@ -316,6 +316,14 @@ fn with_tenant_context<T>(payload: T) -> Request<T> {
     req
 }
 
+fn with_tenant_write_context<T>(payload: T) -> Request<T> {
+    let mut req = with_named_principal(payload, "subject-a");
+    let mut context = test_tenant_context();
+    context.scopes = vec!["sekai.read".into(), "sekai.write".into()];
+    req.extensions_mut().insert(context);
+    req
+}
+
 #[tokio::test]
 async fn revoke_purpose_authorization_hides_other_tenants_authorizations() {
     let svc = enterprise_service();
@@ -21501,6 +21509,62 @@ async fn decision_trend_rpc_reports_what_the_cli_reduces() {
     assert_eq!(empty_window.code(), tonic::Code::InvalidArgument);
 }
 
+/// #3552: a granted tenant assertion reads the trend; instances it may not
+/// read are counted as withheld, not listed.
+#[tokio::test]
+async fn tenant_assertion_reads_decision_trend_with_withheld_instances() {
+    use sekai_admin_client::decision_trend::DecisionTrendReport;
+    let svc = enterprise_service();
+    let namespace = "allowed";
+    grant_source_namespace(&svc, namespace, "subject-a", security::Role::Viewer);
+    let mut visible = action_read_fixture(namespace);
+    visible.instance_id = "visible".into();
+    visible.idempotency_key = "visible-key".into();
+    visible.operation_id = "visible-op".into();
+    visible.principal = "subject-a".into();
+    visible.created_at_ms = 150;
+    svc.db.runtime().put_action_instance(&visible).unwrap();
+    let mut hidden = action_read_fixture(namespace);
+    hidden.instance_id = "hidden".into();
+    hidden.idempotency_key = "hidden-key".into();
+    hidden.operation_id = "hidden-op".into();
+    hidden.principal = "other".into();
+    hidden.created_at_ms = 160;
+    svc.db.runtime().put_action_instance(&hidden).unwrap();
+
+    let served: DecisionTrendReport = serde_json::from_str(
+        &svc.get_decision_trend(with_tenant_context(GetDecisionTrendRequest {
+            namespace: "allowed".into(),
+            window_ms: 100,
+            until_ms: Some(200),
+            min_count: Some(1),
+            max_share_shift_bps: None,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .report_json,
+    )
+    .unwrap();
+    assert_eq!(served.window.instance_ids, ["visible"]);
+    assert_eq!(served.window.withheld, 1);
+
+    grant_source_namespace(&svc, "denied", "subject-a", security::Role::Viewer);
+    assert_eq!(
+        svc.get_decision_trend(with_tenant_context(GetDecisionTrendRequest {
+            namespace: "denied".into(),
+            window_ms: 100,
+            until_ms: Some(200),
+            min_count: Some(1),
+            max_share_shift_bps: None,
+        }))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::PermissionDenied
+    );
+}
+
 #[tokio::test]
 async fn action_instance_reads_require_entitlement_and_target_visibility() {
     let svc = service();
@@ -37927,6 +37991,57 @@ async fn tenant_rpcs_refuse_another_tenants_namespace(svc: &SekaiServiceImpl) {
             }),
             start_timestamp_ms: 100,
             end_timestamp_ms: 200,
+        }))
+    );
+    probe!(
+        "PutSource",
+        svc.put_source(with_tenant_write_context(PutSourceRequest {
+            namespace: ns(),
+            source_id: "repo".into(),
+            ..Default::default()
+        }))
+    );
+    probe!(
+        "GetSource",
+        svc.get_source(with_tenant_context(GetSourceRequest {
+            namespace: ns(),
+            source_id: "repo".into(),
+        }))
+    );
+    probe!(
+        "ListSources",
+        svc.list_sources(with_tenant_context(ListSourcesRequest {
+            namespace: ns(),
+            ..Default::default()
+        }))
+    );
+    probe!(
+        "DisableSource",
+        svc.disable_source(with_tenant_write_context(DisableSourceRequest {
+            namespace: ns(),
+            source_id: "repo".into(),
+        }))
+    );
+    probe!(
+        "RequestSourceDiscovery",
+        svc.request_source_discovery(with_tenant_write_context(RequestSourceDiscoveryRequest {
+            namespace: ns(),
+            source_id: "repo".into(),
+        }))
+    );
+    probe!(
+        "GetSourceDiscovery",
+        svc.get_source_discovery(with_tenant_context(GetSourceDiscoveryRequest {
+            namespace: ns(),
+            discovery_id: "disc".into(),
+        }))
+    );
+    probe!(
+        "GetDecisionTrend",
+        svc.get_decision_trend(with_tenant_context(GetDecisionTrendRequest {
+            namespace: ns(),
+            window_ms: 100,
+            ..Default::default()
         }))
     );
     for (name, code) in codes {

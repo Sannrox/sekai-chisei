@@ -276,3 +276,117 @@ async fn autonomy_changes_need_namespace_admin_and_hide_other_namespaces() {
         .unwrap_err();
     assert_eq!(unknown_mode.code(), tonic::Code::InvalidArgument);
 }
+
+/// #3552: a granted tenant assertion reads autonomy as the user; namespace
+/// admin sets the mode and the decision names that user.
+#[tokio::test]
+async fn tenant_assertion_reads_and_sets_agent_autonomy_as_the_user() {
+    let svc = enterprise_service();
+    crate::chisei_store::apply_chisei_schema(svc.db.runtime());
+    let namespace = "allowed";
+    grant_source_namespace(&svc, namespace, "subject-a", security::Role::Viewer);
+    grant_source_namespace(&svc, namespace, AGENT, security::Role::Editor);
+    let mut action_type = intake_action_type("");
+    action_type.namespace = namespace.into();
+    svc.db
+        .runtime()
+        .put_governed_action_type(
+            from_proto_governed_action_type(action_type).unwrap(),
+            "subject-a",
+            1,
+        )
+        .unwrap();
+    svc.db
+        .runtime()
+        .upsert_action_policy(&action_policy::ActionPolicy::allow_all(format!(
+            "project:{namespace}"
+        )))
+        .unwrap();
+    let mut envelope = signed_envelope();
+    envelope.namespace = namespace.into();
+    envelope.envelope_digest = envelope_digest_for(&envelope).unwrap();
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+    envelope.signature_hex = signing_key
+        .sign(envelope.envelope_digest.as_bytes())
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    admit_envelope(svc.db.runtime(), AGENT, &envelope, 1_000).unwrap();
+    record_reviews_in(&svc, namespace, DEFAULT_MIN_REVIEWS);
+
+    let get_req = || GetAgentAutonomyRequest {
+        namespace: namespace.into(),
+        principal: AGENT.into(),
+        type_id: TYPE_ID.into(),
+    };
+    let set_req = |mode: &str| SetAgentAutonomyRequest {
+        namespace: namespace.into(),
+        principal: AGENT.into(),
+        type_id: TYPE_ID.into(),
+        mode: mode.into(),
+        envelope_id: if mode == "apply" {
+            envelope.envelope_id.clone()
+        } else {
+            String::new()
+        },
+        reason: String::new(),
+    };
+
+    let offered = svc
+        .get_agent_autonomy(with_tenant_context(get_req()))
+        .await
+        .unwrap()
+        .into_inner()
+        .autonomy
+        .unwrap();
+    assert_eq!(offered.mode, "propose");
+    assert!(offered.eligible);
+    assert_eq!(
+        svc.set_agent_autonomy(with_tenant_write_context(set_req("apply")))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+
+    grant_source_namespace(&svc, namespace, "subject-a", security::Role::Admin);
+    let applied = svc
+        .set_agent_autonomy(with_tenant_write_context(set_req("apply")))
+        .await
+        .unwrap()
+        .into_inner()
+        .autonomy
+        .unwrap();
+    assert_eq!(applied.mode, "apply");
+    let granted = receipts(&svc, ACTION_GRANT);
+    assert_eq!(granted.len(), 1);
+    assert_eq!(granted[0].actor, "subject-a");
+
+    grant_source_namespace(&svc, "denied", "subject-a", security::Role::Admin);
+    assert_eq!(
+        svc.get_agent_autonomy(with_tenant_context(GetAgentAutonomyRequest {
+            namespace: "denied".into(),
+            ..get_req()
+        }))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::NotFound
+    );
+}
+
+fn record_reviews_in(svc: &SekaiServiceImpl, namespace: &str, count: u32) {
+    for index in 0..count {
+        let mut instance = action_read_fixture(namespace);
+        instance.instance_id = format!("earned-{index}");
+        instance.idempotency_key = format!("earned-key-{index}");
+        instance.operation_id = format!("earned-op-{index}");
+        instance.principal = AGENT.into();
+        instance.type_id = TYPE_ID.into();
+        instance.status = STATUS_ADMITTED.into();
+        instance.approval_decision = DECISION_GRANT.into();
+        instance.decided_by = "subject-a".into();
+        svc.db.runtime().put_action_instance(&instance).unwrap();
+    }
+}

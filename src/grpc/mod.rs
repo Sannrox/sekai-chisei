@@ -1006,6 +1006,17 @@ fn enterprise_namespace_method(method: &str) -> bool {
             | "PutOntologyHealthSchedule"
             | "DeleteOntologyHealthSchedule"
             | "GetSourceHealth"
+            // Source, discovery, decision-trend, and autonomy (#3552):
+            // handlers keep the tenant and role checks.
+            | "PutSource"
+            | "GetSource"
+            | "ListSources"
+            | "DisableSource"
+            | "RequestSourceDiscovery"
+            | "GetSourceDiscovery"
+            | "GetDecisionTrend"
+            | "GetAgentAutonomy"
+            | "SetAgentAutonomy"
             | "GetDefinitionCertificationGate"
             | "PutDefinitionCertification"
             | "DryRunAgent"
@@ -3268,6 +3279,16 @@ mod tests {
             (SpaceRole::Editor, "DeleteOntologyHealthSchedule", true),
             (SpaceRole::Discoverer, "GetSourceHealth", false),
             (SpaceRole::Viewer, "GetSourceHealth", true),
+            (SpaceRole::Discoverer, "GetSource", false),
+            (SpaceRole::Viewer, "GetSource", true),
+            (SpaceRole::Viewer, "PutSource", false),
+            (SpaceRole::Editor, "PutSource", true),
+            (SpaceRole::Viewer, "RequestSourceDiscovery", false),
+            (SpaceRole::Editor, "RequestSourceDiscovery", true),
+            (SpaceRole::Viewer, "GetDecisionTrend", true),
+            (SpaceRole::Viewer, "GetAgentAutonomy", true),
+            (SpaceRole::Viewer, "SetAgentAutonomy", false),
+            (SpaceRole::Editor, "SetAgentAutonomy", true),
             (SpaceRole::Editor, "CreateObject", true),
             (SpaceRole::Editor, "DecideActionInstance", false),
             (SpaceRole::Approver, "DecideActionInstance", true),
@@ -3681,6 +3702,15 @@ mod tests {
             "DryRunActionPolicy",
             "GetObjectSourceRecord",
             "ReadObjectSeries",
+            "PutSource",
+            "GetSource",
+            "ListSources",
+            "DisableSource",
+            "RequestSourceDiscovery",
+            "GetSourceDiscovery",
+            "GetDecisionTrend",
+            "GetAgentAutonomy",
+            "SetAgentAutonomy",
         ] {
             assert!(enterprise_namespace_method(method), "{method}");
         }
@@ -3741,6 +3771,31 @@ mod tests {
             rpc_namespace_action("PreviewObjectAction"),
             crate::enterprise::NamespaceAction::Write
         );
+        for method in [
+            "GetSource",
+            "ListSources",
+            "GetSourceDiscovery",
+            "GetDecisionTrend",
+            "GetAgentAutonomy",
+        ] {
+            assert_eq!(
+                rpc_namespace_action(method),
+                crate::enterprise::NamespaceAction::Read,
+                "{method}"
+            );
+        }
+        for method in [
+            "PutSource",
+            "DisableSource",
+            "RequestSourceDiscovery",
+            "SetAgentAutonomy",
+        ] {
+            assert_eq!(
+                rpc_namespace_action(method),
+                crate::enterprise::NamespaceAction::Write,
+                "{method}"
+            );
+        }
     }
 
     #[test]
