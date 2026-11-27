@@ -167,3 +167,28 @@ export async function invokeHttpJson<T>(
   }
   return (await response.json()) as T;
 }
+
+export async function* pageHttpJson<T extends { nextPageToken?: string }>(
+  baseUrl: string,
+  service: string,
+  rpc: string,
+  body: Record<string, unknown>,
+  authorization: string,
+  headers: Record<string, string> = {},
+): AsyncGenerator<T, void, void> {
+  let pageToken = typeof body.pageToken === "string" ? body.pageToken : "";
+  for (;;) {
+    const page = await invokeHttpJson<T>(
+      baseUrl,
+      service,
+      rpc,
+      { ...body, pageToken },
+      authorization,
+      headers,
+    );
+    yield page;
+    const next = page.nextPageToken ?? "";
+    if (!next) return;
+    pageToken = next;
+  }
+}

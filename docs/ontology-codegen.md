@@ -45,10 +45,13 @@ namespace, revision pin, and operation id headers for a
 same stale-pin failure applies on HTTP as on gRPC.
 
 - The application adds `authorization: Bearer <token>` at call time. The
-  generated HTTP projection client (`sdk/typescript/http.ts`,
-  `sdk/python/sekai_http.py`) takes it as an argument.
-- `EvaluateObjectSet` pins in the request body: set the descriptor's
-  `definition_digest` to `GENERATED_REVISION_DIGEST`.
+  generated HTTP package depends on the published runtime
+  (`@sannrox/sekai-chisei-sdk` / `sekai-chisei-sdk`, today's HTTP helper) and
+  makes `EvaluateObjectSet` and `SubmitActionInstance` itself. Object-set
+  descriptors type filters on declared properties and selected link
+  traversals; Action parameters use the generated Action type.
+- `EvaluateObjectSet` pins in the request body: the generated client sets the
+  descriptor's `definitionDigest` to `GENERATED_REVISION_DIGEST`.
 - Only stable calls are hosted on HTTP; experimental calls are refused.
 
 ## Fail-closed rules
@@ -79,7 +82,11 @@ same stale-pin failure applies on HTTP as on gRPC.
 `tests/fixtures/ontology_codegen/scoped_client.v1.py` are the CI goldens for
 the same published revision and explicit four-kind selection.
 `scoped_http_client.v1.ts` and `scoped_http_client.v1.py` are the HTTP-target
-goldens for that selection.
+goldens for that selection. Those packages declare a versioned dependency on
+the HTTP runtime (`ontology_http_package_json` / `ontology_http_pyproject`).
+`compile_check.ts` is an application built on the earlier native output;
+`compile_check_http.ts` is an application that depends only on the generated
+HTTP package.
 
 ## Non-goals
 

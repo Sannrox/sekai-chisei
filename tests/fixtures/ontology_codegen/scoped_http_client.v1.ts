@@ -3,10 +3,14 @@
 // namespace="demo"
 // revision_digest="sha256:df76a10f45c87ebe11b97f282ff213733127694dae6594ffdef399866606749e"
 
+import { invokeHttpJson, pageHttpJson } from "@sannrox/sekai-chisei-sdk/http";
+
 export const GENERATED_CONTRACT_VERSION = "sekai.ontology-client/v1";
 export const GENERATED_NAMESPACE = "demo";
 export const GENERATED_REVISION_DIGEST = "sha256:df76a10f45c87ebe11b97f282ff213733127694dae6594ffdef399866606749e";
 export const GENERATED_TRANSPORT = "sekai.http-projection/v1";
+export const GENERATED_RUNTIME_PACKAGE = "@sannrox/sekai-chisei-sdk";
+export const GENERATED_RUNTIME_RANGE = "^0.1.0";
 export const ALLOWED_MEMBERS = ["action_type:Assign", "function:CountOpen", "link_type:AssignedTo", "object_type:Ticket"] as const;
 
 export interface Assign {
@@ -22,6 +26,35 @@ export interface AssignedTo {}
 export interface Ticket {
   title: string;
 }
+
+export type LinkTraversal = {
+  relation: "AssignedTo";
+  direction?: string;
+  farKind?: string;
+  joinProperty?: string;
+};
+
+export type ObjectSetPage = {
+  members?: unknown[];
+  total?: number;
+  nextPageToken?: string;
+  [key: string]: unknown;
+};
+
+export type TicketProperty = "title";
+
+export type TicketPropertyFilter =
+  | { key: TicketProperty; op: "eq" | "gt" | "gte" | "lt" | "lte"; value: string }
+  | { key: "id"; op: "in"; value: string };
+
+export type TicketSetDescriptor = {
+  propertyFilters?: TicketPropertyFilter[];
+  traversal?: LinkTraversal;
+  orderBy?: TicketProperty;
+  descending?: boolean;
+  limit?: number;
+  pageToken?: string;
+};
 
 export interface OntologyInvocation {
   contract_version: string;
@@ -86,6 +119,13 @@ export function httpHeaders(call: OntologyInvocation): Record<string, string> {
 }
 
 export class ScopedOntologyClient {
+  readonly baseUrl: string;
+  readonly authorization: string;
+
+  constructor(options: { baseUrl: string; authorization: string }) {
+    this.baseUrl = options.baseUrl;
+    this.authorization = options.authorization;
+  }
 
   assign(operationId: string, input: Assign): OntologyInvocation {
     return invoke("action_type", "Assign", operationId, input);
@@ -101,5 +141,73 @@ export class ScopedOntologyClient {
 
   ticket(operationId: string, input: Ticket): OntologyInvocation {
     return invoke("object_type", "Ticket", operationId, input);
+  }
+
+  async evaluateTicketSet(descriptor: TicketSetDescriptor, operationId: string): Promise<ObjectSetPage> {
+    const call = invoke("object_type", "Ticket", operationId, {});
+    return invokeHttpJson<ObjectSetPage>(
+      this.baseUrl,
+      "sekai.SekaiService",
+      "EvaluateObjectSet",
+      {
+        descriptor: {
+          contractVersion: "sekai.object-set/v1",
+          namespace: GENERATED_NAMESPACE,
+          kind: "Ticket",
+          definitionDigest: GENERATED_REVISION_DIGEST,
+          propertyFilters: descriptor.propertyFilters ?? [],
+          orderBy: descriptor.orderBy ?? "",
+          descending: descriptor.descending ?? false,
+          limit: descriptor.limit ?? 0,
+          ...(descriptor.traversal ? { traversal: descriptor.traversal } : {}),
+        },
+        pageToken: descriptor.pageToken ?? "",
+      },
+      this.authorization,
+      httpHeaders(call),
+    );
+  }
+
+  async *pageTicketSet(descriptor: TicketSetDescriptor, operationId: string): AsyncGenerator<ObjectSetPage, void, void> {
+    const call = invoke("object_type", "Ticket", operationId, {});
+    yield* pageHttpJson<ObjectSetPage>(
+      this.baseUrl,
+      "sekai.SekaiService",
+      "EvaluateObjectSet",
+      {
+        descriptor: {
+          contractVersion: "sekai.object-set/v1",
+          namespace: GENERATED_NAMESPACE,
+          kind: "Ticket",
+          definitionDigest: GENERATED_REVISION_DIGEST,
+          propertyFilters: descriptor.propertyFilters ?? [],
+          orderBy: descriptor.orderBy ?? "",
+          descending: descriptor.descending ?? false,
+          limit: descriptor.limit ?? 0,
+          ...(descriptor.traversal ? { traversal: descriptor.traversal } : {}),
+        },
+        pageToken: descriptor.pageToken ?? "",
+      },
+      this.authorization,
+      httpHeaders(call),
+    );
+  }
+
+  async submitAssign(parameters: Assign, operationId: string): Promise<unknown> {
+    const call = invoke("action_type", "Assign", operationId, parameters);
+    return invokeHttpJson(
+      this.baseUrl,
+      "sekai.SekaiService",
+      "SubmitActionInstance",
+      {
+        namespace: GENERATED_NAMESPACE,
+        typeId: "Assign",
+        parametersJson: JSON.stringify(call.input),
+        requestId: operationId,
+        ontologyDigest: GENERATED_REVISION_DIGEST,
+      },
+      this.authorization,
+      httpHeaders(call),
+    );
   }
 }

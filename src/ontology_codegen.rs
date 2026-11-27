@@ -8,11 +8,17 @@
 
 use crate::http_projection::HTTP_PROJECTION_CONTRACT;
 use crate::sekai::definition_branch::{DefinitionMember, DefinitionRevision};
+use crate::sekai::object_set::CONTRACT_VERSION as OBJECT_SET_CONTRACT;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const GENERATOR_CONTRACT_VERSION: &str = "sekai.ontology-client/v1";
+
+/// Published HTTP runtime the generated HTTP package depends on (today's helper).
+pub const HTTP_RUNTIME_TS_PACKAGE: &str = "@sannrox/sekai-chisei-sdk";
+pub const HTTP_RUNTIME_PY_PACKAGE: &str = "sekai-chisei-sdk";
+pub const HTTP_RUNTIME_VERSION: &str = "0.1.0";
 
 const SELECTABLE_MEMBER_KINDS: &[&str] = &["action_type", "function", "link_type", "object_type"];
 
@@ -28,7 +34,11 @@ const RESERVED_TS_NAMES: &[&str] = &[
     "bindLiveRevision",
     "httpHeaders",
     "invoke",
+    "invokeHttpJson",
+    "LinkTraversal",
     "nativeMetadata",
+    "ObjectSetPage",
+    "pageHttpJson",
     "scopeAllows",
 ];
 
@@ -47,7 +57,12 @@ const RESERVED_PY_NAMES: &[&str] = &[
     "bind_live_revision",
     "http_headers",
     "invoke",
+    "invoke_http_json",
+    "json",
+    "LinkTraversal",
     "native_metadata",
+    "ObjectSetPage",
+    "page_http_json",
     "scope_allows",
 ];
 
@@ -59,9 +74,9 @@ const PYTHON_KEYWORDS: &[&str] = &[
 ];
 
 /// Where a generated client sends its calls. Both targets share one typed
-/// surface, selection, and fail-closed rules; only the request metadata helper
-/// differs (`nativeMetadata` for gRPC, `httpHeaders` for the ADR 0075 HTTP
-/// projection, ADR 0160).
+/// surface, selection, and fail-closed rules. Native gRPC emits
+/// `nativeMetadata`. HTTP emits `httpHeaders` and calls EvaluateObjectSet and
+/// SubmitActionInstance through the shared runtime (ADR 0075, ADR 0160).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Transport {
     NativeGrpc,
@@ -200,6 +215,26 @@ pub fn verify_ontology_python_client_package(
     Ok(())
 }
 
+/// Manifest for a generated TypeScript HTTP package. The application depends
+/// on this file; the runtime comes with it.
+pub fn ontology_http_package_json() -> String {
+    format!(
+        "{{\n  \"name\": \"@sannrox/sekai-ontology-client\",\n  \"version\": \"0.1.0\",\n  \"type\": \"module\",\n  \"dependencies\": {{\n    {package}: {range}\n  }}\n}}\n",
+        package = js_string(HTTP_RUNTIME_TS_PACKAGE),
+        range = js_string(&format!("^{HTTP_RUNTIME_VERSION}")),
+    )
+}
+
+/// Manifest for a generated Python HTTP package. Same runtime pin as TypeScript.
+pub fn ontology_http_pyproject() -> String {
+    format!(
+        "[project]\nname = \"sekai-ontology-client\"\nversion = \"0.1.0\"\ndependencies = [{dep}]\n",
+        dep = js_string(&format!(
+            "{HTTP_RUNTIME_PY_PACKAGE}>={HTTP_RUNTIME_VERSION},<1"
+        )),
+    )
+}
+
 /// Generate a TypeScript ontology client from one published revision and an
 /// explicit member selection. Failures do not disclose other catalog members.
 pub fn generate_ontology_typescript_client(
@@ -212,8 +247,10 @@ pub fn generate_ontology_typescript_client(
 
 /// Generate a TypeScript ontology client whose calls target the plane's
 /// `sekai.http-projection/v1` listener (ADR 0160). Same selection, typed
-/// surface, and failures as the native target; `httpHeaders` carries the
-/// revision pin and the application supplies the bearer at call time.
+/// members, and failures as the native target. The package depends on the
+/// shared HTTP runtime, types object-set descriptors and Action parameters,
+/// and `httpHeaders` carries the revision pin. The application supplies the
+/// bearer at call time.
 pub fn generate_ontology_typescript_http_client(
     revision: &DefinitionRevision,
     members: &[DefinitionMember],
@@ -367,6 +404,12 @@ fn select_rendered_members(
         selected.push(rendered);
     }
 
+    for name in http_surface_names(&selected, snake_methods) {
+        if !type_names.insert(name.clone()) || !method_names.insert(name) {
+            return Err(OntologyCodegenError::InvalidDefinition);
+        }
+    }
+
     let scope = OntologyClientScope {
         contract_version: GENERATOR_CONTRACT_VERSION.into(),
         namespace: selection.namespace.clone(),
@@ -408,6 +451,76 @@ struct RenderedField {
     name: String,
     ts_type: String,
     required: bool,
+}
+
+fn http_surface_names(selected: &[RenderedMember], snake_methods: bool) -> Vec<String> {
+    let mut names = vec!["ObjectSetPage".into(), "LinkTraversal".into()];
+    for member in selected {
+        match member.member_kind.as_str() {
+            "object_type" => {
+                names.push(format!("{}Property", member.type_name));
+                names.push(format!("{}PropertyFilter", member.type_name));
+                names.push(format!("{}SetDescriptor", member.type_name));
+                if snake_methods {
+                    names.push(format!("evaluate_{}_set", member.method_name));
+                    names.push(format!("page_{}_set", member.method_name));
+                } else {
+                    names.push(format!("evaluate{}Set", member.type_name));
+                    names.push(format!("page{}Set", member.type_name));
+                }
+            }
+            "action_type" => {
+                if snake_methods {
+                    names.push(format!("submit_{}", member.method_name));
+                } else {
+                    names.push(format!("submit{}", member.type_name));
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+fn object_members(selected: &[RenderedMember]) -> Vec<&RenderedMember> {
+    selected
+        .iter()
+        .filter(|member| member.member_kind == "object_type")
+        .collect()
+}
+
+fn action_members(selected: &[RenderedMember]) -> Vec<&RenderedMember> {
+    selected
+        .iter()
+        .filter(|member| member.member_kind == "action_type")
+        .collect()
+}
+
+fn link_members(selected: &[RenderedMember]) -> Vec<&RenderedMember> {
+    selected
+        .iter()
+        .filter(|member| member.member_kind == "link_type")
+        .collect()
+}
+
+fn quoted_names(names: impl IntoIterator<Item = String>, sep: &str) -> String {
+    names.into_iter().collect::<Vec<_>>().join(sep)
+}
+
+fn property_literals(member: &RenderedMember, sep: &str) -> String {
+    quoted_names(
+        member.fields.iter().map(|field| js_string(&field.name)),
+        sep,
+    )
+}
+
+fn link_relation_literals(selected: &[RenderedMember], sep: &str) -> String {
+    quoted_names(
+        link_members(selected)
+            .into_iter()
+            .map(|member| js_string(&member.member_id)),
+        sep,
+    )
 }
 
 fn render_member_types(member: &DefinitionMember) -> Result<RenderedMember, OntologyCodegenError> {
@@ -544,6 +657,9 @@ fn render_typescript(
             id = js_string(&member.member_id),
         ));
     }
+    if transport == Transport::HttpProjection {
+        methods.push_str(&typescript_http_methods(selected));
+    }
 
     let allowed = selected
         .iter()
@@ -560,13 +676,13 @@ fn render_typescript(
 // contract_version={contract_version}
 // namespace={namespace}
 // revision_digest={revision_digest}
-
+{import}
 export const GENERATED_CONTRACT_VERSION = {contract_version};
 export const GENERATED_NAMESPACE = {namespace};
 export const GENERATED_REVISION_DIGEST = {revision_digest};
 {transport_constant}export const ALLOWED_MEMBERS = [{allowed}] as const;
 
-{interfaces}export interface OntologyInvocation {{
+{interfaces}{descriptors}export interface OntologyInvocation {{
   contract_version: string;
   namespace: string;
   revision_digest: string;
@@ -609,7 +725,7 @@ export function invoke<T extends object>(
 
 {metadata}
 export class ScopedOntologyClient {{
-{methods}}}
+{constructor}{methods}}}
 "#,
         contract_version = js_string(&scope.contract_version),
         namespace = js_string(&scope.namespace),
@@ -617,15 +733,183 @@ export class ScopedOntologyClient {{
         allowed = allowed,
         interfaces = interfaces,
         methods = methods,
+        import = match transport {
+            Transport::NativeGrpc => String::new(),
+            Transport::HttpProjection => format!(
+                "\nimport {{ invokeHttpJson, pageHttpJson }} from {}/http\";\n",
+                js_string(HTTP_RUNTIME_TS_PACKAGE).trim_end_matches('"')
+            ),
+        },
+        descriptors = match transport {
+            Transport::NativeGrpc => String::new(),
+            Transport::HttpProjection => typescript_descriptor_types(selected),
+        },
+        constructor = match transport {
+            Transport::NativeGrpc => String::new(),
+            Transport::HttpProjection => r#"  readonly baseUrl: string;
+  readonly authorization: string;
+
+  constructor(options: { baseUrl: string; authorization: string }) {
+    this.baseUrl = options.baseUrl;
+    this.authorization = options.authorization;
+  }
+"#
+            .into(),
+        },
         transport_constant = match transport {
             Transport::NativeGrpc => String::new(),
             Transport::HttpProjection => format!(
-                "export const GENERATED_TRANSPORT = {};\n",
-                js_string(HTTP_PROJECTION_CONTRACT)
+                "export const GENERATED_TRANSPORT = {};\nexport const GENERATED_RUNTIME_PACKAGE = {};\nexport const GENERATED_RUNTIME_RANGE = {};\n",
+                js_string(HTTP_PROJECTION_CONTRACT),
+                js_string(HTTP_RUNTIME_TS_PACKAGE),
+                js_string(&format!("^{HTTP_RUNTIME_VERSION}")),
             ),
         },
         metadata = typescript_metadata(transport),
     )
+}
+
+fn typescript_descriptor_types(selected: &[RenderedMember]) -> String {
+    let mut out = String::new();
+    let relations = link_relation_literals(selected, " | ");
+    if !relations.is_empty() {
+        out.push_str(&format!(
+            "export type LinkTraversal = {{\n  relation: {relations};\n  direction?: string;\n  farKind?: string;\n  joinProperty?: string;\n}};\n\n"
+        ));
+    }
+    out.push_str(
+        "export type ObjectSetPage = {\n  members?: unknown[];\n  total?: number;\n  nextPageToken?: string;\n  [key: string]: unknown;\n};\n\n",
+    );
+    for member in object_members(selected) {
+        let properties = property_literals(member, " | ");
+        let filter = if properties.is_empty() {
+            "export type {type}PropertyFilter = {\n  key: \"id\";\n  op: \"in\";\n  value: string;\n};\n\n"
+                .replace("{type}", &member.type_name)
+        } else {
+            format!(
+                "export type {type}Property = {properties};\n\nexport type {type}PropertyFilter =\n  | {{ key: {type}Property; op: \"eq\" | \"gt\" | \"gte\" | \"lt\" | \"lte\"; value: string }}\n  | {{ key: \"id\"; op: \"in\"; value: string }};\n\n",
+                type = member.type_name,
+                properties = properties,
+            )
+        };
+        out.push_str(&filter);
+        let mut descriptor = format!(
+            "export type {}SetDescriptor = {{\n  propertyFilters?: {}PropertyFilter[];\n",
+            member.type_name, member.type_name
+        );
+        if !relations.is_empty() {
+            descriptor.push_str("  traversal?: LinkTraversal;\n");
+        }
+        if !properties.is_empty() {
+            descriptor.push_str(&format!("  orderBy?: {}Property;\n", member.type_name));
+        }
+        descriptor
+            .push_str("  descending?: boolean;\n  limit?: number;\n  pageToken?: string;\n};\n\n");
+        out.push_str(&descriptor);
+    }
+    out
+}
+
+fn typescript_http_methods(selected: &[RenderedMember]) -> String {
+    let mut out = String::new();
+    for member in object_members(selected) {
+        let kind = js_string(&member.member_kind);
+        let id = js_string(&member.member_id);
+        let type_name = &member.type_name;
+        let has_links = !link_members(selected).is_empty();
+        let traversal = if has_links {
+            "          ...(descriptor.traversal ? { traversal: descriptor.traversal } : {}),\n"
+        } else {
+            ""
+        };
+        let order_by = if member.fields.is_empty() {
+            "          orderBy: \"\",\n"
+        } else {
+            "          orderBy: descriptor.orderBy ?? \"\",\n"
+        };
+        out.push_str(&format!(
+            r#"
+  async evaluate{type_name}Set(descriptor: {type_name}SetDescriptor, operationId: string): Promise<ObjectSetPage> {{
+    const call = invoke({kind}, {id}, operationId, {{}});
+    return invokeHttpJson<ObjectSetPage>(
+      this.baseUrl,
+      "sekai.SekaiService",
+      "EvaluateObjectSet",
+      {{
+        descriptor: {{
+          contractVersion: {contract},
+          namespace: GENERATED_NAMESPACE,
+          kind: {id},
+          definitionDigest: GENERATED_REVISION_DIGEST,
+          propertyFilters: descriptor.propertyFilters ?? [],
+{order_by}          descending: descriptor.descending ?? false,
+          limit: descriptor.limit ?? 0,
+{traversal}        }},
+        pageToken: descriptor.pageToken ?? "",
+      }},
+      this.authorization,
+      httpHeaders(call),
+    );
+  }}
+
+  async *page{type_name}Set(descriptor: {type_name}SetDescriptor, operationId: string): AsyncGenerator<ObjectSetPage, void, void> {{
+    const call = invoke({kind}, {id}, operationId, {{}});
+    yield* pageHttpJson<ObjectSetPage>(
+      this.baseUrl,
+      "sekai.SekaiService",
+      "EvaluateObjectSet",
+      {{
+        descriptor: {{
+          contractVersion: {contract},
+          namespace: GENERATED_NAMESPACE,
+          kind: {id},
+          definitionDigest: GENERATED_REVISION_DIGEST,
+          propertyFilters: descriptor.propertyFilters ?? [],
+{order_by}          descending: descriptor.descending ?? false,
+          limit: descriptor.limit ?? 0,
+{traversal}        }},
+        pageToken: descriptor.pageToken ?? "",
+      }},
+      this.authorization,
+      httpHeaders(call),
+    );
+  }}
+"#,
+            type_name = type_name,
+            kind = kind,
+            id = id,
+            contract = js_string(OBJECT_SET_CONTRACT),
+            traversal = traversal,
+            order_by = order_by,
+        ));
+    }
+    for member in action_members(selected) {
+        out.push_str(&format!(
+            r#"
+  async submit{type_name}(parameters: {type_name}, operationId: string): Promise<unknown> {{
+    const call = invoke({kind}, {id}, operationId, parameters);
+    return invokeHttpJson(
+      this.baseUrl,
+      "sekai.SekaiService",
+      "SubmitActionInstance",
+      {{
+        namespace: GENERATED_NAMESPACE,
+        typeId: {id},
+        parametersJson: JSON.stringify(call.input),
+        requestId: operationId,
+        ontologyDigest: GENERATED_REVISION_DIGEST,
+      }},
+      this.authorization,
+      httpHeaders(call),
+    );
+  }}
+"#,
+            type_name = member.type_name,
+            kind = js_string(&member.member_kind),
+            id = js_string(&member.member_id),
+        ));
+    }
+    out
 }
 
 /// The request metadata helper for one transport. Both validate the call
@@ -716,6 +1000,9 @@ fn render_python(
             id = js_string(&member.member_id),
         ));
     }
+    if transport == Transport::HttpProjection {
+        methods.push_str(&python_http_methods(selected));
+    }
 
     let allowed = selected
         .iter()
@@ -735,14 +1022,12 @@ fn render_python(
 
 from __future__ import annotations
 
-from typing import NotRequired, TypedDict
-
-GENERATED_CONTRACT_VERSION = {contract_version}
+{import_block}GENERATED_CONTRACT_VERSION = {contract_version}
 GENERATED_NAMESPACE = {namespace}
 GENERATED_REVISION_DIGEST = {revision_digest}
 {transport_constant}ALLOWED_MEMBERS = [{allowed}]
 
-{classes}class OntologyInvocation(TypedDict):
+{classes}{descriptors}class OntologyInvocation(TypedDict):
     contract_version: str
     namespace: str
     revision_digest: str
@@ -781,23 +1066,189 @@ def invoke(member_kind: str, member_id: str, operation_id: str, input: object) -
 {metadata}
 
 class ScopedOntologyClient:
-{methods}"#,
+{constructor}{methods}"#,
         contract_version = js_string(&scope.contract_version),
         namespace = js_string(&scope.namespace),
         revision_digest = js_string(&scope.revision_digest),
         allowed = allowed,
         classes = classes,
         methods = methods,
+        import_block = match transport {
+            Transport::NativeGrpc => "from typing import NotRequired, TypedDict\n\n".to_string(),
+            Transport::HttpProjection => {
+                "import json\nfrom typing import Literal, NotRequired, TypedDict\n\nfrom sekai_http import invoke_http_json, page_http_json\n\n".to_string()
+            }
+        },
+        descriptors = match transport {
+            Transport::NativeGrpc => String::new(),
+            Transport::HttpProjection => python_descriptor_types(selected),
+        },
+        constructor = match transport {
+            Transport::NativeGrpc => String::new(),
+            Transport::HttpProjection => {
+                "    def __init__(self, base_url: str, authorization: str) -> None:\n        self._base_url = base_url\n        self._authorization = authorization\n".into()
+            }
+        },
         transport_constant = match transport {
             Transport::NativeGrpc => String::new(),
             Transport::HttpProjection => format!(
-                "GENERATED_TRANSPORT = {}\n",
-                js_string(HTTP_PROJECTION_CONTRACT)
+                "GENERATED_TRANSPORT = {}\nGENERATED_RUNTIME_PACKAGE = {}\nGENERATED_RUNTIME_RANGE = {}\n",
+                js_string(HTTP_PROJECTION_CONTRACT),
+                js_string(HTTP_RUNTIME_PY_PACKAGE),
+                js_string(&format!(">={HTTP_RUNTIME_VERSION},<1")),
             ),
         },
         metadata = python_metadata(transport),
     );
     Ok(rendered)
+}
+
+fn python_descriptor_types(selected: &[RenderedMember]) -> String {
+    let mut out = String::new();
+    let relations = link_relation_literals(selected, ", ");
+    if !relations.is_empty() {
+        out.push_str(&format!(
+            "class LinkTraversal(TypedDict):\n    relation: Literal[{relations}]\n    direction: NotRequired[str]\n    farKind: NotRequired[str]\n    joinProperty: NotRequired[str]\n\n"
+        ));
+    }
+    out.push_str(
+        "class ObjectSetPage(TypedDict):\n    members: NotRequired[list[object]]\n    total: NotRequired[int]\n    nextPageToken: NotRequired[str]\n\n",
+    );
+    for member in object_members(selected) {
+        let properties = property_literals(member, ", ");
+        if properties.is_empty() {
+            out.push_str(&format!(
+                "class {}PropertyFilter(TypedDict):\n    key: Literal[\"id\"]\n    op: Literal[\"in\"]\n    value: str\n\n",
+                member.type_name
+            ));
+        } else {
+            out.push_str(&format!(
+                "{type}Property = Literal[{properties}]\n\nclass {type}PropertyFilter(TypedDict):\n    key: Literal[{properties}, \"id\"]\n    op: Literal[\"eq\", \"gt\", \"gte\", \"lt\", \"lte\", \"in\"]\n    value: str\n\n",
+                type = member.type_name,
+                properties = properties,
+            ));
+        }
+        let mut descriptor = format!(
+            "class {}SetDescriptor(TypedDict):\n    propertyFilters: NotRequired[list[{}PropertyFilter]]\n",
+            member.type_name, member.type_name
+        );
+        if !relations.is_empty() {
+            descriptor.push_str("    traversal: NotRequired[LinkTraversal]\n");
+        }
+        if !properties.is_empty() {
+            descriptor.push_str(&format!(
+                "    orderBy: NotRequired[{}Property]\n",
+                member.type_name
+            ));
+        }
+        descriptor.push_str(
+            "    descending: NotRequired[bool]\n    limit: NotRequired[int]\n    pageToken: NotRequired[str]\n\n",
+        );
+        out.push_str(&descriptor);
+    }
+    out
+}
+
+fn python_http_methods(selected: &[RenderedMember]) -> String {
+    let mut out = String::new();
+    for member in object_members(selected) {
+        let kind = js_string(&member.member_kind);
+        let id = js_string(&member.member_id);
+        let has_links = !link_members(selected).is_empty();
+        let order_by = if member.fields.is_empty() {
+            "                \"orderBy\": \"\",\n"
+        } else {
+            "                \"orderBy\": descriptor.get(\"orderBy\") or \"\",\n"
+        };
+        let traversal_eval = if has_links {
+            "        if descriptor.get(\"traversal\"):\n            body[\"descriptor\"][\"traversal\"] = descriptor[\"traversal\"]\n"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            r#"
+    def evaluate_{method}_set(self, descriptor: {type_name}SetDescriptor, operation_id: str) -> object:
+        call = invoke({kind}, {id}, operation_id, {{}})
+        body = {{
+            "descriptor": {{
+                "contractVersion": {contract},
+                "namespace": GENERATED_NAMESPACE,
+                "kind": {id},
+                "definitionDigest": GENERATED_REVISION_DIGEST,
+                "propertyFilters": descriptor.get("propertyFilters") or [],
+{order_by}                "descending": bool(descriptor.get("descending")),
+                "limit": descriptor.get("limit") or 0,
+            }},
+            "pageToken": descriptor.get("pageToken") or "",
+        }}
+{traversal}        return invoke_http_json(
+            self._base_url,
+            "sekai.SekaiService",
+            "EvaluateObjectSet",
+            body,
+            self._authorization,
+            http_headers(call),
+        )
+
+    def page_{method}_set(self, descriptor: {type_name}SetDescriptor, operation_id: str):
+        call = invoke({kind}, {id}, operation_id, {{}})
+        body = {{
+            "descriptor": {{
+                "contractVersion": {contract},
+                "namespace": GENERATED_NAMESPACE,
+                "kind": {id},
+                "definitionDigest": GENERATED_REVISION_DIGEST,
+                "propertyFilters": descriptor.get("propertyFilters") or [],
+{order_by}                "descending": bool(descriptor.get("descending")),
+                "limit": descriptor.get("limit") or 0,
+            }},
+            "pageToken": descriptor.get("pageToken") or "",
+        }}
+{traversal}        yield from page_http_json(
+            self._base_url,
+            "sekai.SekaiService",
+            "EvaluateObjectSet",
+            body,
+            self._authorization,
+            http_headers(call),
+        )
+"#,
+            method = member.method_name,
+            type_name = member.type_name,
+            kind = kind,
+            id = id,
+            contract = js_string(OBJECT_SET_CONTRACT),
+            order_by = order_by,
+            traversal = traversal_eval,
+        ));
+    }
+    for member in action_members(selected) {
+        out.push_str(&format!(
+            r#"
+    def submit_{method}(self, parameters: {type_name}, operation_id: str) -> object:
+        call = invoke({kind}, {id}, operation_id, parameters)
+        return invoke_http_json(
+            self._base_url,
+            "sekai.SekaiService",
+            "SubmitActionInstance",
+            {{
+                "namespace": GENERATED_NAMESPACE,
+                "typeId": {id},
+                "parametersJson": json.dumps(call["input"]),
+                "requestId": operation_id,
+                "ontologyDigest": GENERATED_REVISION_DIGEST,
+            }},
+            self._authorization,
+            http_headers(call),
+        )
+"#,
+            method = member.method_name,
+            type_name = member.type_name,
+            kind = js_string(&member.member_kind),
+            id = js_string(&member.member_id),
+        ));
+    }
+    out
 }
 
 /// Python counterpart of [`typescript_metadata`].
@@ -1278,9 +1729,8 @@ mod tests {
         );
     }
 
-    /// The HTTP target (ADR 0160) keeps the native typed surface: removing
-    /// each target's metadata helper and transport constant leaves the same
-    /// source. Goldens pin the HTTP output.
+    /// The HTTP target keeps the native typed members and adds a runtime
+    /// import plus typed object-set / Action calls. Goldens pin the HTTP output.
     #[test]
     fn http_target_keeps_the_native_typed_surface() {
         let (revision, members) = fixture_catalog();
@@ -1306,32 +1756,19 @@ mod tests {
         assert_eq!(http_py.scope, native_py.scope);
         assert_ne!(http_ts.package_digest, native_ts.package_digest);
 
-        let ts_transport = format!(
-            "export const GENERATED_TRANSPORT = {};\n",
-            js_string(HTTP_PROJECTION_CONTRACT)
-        );
-        assert_eq!(
-            http_ts
-                .typescript
-                .replace(typescript_metadata(Transport::HttpProjection), "")
-                .replace(&ts_transport, ""),
-            native_ts
-                .typescript
-                .replace(typescript_metadata(Transport::NativeGrpc), ""),
-        );
-        let py_transport = format!(
-            "GENERATED_TRANSPORT = {}\n",
-            js_string(HTTP_PROJECTION_CONTRACT)
-        );
-        assert_eq!(
-            http_py
-                .python
-                .replace(python_metadata(Transport::HttpProjection), "")
-                .replace(&py_transport, ""),
-            native_py
-                .python
-                .replace(python_metadata(Transport::NativeGrpc), ""),
-        );
+        assert!(http_ts.typescript.contains("export interface Ticket"));
+        assert!(http_ts.typescript.contains("export interface Assign"));
+        assert!(http_ts.typescript.contains("evaluateTicketSet"));
+        assert!(http_ts.typescript.contains("submitAssign"));
+        assert!(http_ts.typescript.contains("TicketSetDescriptor"));
+        assert!(http_ts.typescript.contains("LinkTraversal"));
+        assert!(http_ts.typescript.contains(HTTP_RUNTIME_TS_PACKAGE));
+        assert!(http_py.python.contains("class Ticket(TypedDict)"));
+        assert!(http_py.python.contains("class Assign(TypedDict)"));
+        assert!(http_py.python.contains("def evaluate_ticket_set"));
+        assert!(http_py.python.contains("def submit_assign"));
+        assert!(http_py.python.contains("class TicketSetDescriptor"));
+        assert!(http_py.python.contains("from sekai_http import"));
         for source in [&http_ts.typescript, &http_py.python] {
             assert!(!source.contains("credential"));
             assert!(!source.contains("token"));
@@ -1341,6 +1778,14 @@ mod tests {
 
         let fixtures =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ontology_codegen");
+        if std::env::var_os("ONTOLOGY_CODEGEN_UPDATE").is_some() {
+            std::fs::write(
+                fixtures.join("scoped_http_client.v1.ts"),
+                &http_ts.typescript,
+            )
+            .unwrap();
+            std::fs::write(fixtures.join("scoped_http_client.v1.py"), &http_py.python).unwrap();
+        }
         for (generated, golden) in [
             (&http_ts.typescript, "scoped_http_client.v1.ts"),
             (&http_py.python, "scoped_http_client.v1.py"),
@@ -1348,6 +1793,147 @@ mod tests {
             let expected = std::fs::read_to_string(fixtures.join(golden)).expect(golden);
             assert_eq!(generated, &expected, "{golden} drifted");
         }
+    }
+
+    #[test]
+    fn http_runtime_package_matches_published_sdk() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let ts: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("sdk/typescript/package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ts["name"], HTTP_RUNTIME_TS_PACKAGE);
+        assert_eq!(ts["version"], HTTP_RUNTIME_VERSION);
+        let py = std::fs::read_to_string(root.join("sdk/python/pyproject.toml")).unwrap();
+        assert!(py.contains(&format!("name = \"{HTTP_RUNTIME_PY_PACKAGE}\"")));
+        assert!(py.contains(&format!("version = \"{HTTP_RUNTIME_VERSION}\"")));
+        let manifest = ontology_http_package_json();
+        assert!(manifest.contains(HTTP_RUNTIME_TS_PACKAGE));
+        assert!(manifest.contains(&format!("^{HTTP_RUNTIME_VERSION}")));
+        let pyproject = ontology_http_pyproject();
+        assert!(pyproject.contains(HTTP_RUNTIME_PY_PACKAGE));
+        assert!(pyproject.contains(&format!(">={HTTP_RUNTIME_VERSION},<1")));
+    }
+
+    /// An application that depends only on the generated HTTP package must
+    /// evaluate a filtered object set and submit an Action. Regression: the
+    /// generated client still only built an invocation object and left the
+    /// request to a sibling helper.
+    #[test]
+    fn generated_http_python_client_evaluates_and_submits() {
+        let (revision, members) = fixture_catalog();
+        let selection = selected(
+            &revision,
+            [
+                OntologyClientMemberRef::new("object_type", "Ticket"),
+                OntologyClientMemberRef::new("link_type", "AssignedTo"),
+                OntologyClientMemberRef::new("action_type", "Assign"),
+            ],
+        );
+        let generated =
+            generate_ontology_python_http_client(&revision, &members, &selection).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("sekai_http.py"),
+            crate::http_codegen::generate_python_client(),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("client.py"), &generated.python).unwrap();
+        std::fs::write(dir.path().join("pyproject.toml"), ontology_http_pyproject()).unwrap();
+        std::fs::write(
+            dir.path().join("probe.py"),
+            r#"
+import http.server
+import json
+import threading
+import typing
+
+if not hasattr(typing, "NotRequired"):
+    typing.NotRequired = typing.Optional
+
+from client import ScopedOntologyClient, GENERATED_REVISION_DIGEST, GENERATED_NAMESPACE
+
+seen = []
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        body = json.loads(self.rfile.read(length) or b"{}")
+        seen.append({
+            "path": self.path,
+            "authorization": self.headers.get("authorization"),
+            "revision": self.headers.get("x-sekai-definition-revision"),
+            "namespace": self.headers.get("x-sekai-namespace"),
+            "body": body,
+        })
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+        if self.path.endswith("EvaluateObjectSet"):
+            self.wfile.write(b'{"members":[{"id":"t1"}],"nextPageToken":""}')
+        else:
+            self.wfile.write(b'{"instance":{"id":"a1"}}')
+
+    def log_message(self, *_args):
+        pass
+
+httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+port = httpd.server_address[1]
+threading.Thread(target=httpd.serve_forever, daemon=True).start()
+client = ScopedOntologyClient(f"http://127.0.0.1:{port}", "Bearer app-token")
+page = client.evaluate_ticket_set(
+    {"propertyFilters": [{"key": "title", "op": "eq", "value": "urgent"}], "traversal": {"relation": "AssignedTo"}},
+    "op-eval",
+)
+submitted = client.submit_assign({"assignee": "ada"}, "op-submit")
+httpd.shutdown()
+if page["members"][0]["id"] != "t1":
+    raise SystemExit(f"evaluate page: {page!r}")
+if submitted["instance"]["id"] != "a1":
+    raise SystemExit(f"submit: {submitted!r}")
+if len(seen) != 2:
+    raise SystemExit(f"calls: {seen!r}")
+evaluate, submit = seen
+if not evaluate["path"].endswith("/sekai.SekaiService/EvaluateObjectSet"):
+    raise SystemExit(evaluate["path"])
+if evaluate["authorization"] != "Bearer app-token":
+    raise SystemExit(evaluate["authorization"])
+if evaluate["revision"] != GENERATED_REVISION_DIGEST or evaluate["namespace"] != GENERATED_NAMESPACE:
+    raise SystemExit("pin headers missing")
+descriptor = evaluate["body"]["descriptor"]
+if descriptor["kind"] != "Ticket" or descriptor["definitionDigest"] != GENERATED_REVISION_DIGEST:
+    raise SystemExit(descriptor)
+if descriptor["propertyFilters"] != [{"key": "title", "op": "eq", "value": "urgent"}]:
+    raise SystemExit(descriptor["propertyFilters"])
+if descriptor["traversal"]["relation"] != "AssignedTo":
+    raise SystemExit(descriptor["traversal"])
+if not submit["path"].endswith("/sekai.SekaiService/SubmitActionInstance"):
+    raise SystemExit(submit["path"])
+if submit["body"]["typeId"] != "Assign":
+    raise SystemExit(submit["body"])
+if json.loads(submit["body"]["parametersJson"]) != {"assignee": "ada"}:
+    raise SystemExit(submit["body"]["parametersJson"])
+"#,
+        )
+        .unwrap();
+        let checked = Command::new("python3")
+            .arg("probe.py")
+            .current_dir(dir.path())
+            .output();
+        let Ok(checked) = checked else {
+            return;
+        };
+        if !checked.status.success()
+            && String::from_utf8_lossy(&checked.stderr).contains("No such file")
+        {
+            return;
+        }
+        assert!(
+            checked.status.success(),
+            "generated HTTP client probe failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr),
+        );
     }
 
     #[test]

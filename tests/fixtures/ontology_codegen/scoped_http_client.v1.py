@@ -5,12 +5,17 @@
 
 from __future__ import annotations
 
-from typing import NotRequired, TypedDict
+import json
+from typing import Literal, NotRequired, TypedDict
+
+from sekai_http import invoke_http_json, page_http_json
 
 GENERATED_CONTRACT_VERSION = "sekai.ontology-client/v1"
 GENERATED_NAMESPACE = "demo"
 GENERATED_REVISION_DIGEST = "sha256:df76a10f45c87ebe11b97f282ff213733127694dae6594ffdef399866606749e"
 GENERATED_TRANSPORT = "sekai.http-projection/v1"
+GENERATED_RUNTIME_PACKAGE = "sekai-chisei-sdk"
+GENERATED_RUNTIME_RANGE = ">=0.1.0,<1"
 ALLOWED_MEMBERS = ["action_type:Assign", "function:CountOpen", "link_type:AssignedTo", "object_type:Ticket"]
 
 class Assign(TypedDict):
@@ -24,6 +29,32 @@ class AssignedTo(TypedDict):
 
 class Ticket(TypedDict):
     title: str
+
+class LinkTraversal(TypedDict):
+    relation: Literal["AssignedTo"]
+    direction: NotRequired[str]
+    farKind: NotRequired[str]
+    joinProperty: NotRequired[str]
+
+class ObjectSetPage(TypedDict):
+    members: NotRequired[list[object]]
+    total: NotRequired[int]
+    nextPageToken: NotRequired[str]
+
+TicketProperty = Literal["title"]
+
+class TicketPropertyFilter(TypedDict):
+    key: Literal["title", "id"]
+    op: Literal["eq", "gt", "gte", "lt", "lte", "in"]
+    value: str
+
+class TicketSetDescriptor(TypedDict):
+    propertyFilters: NotRequired[list[TicketPropertyFilter]]
+    traversal: NotRequired[LinkTraversal]
+    orderBy: NotRequired[TicketProperty]
+    descending: NotRequired[bool]
+    limit: NotRequired[int]
+    pageToken: NotRequired[str]
 
 class OntologyInvocation(TypedDict):
     contract_version: str
@@ -84,6 +115,9 @@ def http_headers(call: OntologyInvocation) -> dict[str, str]:
 
 
 class ScopedOntologyClient:
+    def __init__(self, base_url: str, authorization: str) -> None:
+        self._base_url = base_url
+        self._authorization = authorization
 
     def assign(self, operation_id: str, input: Assign) -> OntologyInvocation:
         return invoke("action_type", "Assign", operation_id, input)
@@ -96,3 +130,72 @@ class ScopedOntologyClient:
 
     def ticket(self, operation_id: str, input: Ticket) -> OntologyInvocation:
         return invoke("object_type", "Ticket", operation_id, input)
+
+    def evaluate_ticket_set(self, descriptor: TicketSetDescriptor, operation_id: str) -> object:
+        call = invoke("object_type", "Ticket", operation_id, {})
+        body = {
+            "descriptor": {
+                "contractVersion": "sekai.object-set/v1",
+                "namespace": GENERATED_NAMESPACE,
+                "kind": "Ticket",
+                "definitionDigest": GENERATED_REVISION_DIGEST,
+                "propertyFilters": descriptor.get("propertyFilters") or [],
+                "orderBy": descriptor.get("orderBy") or "",
+                "descending": bool(descriptor.get("descending")),
+                "limit": descriptor.get("limit") or 0,
+            },
+            "pageToken": descriptor.get("pageToken") or "",
+        }
+        if descriptor.get("traversal"):
+            body["descriptor"]["traversal"] = descriptor["traversal"]
+        return invoke_http_json(
+            self._base_url,
+            "sekai.SekaiService",
+            "EvaluateObjectSet",
+            body,
+            self._authorization,
+            http_headers(call),
+        )
+
+    def page_ticket_set(self, descriptor: TicketSetDescriptor, operation_id: str):
+        call = invoke("object_type", "Ticket", operation_id, {})
+        body = {
+            "descriptor": {
+                "contractVersion": "sekai.object-set/v1",
+                "namespace": GENERATED_NAMESPACE,
+                "kind": "Ticket",
+                "definitionDigest": GENERATED_REVISION_DIGEST,
+                "propertyFilters": descriptor.get("propertyFilters") or [],
+                "orderBy": descriptor.get("orderBy") or "",
+                "descending": bool(descriptor.get("descending")),
+                "limit": descriptor.get("limit") or 0,
+            },
+            "pageToken": descriptor.get("pageToken") or "",
+        }
+        if descriptor.get("traversal"):
+            body["descriptor"]["traversal"] = descriptor["traversal"]
+        yield from page_http_json(
+            self._base_url,
+            "sekai.SekaiService",
+            "EvaluateObjectSet",
+            body,
+            self._authorization,
+            http_headers(call),
+        )
+
+    def submit_assign(self, parameters: Assign, operation_id: str) -> object:
+        call = invoke("action_type", "Assign", operation_id, parameters)
+        return invoke_http_json(
+            self._base_url,
+            "sekai.SekaiService",
+            "SubmitActionInstance",
+            {
+                "namespace": GENERATED_NAMESPACE,
+                "typeId": "Assign",
+                "parametersJson": json.dumps(call["input"]),
+                "requestId": operation_id,
+                "ontologyDigest": GENERATED_REVISION_DIGEST,
+            },
+            self._authorization,
+            http_headers(call),
+        )
