@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! relational-snapshot-rehearsal --plane <url> --keiko <url> --keiko-ca <pem>
-//!     --db-endpoint <host:port> --out <dir> [--advance-steps n]
+//!     --db-endpoint <host:port> --out <dir>
+//!     [--advance-steps n] [--run-name name] [--ensure-only]
 //! ```
 
 use std::process::ExitCode;

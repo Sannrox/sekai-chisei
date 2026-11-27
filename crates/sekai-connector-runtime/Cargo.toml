@@ -18,8 +18,9 @@ kafka-protocol = { version = "0.18", default-features = false, features = ["clie
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "frame", "safe-decode", "checked-decode"] }
 native-tls = "0.2"
 postgres = { version = "0.19", default-features = false }
-postgres-native-tls = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
 ruzstd = "0.9"
 sekai-client = { version = "1.0.0", path = "../sekai-client" }
 sekai-source-sdk = { version = "2.0.0", path = "../sekai-source-sdk" }
@@ -29,6 +30,7 @@ serde_json = "1"
 sha2 = "0.10"
 snap = "1"
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
 
 [target.'cfg(unix)'.dependencies]
 # Only to kill a parser worker's whole process group at its deadline.

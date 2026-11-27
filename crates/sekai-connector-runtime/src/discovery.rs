@@ -185,9 +185,18 @@ impl Runtime {
             .await
         {
             Ok(listed) => listed,
-            Err(RuntimeClaimError::Invalid(_)) => return Ok(None),
+            Err(RuntimeClaimError::Invalid(_)) => {
+                eprintln!("sekai-connector-runtime: source discovery list refused as invalid");
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
+        if !listed.is_empty() {
+            eprintln!(
+                "sekai-connector-runtime: listed {} source discoveries",
+                listed.len()
+            );
+        }
         for work in listed {
             let runs = work
                 .source

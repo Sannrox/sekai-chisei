@@ -33,22 +33,25 @@
 //! text keys. A change may not touch a primary-key column or a column whose
 //! name suggests a secret.
 //!
-//! The connection always uses TLS and verifies the server's certificate
-//! against the system roots plus an optional operator CA. It goes to the
-//! `endpoint` the egress allowlist admitted, parsed the same way. When the
-//! endpoint's name resolves to several addresses, a failure reports the
-//! last one tried, so an endpoint is best named by one address.
+//! The connection always uses TLS (rustls) and verifies the server's
+//! certificate against the system roots plus an optional operator CA,
+//! including a private CA whose validity is longer than a year. It goes
+//! to the `endpoint` the egress allowlist admitted, parsed the same way.
+//! When the endpoint's name resolves to several addresses, a failure
+//! reports the last one tried, so an endpoint is best named by one
+//! address.
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::BytesMut;
-use native_tls::{Certificate, TlsConnector};
 use postgres::config::SslMode;
 use postgres::error::SqlState;
 use postgres::types::{IsNull, ToSql, Type, to_sql_checked};
-use postgres_native_tls::MakeTlsConnector;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use sekai_source_sdk::{
     ConfigValue, Connector, ConnectorFailure, Destination, DiscoveredColumn, DiscoveredRecordKind,
     DiscoverySample, ExportArtifact, MAX_DISCOVERY_SAMPLE_ROWS, MAX_SOURCE_DISPLAY_NAME_BYTES,
@@ -57,6 +60,7 @@ use sekai_source_sdk::{
     contains_secret_like_text,
 };
 use sha2::{Digest, Sha256};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::sync::Prepared;
 
@@ -72,7 +76,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// One database, reached as the Source's user with its bound password.
 pub struct Relational {
     config: postgres::Config,
-    tls: MakeTlsConnector,
+    tls: MakeRustlsConnect,
     /// The quoted, validated delivery table, when the Source names one.
     delivery_table: Option<String>,
     source: String,
@@ -82,24 +86,37 @@ pub struct Relational {
 
 /// The TLS connector every relational Source connects with: the system
 /// roots, plus `ca_pem` when the operator trusts a private CA.
-pub fn tls(ca_pem: Option<&[u8]>) -> Result<MakeTlsConnector, String> {
-    let mut builder = TlsConnector::builder();
+pub fn tls(ca_pem: Option<&[u8]>) -> Result<MakeRustlsConnect, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    roots.add_parsable_certificates(native.certs);
     if let Some(pem) = ca_pem {
-        let certificate =
-            Certificate::from_pem(pem).map_err(|error| format!("parse CA certificate: {error}"))?;
-        builder.add_root_certificate(certificate);
+        let certs = CertificateDer::pem_slice_iter(pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("parse CA certificate: {error}"))?;
+        if certs.is_empty() {
+            return Err("parse CA certificate: PEM contained no certificates".into());
+        }
+        for cert in certs {
+            roots
+                .add(cert)
+                .map_err(|error| format!("parse CA certificate: {error}"))?;
+        }
     }
-    builder
-        .build()
-        .map(MakeTlsConnector::new)
-        .map_err(|error| format!("build TLS connector: {error}"))
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| format!("build TLS connector: {error}"))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(MakeRustlsConnect::new(config))
 }
 
 /// Opens the relational type for a prepared Source; register it with
 /// `Connectors::with(&RELATIONAL_CONNECTOR, move |prepared| relational::open(prepared, &tls))`.
 pub fn open(
     prepared: &Prepared,
-    tls: &MakeTlsConnector,
+    tls: &MakeRustlsConnect,
 ) -> Result<Box<dyn Connector + Send>, ConnectorFailure> {
     let text = |name: &str| match prepared.config.get(name) {
         Some(ConfigValue::Text(value)) => Ok(Some(value.as_str())),
@@ -809,12 +826,117 @@ fn cell_from(row: &postgres::Row, idx: usize) -> Result<Option<Cell>, ConnectorF
             .try_get::<_, Option<String>>(idx)
             .map(|v| v.map(Cell::Text)));
     }
+    if *ty == Type::NUMERIC {
+        return get(row
+            .try_get::<_, Option<NumericText>>(idx)
+            .map(|value| value.map(|numeric| Cell::Text(numeric.0))));
+    }
     if *ty == Type::TIMESTAMP || *ty == Type::TIMESTAMPTZ {
         return get(row
             .try_get::<_, Option<SystemTime>>(idx)
             .map(|time| time.and_then(system_time_micros).map(Cell::Time)));
     }
     Err(ConnectorFailure::Invalid)
+}
+
+/// PostgreSQL `numeric` as its display decimal, including `dscale` zeros.
+struct NumericText(String);
+
+impl<'a> postgres::types::FromSql<'a> for NumericText {
+    fn from_sql(_ty: &Type, raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        Ok(Self(numeric_to_text(raw)?))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
+}
+
+/// Decode PostgreSQL's binary `numeric` (base-10000 groups plus display scale).
+fn numeric_to_text(raw: &[u8]) -> Result<String, Box<dyn Error + Sync + Send>> {
+    const NUMERIC_NEG: u16 = 0x4000;
+    const NUMERIC_NAN: u16 = 0xC000;
+    const NUMERIC_PINF: u16 = 0xD000;
+    const NUMERIC_NINF: u16 = 0xF000;
+    if raw.len() < 8 {
+        return Err("numeric too short".into());
+    }
+    let ndigits = i16::from_be_bytes(raw[0..2].try_into()?);
+    let weight = i16::from_be_bytes(raw[2..4].try_into()?);
+    let sign = u16::from_be_bytes(raw[4..6].try_into()?);
+    let dscale = i16::from_be_bytes(raw[6..8].try_into()?);
+    if matches!(sign, NUMERIC_NAN | NUMERIC_PINF | NUMERIC_NINF) {
+        return Err("numeric is not a finite number".into());
+    }
+    if ndigits < 0 || dscale < 0 {
+        return Err("numeric header is invalid".into());
+    }
+    let ndigits = usize::try_from(ndigits)?;
+    if raw.len() != 8 + ndigits * 2 {
+        return Err("numeric length does not match ndigits".into());
+    }
+    let negative = sign == NUMERIC_NEG;
+    if ndigits == 0 {
+        return Ok(format_numeric_decimal("0", 0, dscale as usize, negative));
+    }
+    let mut coeff = String::new();
+    for index in 0..ndigits {
+        let offset = 8 + index * 2;
+        let digit = i16::from_be_bytes(raw[offset..offset + 2].try_into()?);
+        if !(0..=9999).contains(&digit) {
+            return Err("numeric digit out of range".into());
+        }
+        if index == 0 {
+            coeff.push_str(&digit.to_string());
+        } else {
+            coeff.push_str(&format!("{digit:04}"));
+        }
+    }
+    let exponent = (i32::from(weight) + 1 - i32::try_from(ndigits)?) * 4;
+    Ok(format_numeric_decimal(
+        &coeff,
+        exponent,
+        dscale as usize,
+        negative,
+    ))
+}
+
+fn format_numeric_decimal(coeff: &str, exponent: i32, dscale: usize, negative: bool) -> String {
+    let mut digits: Vec<char> = coeff.chars().collect();
+    let mut scale = -exponent;
+    if scale < 0 {
+        digits.extend(std::iter::repeat_n('0', (-scale) as usize));
+        scale = 0;
+    }
+    let scale = scale as usize;
+    if digits.len() < scale {
+        let pad = scale - digits.len();
+        digits.splice(0..0, std::iter::repeat_n('0', pad));
+    }
+    let int_len = digits.len() - scale;
+    let keep = int_len + dscale;
+    match digits.len().cmp(&keep) {
+        std::cmp::Ordering::Greater => digits.truncate(keep),
+        std::cmp::Ordering::Less => digits.extend(std::iter::repeat_n('0', keep - digits.len())),
+        std::cmp::Ordering::Equal => {}
+    }
+    let int_raw: String = digits[..int_len].iter().collect();
+    let int_part = {
+        let trimmed = int_raw.trim_start_matches('0');
+        if trimmed.is_empty() { "0" } else { trimmed }
+    };
+    let frac: String = digits[int_len..].iter().collect();
+    let zero = int_part == "0" && frac.chars().all(|digit| digit == '0');
+    let mut out = String::new();
+    if negative && !zero {
+        out.push('-');
+    }
+    out.push_str(int_part);
+    if dscale > 0 {
+        out.push('.');
+        out.push_str(&frac);
+    }
+    out
 }
 
 /// One typed cell used for both identity encoding and resume parameters.
@@ -1108,18 +1230,30 @@ fn now_ms() -> i64 {
         })
 }
 
+fn is_transport(error: &postgres::Error) -> bool {
+    if error.is_closed() {
+        return true;
+    }
+    let mut source = std::error::Error::source(error);
+    while let Some(err) = source {
+        if err.is::<std::io::Error>() || err.is::<rustls::Error>() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
 /// A database refusal as the connector's failure class.
 fn failure(error: postgres::Error) -> ConnectorFailure {
+    // Display is value-free (host, TLS, SQLSTATE). Needed because the
+    // runtime binary has no tracing subscriber.
+    eprintln!("sekai-connector-runtime: relational: {error}");
     let Some(code) = error.code() else {
         // No server answer. The connection, TLS or the network failed, or
         // the client refused the table's shape (a column type, a missing
         // row), which is the Source's configuration.
-        let source = std::error::Error::source(&error);
-        let transport = error.is_closed()
-            || source.is_some_and(|source| {
-                source.is::<std::io::Error>() || source.is::<native_tls::Error>()
-            });
-        return if transport {
+        return if is_transport(&error) {
             ConnectorFailure::Unreachable
         } else {
             ConnectorFailure::Invalid
@@ -1517,6 +1651,51 @@ mod tests {
         assert!(ReadSpec::parse(&prepared(&wide, Some("pw")).config).is_err());
     }
 
+    fn encode_numeric(digits: &[i16], weight: i16, sign: u16, dscale: i16) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&(digits.len() as i16).to_be_bytes());
+        raw.extend_from_slice(&weight.to_be_bytes());
+        raw.extend_from_slice(&sign.to_be_bytes());
+        raw.extend_from_slice(&dscale.to_be_bytes());
+        for digit in digits {
+            raw.extend_from_slice(&digit.to_be_bytes());
+        }
+        raw
+    }
+
+    #[test]
+    fn numeric_binary_keeps_display_scale() {
+        assert_eq!(numeric_to_text(&encode_numeric(&[], 0, 0, 0)).unwrap(), "0");
+        assert_eq!(
+            numeric_to_text(&encode_numeric(&[], 0, 0, 2)).unwrap(),
+            "0.00"
+        );
+        assert_eq!(
+            numeric_to_text(&encode_numeric(&[1], 0, 0, 0)).unwrap(),
+            "1"
+        );
+        assert_eq!(
+            numeric_to_text(&encode_numeric(&[1], 1, 0, 0)).unwrap(),
+            "10000"
+        );
+        assert_eq!(
+            numeric_to_text(&encode_numeric(&[2247, 8000], 0, 0, 2)).unwrap(),
+            "2247.80"
+        );
+        assert_eq!(
+            numeric_to_text(&encode_numeric(&[2247, 8000], 0, 0x4000, 2)).unwrap(),
+            "-2247.80"
+        );
+        assert_eq!(
+            numeric_to_text(&encode_numeric(&[5000], -1, 0, 2)).unwrap(),
+            "0.50"
+        );
+        assert_eq!(
+            numeric_to_text(&encode_numeric(&[12, 5000], 0, 0, 2)).unwrap(),
+            "12.50"
+        );
+    }
+
     #[test]
     fn cursors_round_trip_typed_cells() {
         let cursor = Cursor {
@@ -1565,14 +1744,16 @@ mod tests {
         admin
             .batch_execute(&format!(
                 "CREATE TABLE {table} (id int PRIMARY KEY, name text NOT NULL, \
-                 updated_at bigint NOT NULL, password text NOT NULL)"
+                 updated_at bigint NOT NULL, value_eur numeric(12,2) NOT NULL, \
+                 password text NOT NULL)"
             ))
             .unwrap();
         admin
             .batch_execute(&format!(
-                "INSERT INTO {table} (id, name, updated_at, password) VALUES \
-                 (1, 'a', 10, 'secret'), (2, 'b', 20, 'secret'), (3, 'c', 30, 'secret'), \
-                 (4, 'd', 40, 'secret'), (5, 'e', 50, 'secret')"
+                "INSERT INTO {table} (id, name, updated_at, value_eur, password) VALUES \
+                 (1, 'a', 10, 10.50, 'secret'), (2, 'b', 20, 20.00, 'secret'), \
+                 (3, 'c', 30, 30.25, 'secret'), (4, 'd', 40, 40.00, 'secret'), \
+                 (5, 'e', 50, 50.00, 'secret')"
             ))
             .unwrap();
         let host = if host == "localhost" {
@@ -1607,6 +1788,10 @@ mod tests {
                 .iter()
                 .all(|record| !record.properties.contains_key("password"))
         );
+        assert_eq!(
+            first.records[0].properties.get("value_eur"),
+            Some(&PropertyValue::String("10.50".into()))
+        );
         let mut cursor = Some(first.proposed_next_cursor);
         let mut ids = first
             .records
@@ -1630,7 +1815,8 @@ mod tests {
         admin
             .batch_execute(&format!(
                 "UPDATE {table} SET updated_at = 60, name = 'A' WHERE id = 1; \
-                 INSERT INTO {table} (id, name, updated_at, password) VALUES (6, 'f', 70, 'secret')"
+                 INSERT INTO {table} (id, name, updated_at, value_eur, password) \
+                 VALUES (6, 'f', 70, 70.00, 'secret')"
             ))
             .unwrap();
         let mut changed = Vec::new();

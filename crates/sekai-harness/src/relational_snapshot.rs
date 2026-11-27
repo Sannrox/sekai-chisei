@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use sekai_chisei::grpc::pb::sekai::sekai_service_client::SekaiServiceClient;
 use sekai_chisei::grpc::pb::sekai::{
-    ConnectorSource, ConnectorSourceSpec, EnsureTeamNamespaceRequest, GetObjectRequest,
-    GetSourceDiscoveryRequest, GetSourceRequest, GetSourceSyncStateRequest, PutSourceRequest,
+    ConnectorSource, ConnectorSourceSpec, EnsureTeamNamespaceRequest, GetSourceDiscoveryRequest,
+    GetSourceRequest, GetSourceSyncStateRequest, ListFilter, ListObjectsRequest, PutSourceRequest,
     RegisterSourceTypeDescriptorRequest, RequestSourceDiscoveryRequest, SourceConfigValue,
     TickGovernedTransformsRequest, source_config_value,
 };
@@ -32,9 +32,14 @@ pub const DATABASE: &str = "erp";
 pub const SCHEMA: &str = "public";
 pub const CREDENTIAL_REF: &str = "ops/keiko-connector";
 pub const PLACEMENT_ROLE: &str = "rehearsal";
+/// Team grant. `local` is reserved for the insecure/UDS caller identity.
+pub const TEAM_PRINCIPAL: &str = "rehearsal";
 const SYNC_EVERY_MS: i64 = 60_000;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
-const SYNC_TIMEOUT: Duration = Duration::from_secs(900);
+const SYNC_TIMEOUT: Duration = Duration::from_secs(14_400);
+const LIST_PAGE: i32 = 1_000;
+/// keiko hard-deletes one exception every 7th activity step.
+pub const HARD_DELETE_EVERY: u32 = 7;
 
 /// One fixture table the relational type snapshots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,14 +225,7 @@ pub fn cell_json(kind: ColumnKind, value: Option<&str>) -> serde_json::Value {
                 .parse::<i64>()
                 .map(serde_json::Value::from)
                 .unwrap_or_else(|_| serde_json::Value::String(text.to_string())),
-            ColumnKind::Numeric => text
-                .parse::<f64>()
-                .map(|number| {
-                    serde_json::Number::from_f64(number)
-                        .map(serde_json::Value::Number)
-                        .unwrap_or_else(|| serde_json::Value::String(text.to_string()))
-                })
-                .unwrap_or_else(|_| serde_json::Value::String(text.to_string())),
+            ColumnKind::Numeric => serde_json::Value::String(text.to_string()),
             ColumnKind::Text => serde_json::Value::String(text.to_string()),
         },
     }
@@ -250,6 +248,26 @@ pub fn compare_row(
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScorecardDiff {
+    pub id: i64,
+    pub column: String,
+    #[serde(default)]
+    pub expected: Option<String>,
+    #[serde(default)]
+    pub received: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ScorecardExamples {
+    #[serde(default)]
+    pub missing: Vec<i64>,
+    #[serde(default)]
+    pub extra: Vec<i64>,
+    #[serde(default)]
+    pub different: Vec<ScorecardDiff>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scorecard {
     pub table: String,
@@ -259,12 +277,41 @@ pub struct Scorecard {
     pub missing: i64,
     pub extra: i64,
     pub different: i64,
+    #[serde(default)]
+    pub examples: ScorecardExamples,
 }
 
 impl Scorecard {
     pub fn differences(&self) -> i64 {
         self.missing + self.extra + self.different
     }
+}
+
+/// Activity steps at which keiko hard-deletes one exception.
+pub fn hard_delete_steps(advance_steps: u32) -> Vec<u32> {
+    (1..=advance_steps)
+        .filter(|step| step % HARD_DELETE_EVERY == 0)
+        .collect()
+}
+
+/// What a later compare said about rows keiko no longer holds.
+pub fn hard_delete_observation(card: &Scorecard, advance_steps: u32) -> serde_json::Value {
+    serde_json::json!({
+        "table": card.table,
+        "step": card.step,
+        "advance_steps": advance_steps,
+        "hard_delete_every": HARD_DELETE_EVERY,
+        "hard_delete_steps": hard_delete_steps(advance_steps),
+        "expected": card.expected,
+        "received": card.received,
+        "missing": card.missing,
+        "extra": card.extra,
+        "different": card.different,
+        "extra_examples": card.examples.extra,
+        "missing_examples": card.examples.missing,
+        "held_rows_keiko_deleted": card.extra > 0,
+        "missing_rows_keiko_still_has": card.missing > 0,
+    })
 }
 
 /// First snapshot must match. A later re-read records hard-delete and
@@ -301,6 +348,10 @@ pub struct Rehearsal {
     db_endpoint: String,
     out: PathBuf,
     advance_steps: u32,
+    run_name: String,
+    /// Grant the team namespace and exit, so the runtime can register
+    /// before discovery is requested.
+    ensure_only: bool,
 }
 
 impl Rehearsal {
@@ -311,6 +362,8 @@ impl Rehearsal {
         let mut db_endpoint = String::new();
         let mut out = PathBuf::new();
         let mut advance_steps = 20u32;
+        let mut run_name = String::new();
+        let mut ensure_only = false;
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             let mut value = || {
@@ -324,6 +377,8 @@ impl Rehearsal {
                 "--keiko-ca" => keiko_ca = PathBuf::from(value()?),
                 "--db-endpoint" => db_endpoint = value()?,
                 "--out" => out = PathBuf::from(value()?),
+                "--run-name" => run_name = value()?,
+                "--ensure-only" => ensure_only = true,
                 "--advance-steps" => {
                     advance_steps = value()?
                         .parse()
@@ -332,16 +387,29 @@ impl Rehearsal {
                 other => return Err(format!("unknown argument {other}")),
             }
         }
-        if plane.is_empty()
-            || keiko.is_empty()
-            || keiko_ca.as_os_str().is_empty()
-            || db_endpoint.is_empty()
-            || out.as_os_str().is_empty()
-        {
+        if plane.is_empty() {
             return Err(
-                "usage: relational-snapshot-rehearsal --plane <url> --keiko <url> --keiko-ca <pem> --db-endpoint <host:port> --out <dir> [--advance-steps n]"
+                "usage: relational-snapshot-rehearsal --plane <url> [--ensure-only] --keiko <url> --keiko-ca <pem> --db-endpoint <host:port> --out <dir> [--advance-steps n] [--run-name name]"
                     .into(),
             );
+        }
+        if !ensure_only
+            && (keiko.is_empty()
+                || keiko_ca.as_os_str().is_empty()
+                || db_endpoint.is_empty()
+                || out.as_os_str().is_empty())
+        {
+            return Err(
+                "usage: relational-snapshot-rehearsal --plane <url> --keiko <url> --keiko-ca <pem> --db-endpoint <host:port> --out <dir> [--advance-steps n] [--run-name name]"
+                    .into(),
+            );
+        }
+        if run_name.is_empty() {
+            run_name = if advance_steps == 0 {
+                "medium".into()
+            } else {
+                "initial".into()
+            };
         }
         Ok(Self {
             plane,
@@ -350,17 +418,36 @@ impl Rehearsal {
             db_endpoint,
             out,
             advance_steps,
+            run_name,
+            ensure_only,
         })
     }
 }
 
+async fn ensure_namespace(plane: &str) -> Result<(), String> {
+    let mut client = connect(plane).await?;
+    client
+        .ensure_team_namespace(EnsureTeamNamespaceRequest {
+            namespace: NAMESPACE.into(),
+            principal: TEAM_PRINCIPAL.into(),
+            role: "admin".into(),
+        })
+        .await
+        .map_err(status)?;
+    Ok(())
+}
+
 pub async fn run(rehearsal: Rehearsal) -> Result<(), String> {
+    if rehearsal.ensure_only {
+        return ensure_namespace(&rehearsal.plane).await;
+    }
     std::fs::create_dir_all(&rehearsal.out).map_err(|error| error.to_string())?;
+    let started = Instant::now();
     let mut client = connect(&rehearsal.plane).await?;
     client
         .ensure_team_namespace(EnsureTeamNamespaceRequest {
             namespace: NAMESPACE.into(),
-            principal: "local".into(),
+            principal: TEAM_PRINCIPAL.into(),
             role: "admin".into(),
         })
         .await
@@ -368,65 +455,65 @@ pub async fn run(rehearsal: Rehearsal) -> Result<(), String> {
     let http = http_client(&rehearsal.keiko_ca)?;
     let mut cards = Vec::new();
     let mut descriptors = BTreeMap::new();
+    let mut sync_ms = BTreeMap::new();
     for table in TABLES {
         let descriptor = discover_and_register(&mut client, table, &rehearsal.db_endpoint).await?;
+        let sync_started = Instant::now();
         wait_for_sync(&mut client, table, &descriptor.digest, SYNC_EVERY_MS).await?;
+        sync_ms.insert(table.name, sync_started.elapsed().as_millis() as u64);
         descriptors.insert(table.name, descriptor);
     }
     let truth = fixture_truth(&http, &rehearsal.keiko).await?;
     for table in TABLES {
-        let descriptor = descriptors
-            .get(table.name)
-            .ok_or_else(|| format!("{} was not registered", table.name))?;
-        let rows = expected_rows(&truth, table.name)?;
-        let jsonl = export_rows(&mut client, table, descriptor, 1, rows, true).await?;
+        let _rows = expected_rows(&truth, table.name)?;
+        let jsonl = export_held(&mut client, table).await?;
         let card = compare_table(&http, &rehearsal.keiko, table.name, &jsonl).await?;
-        write_scorecard(&rehearsal.out, "initial", &card)?;
+        write_scorecard(&rehearsal.out, &rehearsal.run_name, &card)?;
         if unexpected_differences(ComparePass::Initial, &card) {
             return Err(format!(
-                "initial compare for {} reported missing={} extra={} different={}",
-                table.name, card.missing, card.extra, card.different
+                "{} compare for {} reported missing={} extra={} different={}",
+                rehearsal.run_name, table.name, card.missing, card.extra, card.different
             ));
         }
-        cards.push(("initial", card));
+        cards.push((rehearsal.run_name.as_str(), card));
     }
-    advance(&http, &rehearsal.keiko, rehearsal.advance_steps).await?;
-    for table in TABLES {
-        let descriptor = descriptors
-            .get(table.name)
-            .ok_or_else(|| format!("{} was not registered", table.name))?;
-        wait_for_sync(
-            &mut client,
-            table,
-            &descriptor.digest,
-            SYNC_EVERY_MS + 1_000,
-        )
-        .await?;
-        let truth = fixture_truth(&http, &rehearsal.keiko).await?;
-        let rows = expected_rows(&truth, table.name)?;
-        let jsonl = export_rows(
-            &mut client,
-            table,
-            descriptor,
-            1,
-            rows.saturating_add(64),
-            false,
-        )
-        .await?;
-        let card = compare_table(&http, &rehearsal.keiko, table.name, &jsonl).await?;
-        write_scorecard(&rehearsal.out, "after-advance", &card)?;
-        cards.push(("after-advance", card));
+    let mut hard_deletes = None;
+    if rehearsal.advance_steps > 0 {
+        advance(&http, &rehearsal.keiko, rehearsal.advance_steps).await?;
+        for table in TABLES {
+            let descriptor = descriptors
+                .get(table.name)
+                .ok_or_else(|| format!("{} was not registered", table.name))?;
+            wait_for_sync(
+                &mut client,
+                table,
+                &descriptor.digest,
+                SYNC_EVERY_MS + 1_000,
+            )
+            .await?;
+            let jsonl = export_held(&mut client, table).await?;
+            let card = compare_table(&http, &rehearsal.keiko, table.name, &jsonl).await?;
+            write_scorecard(&rehearsal.out, "after-advance", &card)?;
+            if table.name == "exceptions" {
+                hard_deletes = Some(hard_delete_observation(&card, rehearsal.advance_steps));
+                write_json(
+                    &rehearsal.out.join("hard-deletes.json"),
+                    hard_deletes.as_ref().expect("just set"),
+                )?;
+            }
+            cards.push(("after-advance", card));
+        }
     }
     let report = serde_json::json!({
         "keiko_image": KEIKO_IMAGE,
+        "run_name": rehearsal.run_name,
         "advance_steps": rehearsal.advance_steps,
+        "wall_ms": started.elapsed().as_millis() as u64,
+        "sync_ms": sync_ms,
+        "hard_deletes": hard_deletes,
         "scorecards": cards.iter().map(|(pass, card)| json_card(pass, card)).collect::<Vec<_>>(),
     });
-    std::fs::write(
-        rehearsal.out.join("report.json"),
-        serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
+    write_json(&rehearsal.out.join("report.json"), &report)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
@@ -444,6 +531,7 @@ fn json_card(pass: &str, card: &Scorecard) -> serde_json::Value {
         "missing": card.missing,
         "extra": card.extra,
         "different": card.different,
+        "examples": card.examples,
     })
 }
 
@@ -703,30 +791,35 @@ async fn tick(client: &mut SekaiServiceClient<Channel>) -> Result<(), String> {
     Ok(())
 }
 
-async fn export_rows(
+async fn export_held(
     client: &mut SekaiServiceClient<Channel>,
     table: &Table,
-    descriptor: &ProposedSourceTypeDescriptor,
-    first: i64,
-    last: i64,
-    require: bool,
 ) -> Result<String, String> {
     let mut lines = Vec::new();
-    for key in first..=last {
-        let id = object_id(descriptor, table, &key.to_string())?;
-        match client.get_object(GetObjectRequest { id: id.clone() }).await {
-            Ok(response) => {
-                let object = response
-                    .into_inner()
-                    .object
-                    .ok_or_else(|| format!("object {id} had no body"))?;
-                let properties = object.properties.into_iter().collect();
-                let row = compare_row(table, &properties);
-                lines.push(serde_json::to_string(&row).map_err(|error| error.to_string())?);
-            }
-            Err(error) if !require && error.code() == tonic::Code::NotFound => continue,
-            Err(error) => return Err(status(error)),
+    let mut page_token = String::new();
+    loop {
+        let listed = client
+            .list_objects(ListObjectsRequest {
+                filter: Some(ListFilter {
+                    kind: table.record_kind.into(),
+                    namespace: NAMESPACE.into(),
+                    limit: LIST_PAGE,
+                    ..Default::default()
+                }),
+                page_token,
+            })
+            .await
+            .map_err(status)?
+            .into_inner();
+        for object in listed.objects {
+            let properties = object.properties.into_iter().collect();
+            let row = compare_row(table, &properties);
+            lines.push(serde_json::to_string(&row).map_err(|error| error.to_string())?);
         }
+        if listed.next_page_token.is_empty() {
+            break;
+        }
+        page_token = listed.next_page_token;
     }
     Ok(lines.join("\n"))
 }
@@ -811,10 +904,13 @@ async fn advance(http: &reqwest::Client, keiko: &str, steps: u32) -> Result<(), 
 }
 
 fn write_scorecard(out: &Path, pass: &str, card: &Scorecard) -> Result<(), String> {
-    let path = out.join(format!("{pass}-{}.json", card.table));
+    write_json(&out.join(format!("{pass}-{}.json", card.table)), card)
+}
+
+fn write_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     std::fs::write(
         path,
-        serde_json::to_vec_pretty(card).map_err(|error| error.to_string())?,
+        serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
 }
@@ -826,6 +922,11 @@ fn status(error: tonic::Status) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn team_grant_is_not_a_reserved_principal() {
+        assert!(!matches!(TEAM_PRINCIPAL, "local" | "root" | "anonymous"));
+    }
 
     #[test]
     fn six_tables_cover_the_fixture() {
@@ -858,6 +959,16 @@ mod tests {
         assert_eq!(row.get("id"), Some(&serde_json::json!(1)));
         assert_eq!(row.get("deleted_at"), Some(&serde_json::Value::Null));
         assert_eq!(row.get("city"), Some(&serde_json::json!("Hamburg")));
+        let mut order = BTreeMap::new();
+        order.insert("id".into(), "1".into());
+        order.insert("customer_id".into(), "2".into());
+        order.insert("requested_delivery".into(), "2026-03-14".into());
+        order.insert("value_eur".into(), "2247.80".into());
+        let order_row = compare_row(&TABLES[1], &order);
+        assert_eq!(
+            order_row.get("value_eur"),
+            Some(&serde_json::json!("2247.80"))
+        );
     }
 
     #[test]
@@ -870,6 +981,7 @@ mod tests {
             missing: 0,
             extra: 0,
             different: 0,
+            examples: ScorecardExamples::default(),
         };
         let drifted = Scorecard {
             different: 1,
@@ -878,6 +990,40 @@ mod tests {
         assert!(!unexpected_differences(ComparePass::Initial, &clean));
         assert!(unexpected_differences(ComparePass::Initial, &drifted));
         assert!(!unexpected_differences(ComparePass::AfterAdvance, &drifted));
+    }
+
+    #[test]
+    fn hard_delete_observation_records_extras_without_assuming() {
+        assert_eq!(hard_delete_steps(20), vec![7, 14]);
+        let card = Scorecard {
+            table: "exceptions".into(),
+            step: 20,
+            expected: 1000,
+            received: 1002,
+            missing: 2,
+            extra: 2,
+            different: 0,
+            examples: ScorecardExamples {
+                extra: vec![1, 2],
+                missing: vec![1001, 1002],
+                ..ScorecardExamples::default()
+            },
+        };
+        let observed = hard_delete_observation(&card, 20);
+        assert_eq!(observed["held_rows_keiko_deleted"], true);
+        assert_eq!(observed["extra"], 2);
+        assert_eq!(observed["extra_examples"], serde_json::json!([1, 2]));
+        let clean = Scorecard {
+            extra: 0,
+            missing: 0,
+            received: 1000,
+            examples: ScorecardExamples::default(),
+            ..card
+        };
+        assert_eq!(
+            hard_delete_observation(&clean, 20)["held_rows_keiko_deleted"],
+            false
+        );
     }
 
     #[test]
@@ -916,5 +1062,32 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(rehearsal.advance_steps, 20);
+        assert_eq!(rehearsal.run_name, "initial");
+        let medium = Rehearsal::from_args(&[
+            "--plane".into(),
+            "http://127.0.0.1:9".into(),
+            "--keiko".into(),
+            "https://127.0.0.1:8".into(),
+            "--keiko-ca".into(),
+            "ca.crt".into(),
+            "--db-endpoint".into(),
+            "127.0.0.1:5432".into(),
+            "--out".into(),
+            "out".into(),
+            "--advance-steps".into(),
+            "0".into(),
+            "--run-name".into(),
+            "medium".into(),
+        ])
+        .unwrap();
+        assert_eq!(medium.advance_steps, 0);
+        assert_eq!(medium.run_name, "medium");
+        let ensure = Rehearsal::from_args(&[
+            "--plane".into(),
+            "http://127.0.0.1:9".into(),
+            "--ensure-only".into(),
+        ])
+        .unwrap();
+        assert!(ensure.ensure_only);
     }
 }
