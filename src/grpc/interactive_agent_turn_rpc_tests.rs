@@ -9,8 +9,8 @@ use crate::sekai::security::Role;
 
 const NS: &str = "desk";
 
-/// A service with a published, certified revision whose agent member is
-/// `triage`, an editor `alice` and a viewer `bob` of the namespace.
+/// A service with a published, certified revision whose agent members are
+/// `triage` and `gated`, whose Action tool needs approval, an editor `alice` and a viewer `bob` of the namespace.
 /// Returns the revision digest. The revision goes through a certified
 /// proposal merge, since agent revisions are never published directly.
 async fn service_with_revision() -> (SekaiServiceImpl, String) {
@@ -41,19 +41,39 @@ async fn publish_revision(svc: &SekaiServiceImpl) -> String {
                 namespace: NS.into(),
                 branch_id: "agents".into(),
                 expected_head_digest: parent.clone(),
-                upserts: vec![DefinitionMemberInput {
-                    member_kind: "agent".into(),
-                    member_id: "triage".into(),
-                    member_digest: String::new(),
-                    definition_json: serde_json::json!({
-                        "contract_version": "sekai.agent-definition/v1",
-                        "name": "Triage",
-                        "task_class": "lookup",
-                        "instructions": "Inspect records.",
-                        "allowed_action_types": ["Ticket.inspect"]
-                    })
-                    .to_string(),
-                }],
+                upserts: vec![
+                    DefinitionMemberInput {
+                        member_kind: "agent".into(),
+                        member_id: "triage".into(),
+                        member_digest: String::new(),
+                        definition_json: serde_json::json!({
+                            "contract_version": "sekai.agent-definition/v1",
+                            "name": "Triage",
+                            "task_class": "lookup",
+                            "instructions": "Inspect records.",
+                            "allowed_action_types": ["Ticket.inspect"]
+                        })
+                        .to_string(),
+                    },
+                    DefinitionMemberInput {
+                        member_kind: "agent".into(),
+                        member_id: "gated".into(),
+                        member_digest: String::new(),
+                        definition_json: serde_json::json!({
+                            "contract_version": "sekai.agent-definition/v1",
+                            "name": "Gated",
+                            "task_class": "lookup",
+                            "instructions": "Inspect records once approved.",
+                            "allowed_action_types": ["Ticket.inspect"],
+                            "tools": [{
+                                "kind": "action",
+                                "name": "Ticket.inspect",
+                                "approval_policy": "owner"
+                            }]
+                        })
+                        .to_string(),
+                    },
+                ],
                 removals: Vec::new(),
                 idempotency_key: "edit".into(),
             },
@@ -470,8 +490,9 @@ async fn an_opted_in_worker_runs_the_turn_as_the_member() {
             },
         ))
     };
+    // A turn parks only on an Action it submitted.
     let parked = ack("parked").await.unwrap_err();
-    assert_eq!(parked.code(), tonic::Code::FailedPrecondition, "{parked:?}");
+    assert_eq!(parked.code(), tonic::Code::InvalidArgument, "{parked:?}");
     let done = ack("completed").await.unwrap().into_inner().turn.unwrap();
     assert_eq!(
         (done.status.as_str(), done.reason.as_str()),
@@ -539,21 +560,7 @@ async fn revoking_the_member_fails_the_turn() {
 async fn an_interactive_turn_action_names_its_revision_on_the_receipt() {
     let (plane, digest) = token_plane().await;
     let svc = &plane.svc;
-    svc.put_governed_action_type(with_named_principal(PutGovernedActionTypeRequest {
-        r#type: Some(GovernedActionType {
-            namespace: NS.into(),
-            type_id: "Ticket.inspect".into(),
-            version: "1.0.0".into(),
-            description: "Inspect a ticket".into(),
-            parameter_schema_json: r#"{"type":"object","properties":{"note":{"type":"string"}},"required":["note"],"additionalProperties":false}"#.into(),
-            allowed_effect_kinds: vec!["runtime_dispatch".into()],
-            enabled: true,
-            ..Default::default()
-        }),
-        request_id: "put-type".into(),
-    }, "root"))
-    .await
-    .unwrap();
+    put_inspect_type(svc, &[]).await;
     let turn_id = svc
         .admit_interactive_agent_turn(with_named_principal(request(&digest), "alice"))
         .await
@@ -601,4 +608,164 @@ async fn an_interactive_turn_action_names_its_revision_on_the_receipt() {
             trace_id: "trace-1".into(),
         })
     );
+}
+
+/// Enables `Ticket.inspect` in the namespace, decided by `approvers`.
+async fn put_inspect_type(svc: &SekaiServiceImpl, approvers: &[&str]) {
+    svc.put_governed_action_type(with_named_principal(PutGovernedActionTypeRequest {
+        r#type: Some(GovernedActionType {
+            namespace: NS.into(),
+            type_id: "Ticket.inspect".into(),
+            version: "1.0.0".into(),
+            description: "Inspect a ticket".into(),
+            parameter_schema_json: r#"{"type":"object","properties":{"note":{"type":"string"}},"required":["note"],"additionalProperties":false}"#.into(),
+            allowed_effect_kinds: vec!["runtime_dispatch".into()],
+            enabled: true,
+            approvers: approvers.iter().map(|approver| approver.to_string()).collect(),
+            ..Default::default()
+        }),
+        request_id: "put-type".into(),
+    }, "root"))
+    .await
+    .unwrap();
+}
+
+/// An Action the agent binds as a tool with an approval policy parks under
+/// that rule; the turn parks on it and resumes, with the decision as its
+/// continuation, only for a worker that accepts continuation and only once
+/// the type's approver decides it.
+#[tokio::test]
+async fn a_tool_approval_parks_the_turn_until_decided() {
+    let (plane, digest) = token_plane().await;
+    let svc = &plane.svc;
+    grant_source_namespace(svc, NS, "carol", Role::Editor);
+    put_inspect_type(svc, &["carol"]).await;
+    let mut gated = request(&digest);
+    gated.agent_member = "gated".into();
+    let turn_id = svc
+        .admit_interactive_agent_turn(with_named_principal(gated, "alice"))
+        .await
+        .unwrap()
+        .into_inner()
+        .turn
+        .unwrap()
+        .turn_id;
+    let claimed = svc
+        .claim_agent_turn(as_worker("local", claim_request(&turn_id, true)))
+        .await
+        .unwrap()
+        .into_inner();
+    let turn = claimed.turn.unwrap();
+    let action = svc
+        .submit_action_instance(with_token(
+            &plane,
+            &claimed.runtime_token,
+            "SubmitActionInstance",
+            SubmitActionInstanceRequest {
+                namespace: NS.into(),
+                type_id: "Ticket.inspect".into(),
+                version: "1.0.0".into(),
+                parameters_json: r#"{"note":"look"}"#.into(),
+                idempotency_key: "inspect-1".into(),
+                request_id: "req-inspect".into(),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .instance
+        .unwrap();
+    assert_eq!(action.status, "parked", "{action:?}");
+    let stored = svc
+        .db
+        .runtime()
+        .get_action_instance(&action.instance_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.approval.map(|approval| approval.rule),
+        Some("agent_tool:gated:owner".to_string())
+    );
+
+    let parked = svc
+        .ack_agent_turn(with_token(
+            &plane,
+            &claimed.runtime_token,
+            "AckAgentTurn",
+            AckAgentTurnRequest {
+                turn_id: turn_id.clone(),
+                runtime_id: turn.claim_owner.clone(),
+                claim_generation: turn.claim_generation,
+                fencing_token: turn.fencing_token.clone(),
+                outcome: "parked".into(),
+                reason: "awaiting approval".into(),
+                parked_action_instance_id: action.instance_id.clone(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+        .turn
+        .unwrap();
+    assert_eq!((parked.status.as_str(), parked.park_count), ("parked", 1));
+    let undecided = svc
+        .claim_agent_turn(as_worker("local", claim_request(&turn_id, true)))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        undecided.code(),
+        tonic::Code::FailedPrecondition,
+        "{undecided:?}"
+    );
+
+    svc.decide_action_instance(as_decider(
+        DecideActionInstanceRequest {
+            instance_id: action.instance_id.clone(),
+            decision: "grant".into(),
+            reason: String::new(),
+            ..Default::default()
+        },
+        "carol",
+    ))
+    .await
+    .unwrap();
+    let listed = |accepts_continuation| {
+        svc.list_claimable_agent_turns(as_worker(
+            "local",
+            ListClaimableAgentTurnsRequest {
+                namespace: NS.into(),
+                limit: 10,
+                accepts_continuation,
+                accepts_interactive: true,
+            },
+        ))
+    };
+    assert!(listed(false).await.unwrap().into_inner().turns.is_empty());
+    assert_eq!(listed(true).await.unwrap().into_inner().turns.len(), 1);
+    let mut without = claim_request(&turn_id, true);
+    without.accepts_continuation = false;
+    assert!(
+        svc.claim_agent_turn(as_worker("local", without))
+            .await
+            .is_err()
+    );
+    let resumed = svc
+        .claim_agent_turn(as_worker("local", claim_request("", true)))
+        .await
+        .unwrap()
+        .into_inner();
+    let turn = resumed.turn.unwrap();
+    assert_eq!(
+        (
+            turn.turn_id.as_str(),
+            turn.status.as_str(),
+            turn.claim_generation
+        ),
+        (turn_id.as_str(), "claimed", 2)
+    );
+    let continuation = resumed.continuation.unwrap();
+    assert_eq!(continuation.action_instance_id, action.instance_id);
+    assert_eq!(continuation.approval_decision, "grant");
+    assert_ne!(continuation.status, "parked");
 }

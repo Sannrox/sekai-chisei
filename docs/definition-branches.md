@@ -506,7 +506,10 @@ effect is derived, never declared:
 - a gateway tool is destructive until the gateway publishes its annotations.
 Merge refuses a revision whose mutating or destructive tool has no approval
 policy, with `agent_tool_approval_required:<tool>`. Drafts may be saved
-without policies. Enforcing the policy at runtime is the gateway's job.
+without policies. Gateway and query tools enforce the policy at the
+gateway. On an interactive turn (ADR 0173), an Action tool's policy parks
+the submitted Action for its type's approvers under the rule
+`agent_tool:{agent member}:{policy}`.
 Effects use the enabled versions of a governed Action type, the same rule
 `SubmitActionInstance` admits. `GetDefinitionCertificationGate` and
 `PutDefinitionCertification` return each agent member's bound tools with the

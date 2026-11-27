@@ -179,11 +179,15 @@ pub(super) async fn submit_action_instance(
         .unwrap_or_default();
     // A turn token submits only while its turn is claimed (ADR 0142), and
     // its admission commits only while that claim still holds.
-    let agent_turn = service.authorize_turn_submission(
-        &req,
-        req.get_ref().namespace.trim(),
-        req.get_ref().type_id.trim(),
-    )?;
+    let (agent_turn, binding_approval_rule) = service
+        .authorize_turn_submission(
+            &req,
+            req.get_ref().namespace.trim(),
+            req.get_ref().type_id.trim(),
+        )?
+        .map_or((None, String::new()), |submission| {
+            (Some(submission.fence), submission.approval_rule)
+        });
     let mut inner = req.into_inner();
     let namespace = inner.namespace.trim().to_string();
     if namespace.is_empty() {
@@ -288,7 +292,7 @@ pub(super) async fn submit_action_instance(
         source_object_id: String::new(),
         marking_gate: submitter_marking_gate(service, &principals, &namespace_for_gate),
         expected_object_revision: String::new(),
-        binding_approval_rule: String::new(),
+        binding_approval_rule,
         offline: inner
             .offline
             .map(|offline| from_proto_offline_submission(offline, device_id))

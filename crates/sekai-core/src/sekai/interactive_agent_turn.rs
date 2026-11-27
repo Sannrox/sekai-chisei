@@ -8,10 +8,9 @@
 //! Turn ids carry the [`ID_PREFIX`], so a lookup routes by id and never
 //! probes both tables.
 //!
-//! This slice admits and stores turns only. No claim path reads the table
-//! yet, so an admitted turn stays pending until the claim slice lands; a
-//! turn token naming one is refused because the instance-turn lookup does
-//! not find it.
+//! A turn parks on an Action it submitted that awaits approval and is
+//! claimable again, with that Action as its continuation, once the decision
+//! stands, as an instance turn does (ADR 0142).
 
 use rusqlite::{OptionalExtension, Row, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -19,7 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::db::postgres::{PostgresDb, off_runtime};
 use crate::db::runtime_db::RuntimeDb;
 use crate::db::sekai::SekaiDb;
-use crate::sekai::agent_turn::{Outcome, TurnError};
+use crate::sekai::agent_turn::{MAX_PARKS, Outcome, TurnError, parked_action_decided};
 use crate::sekai::governed_transform::{
     MAX_TRANSFORM_LEASE_EXPIRIES, normalize_transform_claim_ttl_ms,
 };
@@ -37,6 +36,8 @@ const PENDING: &str = "pending";
 const CLAIMED: &str = "claimed";
 const COMPLETED: &str = "completed";
 const FAILED: &str = "failed";
+const PARKED: &str = "parked";
+const PARKED_TOO_OFTEN: &str = "parked too often";
 const LEASE_EXHAUSTED: &str = "claim lapsed too often";
 /// How many due candidates one claim-next tries before reporting an empty
 /// queue; each try re-checks its row under the row lock.
@@ -74,6 +75,11 @@ impl InteractiveAgentTurn {
     /// Whether the turn completed or failed.
     pub fn is_finished(&self) -> bool {
         matches!(self.status.as_str(), COMPLETED | FAILED)
+    }
+
+    /// Whether the turn waits on the decision of its parked Action.
+    pub fn is_parked(&self) -> bool {
+        self.status == PARKED
     }
 
     /// Whether the turn is claimed and its lease has not lapsed at `now_ms`.
@@ -224,29 +230,75 @@ pub fn get(db: &RuntimeDb, turn_id: &str) -> Result<Option<InteractiveAgentTurn>
 }
 
 /// Due turns in `namespace` a worker may claim, oldest due first: pending
-/// turns and turns whose claim lapsed. `limit` caps as the site-turn list
+/// turns, turns whose claim lapsed and parked turns whose Action's decision
+/// stands. Without `include_resuming`, a turn that ever parked is left out:
+/// it resumes with a continuation. `limit` caps as the site-turn list
 /// does: 50 when not positive, at most 500. Only workers that set
 /// `accepts_interactive` see them.
+pub fn list_claimable_maybe_resuming(
+    db: &RuntimeDb,
+    namespace: &str,
+    now_ms: i64,
+    limit: i64,
+    include_resuming: bool,
+) -> Result<Vec<InteractiveAgentTurn>, TurnError> {
+    let limit = if limit <= 0 { 50 } else { limit.min(500) };
+    candidates(db, namespace, "", now_ms, limit, include_resuming)
+}
+
+/// [`list_claimable_maybe_resuming`], resuming turns included.
 pub fn list_claimable(
     db: &RuntimeDb,
     namespace: &str,
     now_ms: i64,
     limit: i64,
 ) -> Result<Vec<InteractiveAgentTurn>, TurnError> {
-    let limit = if limit <= 0 { 50 } else { limit.min(500) };
-    match db {
-        RuntimeDb::Sqlite(store) => {
-            store.claimable_interactive_agent_turns(namespace, "", now_ms, limit)
-        }
-        RuntimeDb::Postgres(store) => {
-            off_runtime(|| store.claimable_interactive_agent_turns(namespace, "", now_ms, limit))
+    list_claimable_maybe_resuming(db, namespace, now_ms, limit, true)
+}
+
+/// Up to `limit` due turns not of `skip_member`. The store reads parks only
+/// once their Action left `parked` or is gone, so parks still awaiting
+/// approval never crowd the page; the durable check then drops a grant whose
+/// recording has not landed.
+fn candidates(
+    db: &RuntimeDb,
+    namespace: &str,
+    skip_member: &str,
+    now_ms: i64,
+    limit: i64,
+    include_resuming: bool,
+) -> Result<Vec<InteractiveAgentTurn>, TurnError> {
+    let turns = match db {
+        RuntimeDb::Sqlite(store) => store.claimable_interactive_agent_turns(
+            namespace,
+            skip_member,
+            now_ms,
+            limit,
+            include_resuming,
+        ),
+        RuntimeDb::Postgres(store) => off_runtime(|| {
+            store.claimable_interactive_agent_turns(
+                namespace,
+                skip_member,
+                now_ms,
+                limit,
+                include_resuming,
+            )
+        }),
+    }?;
+    let mut kept = Vec::with_capacity(turns.len());
+    for turn in turns {
+        if !turn.is_parked() || parked_action_decided(db, &turn.parked_action_id)? {
+            kept.push(turn);
         }
     }
+    Ok(kept)
 }
 
 /// Claims `turn_id` for `runtime_id`. A worker whose subject is the turn's
 /// member is refused, as a worker that is the instance principal is
-/// (ADR 0146): the member's own credential must not run its turn.
+/// (ADR 0146): the member's own credential must not run its turn. A worker
+/// claiming through this call accepts continuation.
 pub fn claim(
     db: &RuntimeDb,
     namespace: &str,
@@ -256,9 +308,44 @@ pub fn claim(
     ttl_ms: i64,
     now_ms: i64,
 ) -> Result<InteractiveAgentTurn, TurnError> {
+    claim_accepting_continuation(
+        db,
+        namespace,
+        runtime_id,
+        turn_id,
+        worker_principal,
+        ttl_ms,
+        now_ms,
+        true,
+    )
+}
+
+/// [`claim`]. A parked turn resumes once its Action is decided, and a turn
+/// that ever parked is claimed only by a worker that
+/// `accepts_continuation`.
+#[allow(clippy::too_many_arguments)]
+pub fn claim_accepting_continuation(
+    db: &RuntimeDb,
+    namespace: &str,
+    runtime_id: &str,
+    turn_id: &str,
+    worker_principal: &str,
+    ttl_ms: i64,
+    now_ms: i64,
+    accepts_continuation: bool,
+) -> Result<InteractiveAgentTurn, TurnError> {
     if runtime_id.trim().is_empty() {
         return Err(TurnError::Invalid("runtime_id required".into()));
     }
+    // Read the park's decision outside the claim's transaction: the store's
+    // connection is not reentrant. A decision never reverts (ADR 0142).
+    let checked = get(db, turn_id)?
+        .filter(|turn| turn.is_parked())
+        .map(|turn| -> Result<_, TurnError> {
+            let decided = parked_action_decided(db, &turn.parked_action_id)?;
+            Ok((turn.claim_generation, turn.parked_action_id, decided))
+        })
+        .transpose()?;
     let mut exhausted = false;
     let claimed = edit(db, turn_id, |turn| {
         if turn.namespace != namespace {
@@ -269,10 +356,28 @@ pub fn claim(
                 "a turn's worker must not be its member".into(),
             ));
         }
-        if !turn.claimable(now_ms) {
+        // A turn that ever parked resumes with a continuation, a lapsed
+        // resumed claim included.
+        if !turn.parked_action_id.is_empty() && !accepts_continuation {
+            return Err(TurnError::Invalid(
+                "claimer does not accept continuation".into(),
+            ));
+        }
+        // Resume only the park whose decision was read: a turn reclaimed and
+        // parked again meanwhile waits on its new Action.
+        let resuming = turn.is_parked()
+            && checked
+                .as_ref()
+                .is_some_and(|(generation, action, decided)| {
+                    *decided
+                        && *generation == turn.claim_generation
+                        && *action == turn.parked_action_id
+                });
+        if !resuming && !turn.claimable(now_ms) {
             return Err(TurnError::NotClaimable);
         }
-        exhausted = !assign_claim(turn, runtime_id, ttl_ms, now_ms)?;
+        let hold = if resuming { Hold::Open } else { turn.hold() };
+        exhausted = !assign_claim(turn, runtime_id, ttl_ms, now_ms, hold)?;
         Ok(())
     })?;
     if exhausted {
@@ -293,27 +398,41 @@ pub fn claim_next(
     ttl_ms: i64,
     now_ms: i64,
 ) -> Result<InteractiveAgentTurn, TurnError> {
+    claim_next_accepting_continuation(
+        db,
+        namespace,
+        runtime_id,
+        worker_principal,
+        ttl_ms,
+        now_ms,
+        true,
+    )
+}
+
+/// [`claim_next`], offering turns that ever parked only when
+/// `accepts_continuation`.
+pub fn claim_next_accepting_continuation(
+    db: &RuntimeDb,
+    namespace: &str,
+    runtime_id: &str,
+    worker_principal: &str,
+    ttl_ms: i64,
+    now_ms: i64,
+    accepts_continuation: bool,
+) -> Result<InteractiveAgentTurn, TurnError> {
     if runtime_id.trim().is_empty() {
         return Err(TurnError::Invalid("runtime_id required".into()));
     }
-    let candidates = match db {
-        RuntimeDb::Sqlite(store) => store.claimable_interactive_agent_turns(
-            namespace,
-            worker_principal,
-            now_ms,
-            CLAIM_NEXT_CANDIDATES,
-        ),
-        RuntimeDb::Postgres(store) => off_runtime(|| {
-            store.claimable_interactive_agent_turns(
-                namespace,
-                worker_principal,
-                now_ms,
-                CLAIM_NEXT_CANDIDATES,
-            )
-        }),
-    }?;
+    let candidates = candidates(
+        db,
+        namespace,
+        worker_principal,
+        now_ms,
+        CLAIM_NEXT_CANDIDATES,
+        accepts_continuation,
+    )?;
     for candidate in candidates {
-        match claim(
+        match claim_accepting_continuation(
             db,
             namespace,
             runtime_id,
@@ -321,6 +440,7 @@ pub fn claim_next(
             worker_principal,
             ttl_ms,
             now_ms,
+            accepts_continuation,
         ) {
             Err(TurnError::NotClaimable) => continue,
             other => return other,
@@ -397,8 +517,8 @@ pub fn acknowledge(
     })
 }
 
-/// Ends a turn that has not finished as failed with `reason`, whoever holds
-/// it: the member lost the access the turn acts with (ADR 0173 decision 3).
+/// Ends a turn that has not finished, parked ones included, as failed with
+/// `reason`, whoever holds it: the member lost the access the turn acts with (ADR 0173 decision 3).
 /// A finished turn is left as it is.
 pub fn fail_unfinished(
     db: &RuntimeDb,
@@ -407,7 +527,7 @@ pub fn fail_unfinished(
     now_ms: i64,
 ) -> Result<InteractiveAgentTurn, TurnError> {
     edit(db, turn_id, |turn| {
-        if !matches!(turn.status.as_str(), PENDING | CLAIMED) {
+        if turn.is_finished() {
             return Ok(());
         }
         let mut record = turn.claim_record();
@@ -420,14 +540,80 @@ pub fn fail_unfinished(
     })
 }
 
+/// Parks the turn under its current, unexpired claim on `action_id`, an
+/// Action the turn submitted under this claim that awaits approval or whose
+/// decision already stands (ADR 0142). The claim ends; the turn is
+/// claimable again once the Action is decided. A retry with the same claim
+/// and Action returns the same receipt. A turn parked [`MAX_PARKS`] times
+/// fails instead.
+#[allow(clippy::too_many_arguments)]
+pub fn park(
+    db: &RuntimeDb,
+    turn_id: &str,
+    runtime_id: &str,
+    claim_generation: i64,
+    fencing_token: &str,
+    action_id: &str,
+    reason: &str,
+    now_ms: i64,
+) -> Result<InteractiveAgentTurn, TurnError> {
+    // Read before the turn's transaction, whose connection is not reentrant.
+    let action = db
+        .get_action_instance(action_id)?
+        .ok_or_else(|| TurnError::Invalid(format!("action instance {action_id} not found")))?;
+    let submitted_here = action.agent_turn.as_ref().is_some_and(|fence| {
+        fence.turn_id == turn_id
+            && i64::try_from(fence.claim_generation).ok() == Some(claim_generation)
+    });
+    let awaiting_approval = action.status == crate::sekai::action_instance::STATUS_PARKED;
+    let decision_stands = parked_action_decided(db, action_id)?;
+    edit(db, turn_id, |turn| {
+        let held = fence(runtime_id, claim_generation, fencing_token);
+        if !turn.claim_record().matches(held) {
+            return Err(TurnError::StaleClaim);
+        }
+        // A retry of this park replays its receipt, the failing fourth one
+        // included.
+        let parked_here =
+            turn.is_parked() || (turn.status == FAILED && turn.reason == PARKED_TOO_OFTEN);
+        if parked_here && turn.parked_action_id == action_id {
+            return Ok(());
+        }
+        if !turn.is_live_claim(now_ms) {
+            return Err(TurnError::StaleClaim);
+        }
+        if !submitted_here || !(awaiting_approval || decision_stands) {
+            return Err(TurnError::Invalid(
+                "a turn parks only on an Action it submitted under this claim that awaits approval or whose decision stands"
+                    .into(),
+            ));
+        }
+        turn.park_count += 1;
+        turn.claim_expires_at_ms = 0;
+        turn.parked_action_id = action_id.into();
+        turn.reason = reason.into();
+        if turn.park_count > MAX_PARKS {
+            turn.status = FAILED.into();
+            turn.reason = PARKED_TOO_OFTEN.into();
+            turn.finished_at_ms = now_ms;
+            return Ok(());
+        }
+        turn.status = PARKED.into();
+        Ok(())
+    })
+}
+
 /// Refuses `action_type` unless the turn's agent member lists it in
 /// `allowed_action_types` at the turn's revision (ADR 0173 decision 4). An
-/// unreadable member refuses every type.
+/// unreadable member refuses every type. Returns the approval rule a
+/// submission parks with: `agent_tool:{agent member}:{policy}` when the
+/// member binds the type as an Action tool with an approval policy, else
+/// empty. The type's own approvers decide it.
 pub fn require_allowed_action_type(
     db: &RuntimeDb,
     turn: &InteractiveAgentTurn,
     action_type: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let member = db
         .get_definition_member(
             &turn.namespace,
@@ -444,17 +630,26 @@ pub fn require_allowed_action_type(
     let definition: crate::sekai::agent_definition::AgentDefinition =
         serde_json::from_str(&member.definition_json)
             .map_err(|_| "agent definition is unreadable".to_string())?;
-    if definition
+    if !definition
         .allowed_action_types
         .iter()
         .any(|allowed| allowed == action_type)
     {
-        return Ok(());
+        return Err(format!(
+            "agent member {} does not allow Action type {action_type}",
+            turn.agent_member
+        ));
     }
-    Err(format!(
-        "agent member {} does not allow Action type {action_type}",
-        turn.agent_member
-    ))
+    Ok(definition
+        .tools
+        .iter()
+        .find(|tool| {
+            tool.kind == crate::sekai::agent_definition::TOOL_KIND_ACTION
+                && tool.name == action_type
+        })
+        .and_then(|tool| tool.approval_policy.as_deref())
+        .map(|policy| format!("agent_tool:{}:{policy}", turn.agent_member))
+        .unwrap_or_default())
 }
 
 /// Claims `turn` for `runtime_id` through the claim engine. `Ok(false)`
@@ -464,9 +659,10 @@ fn assign_claim(
     runtime_id: &str,
     ttl_ms: i64,
     now_ms: i64,
+    hold: Hold,
 ) -> Result<bool, TurnError> {
     let mut record = turn.claim_record();
-    match record.count_lapse(turn.hold(), MAX_TRANSFORM_LEASE_EXPIRIES, now_ms) {
+    match record.count_lapse(hold, MAX_TRANSFORM_LEASE_EXPIRIES, now_ms) {
         Ok(_) => {}
         Err(ClaimError::LeaseLimit) => {
             record.expires_at_ms = 0;
@@ -637,17 +833,28 @@ impl SekaiDb {
         skip_member: &str,
         now_ms: i64,
         limit: i64,
+        include_resuming: bool,
     ) -> Result<Vec<InteractiveAgentTurn>, TurnError> {
+        // The Action table is created on first use; a parked turn has one.
+        self.migrate_action_instances()?;
         let conn = self.conn();
         let mut statement = conn.prepare(&format!(
             "SELECT {COLUMNS} FROM sekai_interactive_agent_turn
              WHERE namespace = ?1 AND due_at_ms <= ?2 AND member_id <> ?3
-               AND (status = 'pending' OR (status = 'claimed' AND claim_expires_at_ms <= ?2))
+               AND (?5 OR parked_action_id = '')
+               AND (status = 'pending' OR (status = 'claimed' AND claim_expires_at_ms <= ?2)
+                    OR (status = 'parked' AND NOT EXISTS (
+                        SELECT 1 FROM sekai_action_instances action
+                        WHERE action.instance_id = sekai_interactive_agent_turn.parked_action_id
+                          AND action.status = 'parked')))
              ORDER BY due_at_ms, turn_id
              LIMIT ?4"
         ))?;
         let turns = statement
-            .query_map(params![namespace, now_ms, skip_member, limit], map_turn)?
+            .query_map(
+                params![namespace, now_ms, skip_member, limit, include_resuming],
+                map_turn,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(turns)
     }
@@ -671,7 +878,8 @@ impl SekaiDb {
         tx.execute(
             "UPDATE sekai_interactive_agent_turn SET status = ?2, claim_owner = ?3,
                  claim_generation = ?4, fencing_token = ?5, claim_expires_at_ms = ?6,
-                 lease_expiries = ?7, finished_at_ms = ?8, reason = ?9
+                 lease_expiries = ?7, finished_at_ms = ?8, reason = ?9,
+                 parked_action_id = ?10, park_count = ?11
              WHERE turn_id = ?1",
             params![
                 turn.turn_id,
@@ -683,6 +891,8 @@ impl SekaiDb {
                 turn.lease_expiries,
                 turn.finished_at_ms,
                 turn.reason,
+                turn.parked_action_id,
+                turn.park_count,
             ],
         )?;
         tx.commit()?;
@@ -745,6 +955,7 @@ impl PostgresDb {
         skip_member: &str,
         now_ms: i64,
         limit: i64,
+        include_resuming: bool,
     ) -> Result<Vec<InteractiveAgentTurn>, TurnError> {
         Ok(self
             .connection()?
@@ -752,12 +963,18 @@ impl PostgresDb {
                 &format!(
                     "SELECT {COLUMNS} FROM sekai_interactive_agent_turn
                      WHERE namespace = $1 AND due_at_ms <= $2 AND member_id <> $3
+                       AND ($5 OR parked_action_id = '')
                        AND (status = 'pending'
-                            OR (status = 'claimed' AND claim_expires_at_ms <= $2))
+                            OR (status = 'claimed' AND claim_expires_at_ms <= $2)
+                            OR (status = 'parked' AND NOT EXISTS (
+                                SELECT 1 FROM sekai_action_instances action
+                                WHERE action.instance_id
+                                      = sekai_interactive_agent_turn.parked_action_id
+                                  AND action.status = 'parked')))
                      ORDER BY due_at_ms, turn_id
                      LIMIT $4"
                 ),
-                &[&namespace, &now_ms, &skip_member, &limit],
+                &[&namespace, &now_ms, &skip_member, &limit, &include_resuming],
             )?
             .iter()
             .map(pg_turn)
@@ -785,7 +1002,8 @@ impl PostgresDb {
         tx.execute(
             "UPDATE sekai_interactive_agent_turn SET status = $2, claim_owner = $3,
                  claim_generation = $4, fencing_token = $5, claim_expires_at_ms = $6,
-                 lease_expiries = $7, finished_at_ms = $8, reason = $9
+                 lease_expiries = $7, finished_at_ms = $8, reason = $9,
+                 parked_action_id = $10, park_count = $11
              WHERE turn_id = $1",
             &[
                 &turn.turn_id,
@@ -797,6 +1015,8 @@ impl PostgresDb {
                 &turn.lease_expiries,
                 &turn.finished_at_ms,
                 &turn.reason,
+                &turn.parked_action_id,
+                &turn.park_count,
             ],
         )?;
         tx.commit()?;
@@ -945,13 +1165,99 @@ mod tests {
         insert(&racing).unwrap();
         assert_eq!(get(db, &turn.turn_id).unwrap(), Some(turn.clone()));
         claim_contract(db, namespace, &turn.turn_id);
+        let parked = InteractiveAgentTurn {
+            turn_id: format!("{ID_PREFIX}parked-{namespace}"),
+            status: PARKED.into(),
+            claim_generation: 1,
+            parked_action_id: format!("act-gone-{namespace}"),
+            park_count: 1,
+            ..turn
+        };
+        insert(&parked).unwrap();
+        park_contract(db, namespace, &parked);
+    }
+
+    /// A turn parked on an Action that is gone, whose decision therefore
+    /// stands: it resumes only for a worker that accepts continuation, and
+    /// the park survives the store's edit.
+    fn park_contract(db: &RuntimeDb, namespace: &str, parked: &InteractiveAgentTurn) {
+        let listed = |resuming, now_ms| {
+            list_claimable_maybe_resuming(db, namespace, now_ms, 0, resuming)
+                .unwrap()
+                .into_iter()
+                .map(|turn| turn.turn_id)
+                .collect::<Vec<_>>()
+        };
+        assert!(listed(false, 10).is_empty());
+        assert_eq!(listed(true, 10), std::slice::from_ref(&parked.turn_id));
+        assert!(matches!(
+            claim_accepting_continuation(
+                db,
+                namespace,
+                "rt",
+                &parked.turn_id,
+                "worker",
+                1_000,
+                10,
+                false
+            ),
+            Err(TurnError::Invalid(_))
+        ));
+        assert!(matches!(
+            claim_next_accepting_continuation(db, namespace, "rt", "worker", 1_000, 10, false),
+            Err(TurnError::NotFound)
+        ));
+        let resumed =
+            claim_next_accepting_continuation(db, namespace, "rt", "worker", 1_000, 10, true)
+                .unwrap();
+        assert_eq!(
+            (
+                resumed.status.as_str(),
+                resumed.claim_generation,
+                resumed.parked_action_id.as_str(),
+                resumed.park_count,
+            ),
+            (CLAIMED, 2, parked.parked_action_id.as_str(), 1)
+        );
+        // A lapsed resumed claim still carries its continuation.
+        let lapsed = resumed.claim_expires_at_ms + 1;
+        assert!(listed(false, lapsed).is_empty());
+        assert_eq!(listed(true, lapsed), std::slice::from_ref(&parked.turn_id));
+        assert!(matches!(
+            claim_accepting_continuation(
+                db,
+                namespace,
+                "rt",
+                &parked.turn_id,
+                "worker",
+                1_000,
+                lapsed,
+                false
+            ),
+            Err(TurnError::Invalid(_))
+        ));
+        assert!(matches!(
+            park(
+                db,
+                &parked.turn_id,
+                "rt",
+                2,
+                &resumed.fencing_token,
+                "act-missing",
+                "approval",
+                20,
+            ),
+            Err(TurnError::Invalid(_))
+        ));
+        let failed = fail_unfinished(db, &parked.turn_id, "member access revoked", 30).unwrap();
+        assert_eq!(get(db, &parked.turn_id).unwrap(), Some(failed));
     }
 
     /// Claim, heartbeat and acknowledge one pending turn due at 5: the
     /// member never claims it, one claim holds at a time, a superseded
     /// fence is stale, and a retried ack keeps the first receipt.
     fn claim_contract(db: &RuntimeDb, namespace: &str, turn_id: &str) {
-        let listed = list_claimable(db, namespace, 10, 0).unwrap();
+        let listed = list_claimable_maybe_resuming(db, namespace, 10, 0, true).unwrap();
         assert_eq!(
             listed
                 .iter()
@@ -960,28 +1266,35 @@ mod tests {
             [turn_id]
         );
         assert!(
-            list_claimable(db, namespace, 4, 0).unwrap().is_empty(),
+            list_claimable_maybe_resuming(db, namespace, 4, 0, true)
+                .unwrap()
+                .is_empty(),
             "not yet due"
         );
         assert!(matches!(
-            claim_next(db, namespace, "rt-a", "alice", 1_000, 10),
+            claim_next_accepting_continuation(db, namespace, "rt-a", "alice", 1_000, 10, true),
             Err(TurnError::NotFound)
         ));
         assert!(matches!(
-            claim(db, namespace, "rt-a", turn_id, "alice", 1_000, 10),
+            claim_accepting_continuation(db, namespace, "rt-a", turn_id, "alice", 1_000, 10, true),
             Err(TurnError::Invalid(_))
         ));
-        let first = claim_next(db, namespace, "rt-a", "worker", 1_000, 10).unwrap();
+        let first =
+            claim_next_accepting_continuation(db, namespace, "rt-a", "worker", 1_000, 10, true)
+                .unwrap();
         assert_eq!(
             (first.status.as_str(), first.claim_generation),
             (CLAIMED, 1)
         );
         assert!(matches!(
-            claim(db, namespace, "rt-b", turn_id, "worker", 1_000, 20),
+            claim_accepting_continuation(db, namespace, "rt-b", turn_id, "worker", 1_000, 20, true),
             Err(TurnError::NotClaimable)
         ));
         let lapsed = first.claim_expires_at_ms + 1;
-        let second = claim(db, namespace, "rt-b", turn_id, "worker", 1_000, lapsed).unwrap();
+        let second = claim_accepting_continuation(
+            db, namespace, "rt-b", turn_id, "worker", 1_000, lapsed, true,
+        )
+        .unwrap();
         assert_eq!(
             (second.claim_owner.as_str(), second.claim_generation),
             ("rt-b", 2)
@@ -1030,7 +1343,7 @@ mod tests {
         .unwrap();
         assert_eq!(retried, done);
         assert!(
-            list_claimable(db, namespace, lapsed + 4, 0)
+            list_claimable_maybe_resuming(db, namespace, lapsed + 4, 0, true)
                 .unwrap()
                 .is_empty()
         );
@@ -1047,7 +1360,17 @@ mod tests {
         let db = runtime();
         let digest = published_revision(&db, "", true);
         let turn = admit(&db, admission(&digest, "triage", "req-1"), 10).unwrap();
-        let claimed = claim(&db, "site", "rt", &turn.turn_id, "worker", 1_000, 10).unwrap();
+        let claimed = claim_accepting_continuation(
+            &db,
+            "site",
+            "rt",
+            &turn.turn_id,
+            "worker",
+            1_000,
+            10,
+            true,
+        )
+        .unwrap();
         let failed = fail_unfinished(&db, &turn.turn_id, "member access revoked", 20).unwrap();
         assert_eq!(
             (failed.status.as_str(), failed.reason.as_str()),
@@ -1067,7 +1390,16 @@ mod tests {
             Err(TurnError::StaleClaim)
         ));
         assert!(matches!(
-            claim(&db, "site", "rt", &turn.turn_id, "worker", 1_000, 30),
+            claim_accepting_continuation(
+                &db,
+                "site",
+                "rt",
+                &turn.turn_id,
+                "worker",
+                1_000,
+                30,
+                true
+            ),
             Err(TurnError::NotClaimable)
         ));
     }

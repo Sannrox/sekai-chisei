@@ -406,7 +406,7 @@ fn decided_parked_turns(
 /// 0142): it is gone, denied, or past `parked` with the approval recorded on
 /// its receipt. A grant whose recording fails is undone and parked again,
 /// so an Action's status alone is not yet a decision.
-fn parked_action_decided(db: &RuntimeDb, action_id: &str) -> Result<bool, TurnError> {
+pub(crate) fn parked_action_decided(db: &RuntimeDb, action_id: &str) -> Result<bool, TurnError> {
     use crate::sekai::action_instance::{STATUS_DENIED, STATUS_PARKED};
     let Some(action) = db.get_action_instance(action_id)? else {
         return Ok(true);
