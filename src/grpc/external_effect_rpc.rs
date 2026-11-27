@@ -7,6 +7,7 @@
 //! parameters. Placement matches the labels the runtime registered with
 //! `RegisterTransformRuntime`.
 
+use super::connector_credential_rpc;
 use super::*;
 use crate::sekai::external_effect::{self, EffectError, EffectOutcome, ExternalEffectWork as Work};
 use crate::sekai::work_claim::{ClaimError, Fence};
@@ -34,7 +35,20 @@ impl SekaiServiceImpl {
             effect: Some(to_proto_action_effect(&work.effect)),
             source: Some(source_rpc::source_to_proto(work.source)),
             parameters_json: work.parameters_json,
+            credential: None,
         })
+    }
+
+    fn claimed_external_effect_work<T: std::any::Any>(
+        &self,
+        req: &Request<T>,
+        work: Work,
+    ) -> Result<ExternalEffectWork, Status> {
+        let credential =
+            connector_credential_rpc::material_for_source(self.db.runtime(), &work.source)?;
+        let mut proto = self.external_effect_work(req, work)?;
+        proto.credential = credential;
+        Ok(proto)
     }
 
     pub(super) fn list_claimable_external_effects<T: std::any::Any>(
@@ -107,7 +121,7 @@ impl SekaiServiceImpl {
             now_millis(),
         )
         .map_err(effect_status)?;
-        self.external_effect_work(req, work)
+        self.claimed_external_effect_work(req, work)
     }
 
     pub(super) fn heartbeat_external_effect<T: std::any::Any>(

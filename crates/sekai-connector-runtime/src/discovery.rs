@@ -25,7 +25,7 @@ use sekai_source_sdk::{
 };
 
 use crate::runtime::{LIST_LIMIT, Ran, Runtime};
-use crate::sync::{SyncFailure, blocking, prepare};
+use crate::sync::{SyncFailure, blocking};
 
 /// Sample bytes (names and values) one discovery sends at most; record
 /// kinds past it are sent without a sample. Well under the plane's bound.
@@ -234,7 +234,7 @@ impl Runtime {
             generation: work.claim_generation,
             fencing_token: work.fencing_token,
         };
-        let outcome = match prepare(&source, &self.bindings) {
+        let outcome = match self.prepare_source(&source, work.credential.as_ref()) {
             Err(failure) => Err(failure),
             Ok(prepared) => {
                 let connectors = self.connectors.clone();

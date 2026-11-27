@@ -447,6 +447,42 @@
     },
     {
       "service": "SekaiService",
+      "rpc": "RegisterRuntimeFleetKey",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "GetRuntimeFleetKey",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "IssueCredentialHandle",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
+      "rpc": "RevokeCredentialHandle",
+      "storage_path": "sekai.object-sync",
+      "real_backend": "yes",
+      "consumer": "cli",
+      "classification": "experimental",
+      "product_tier": "experimental"
+    },
+    {
+      "service": "SekaiService",
       "rpc": "ListSourceRecordVersions",
       "storage_path": "sekai.object-sync",
       "real_backend": "yes",

@@ -15,12 +15,13 @@ use sekai_chisei::db::store::SekaiStore;
 use sekai_chisei::grpc::pb::sekai::sekai_service_server::SekaiServiceServer;
 use sekai_chisei::grpc::sekai_service::SekaiServiceImpl;
 use sekai_chisei::rpc_maturity::RpcMaturityLayer;
+use sekai_chisei::sekai::connector_credential::{self, SealedSlot};
 use sekai_chisei::sekai::security::Role;
 use sekai_chisei::sekai::source::{self, PutSource, SourceSpec};
 use sekai_client::ClientConfig;
 use sekai_client::claim::RuntimeClaimError;
 use sekai_connector_runtime::{
-    Connectors, CredentialBindings, Ran, Runtime, RuntimeOptions, SyncFailure, github,
+    Connectors, CredentialBindings, FleetKey, Ran, Runtime, RuntimeOptions, SyncFailure, github,
 };
 use sekai_source_sdk::{
     ConfigValue, Connector, ConnectorFailure, GITHUB_CONNECTOR, GITHUB_OBJECT_SYNC_TYPE_DIGEST,
@@ -193,11 +194,45 @@ impl Plane {
         );
     }
 
+    fn issue(&self, fleet: &FleetKey, name: &str, secret: &str) {
+        connector_credential::register_fleet_key(
+            &self.db,
+            fleet.id(),
+            &fleet.public_bytes(),
+            PRINCIPAL,
+            1,
+        )
+        .unwrap();
+        connector_credential::issue_handle(
+            &self.db,
+            name,
+            &[NS.into()],
+            &["api.github.com".into()],
+            &[SealedSlot {
+                name: "token".into(),
+                fleet_key_id: fleet.id().into(),
+                ciphertext: fleet.seal(secret.as_bytes()).unwrap(),
+            }],
+            PRINCIPAL,
+            2,
+        )
+        .unwrap();
+    }
+
+    fn revoke(&self, name: &str) {
+        connector_credential::revoke_handle(&self.db, name, PRINCIPAL, 3).unwrap();
+    }
+
     fn tick(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        self.tick_at(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64,
+        );
+    }
+
+    fn tick_at(&self, now: i64) {
         self.db.tick_source_syncs(NS, now).unwrap();
     }
 
@@ -491,6 +526,142 @@ async fn an_unresolved_credential_fails_once_as_unavailable() {
     assert_eq!(runs.load(Ordering::SeqCst), 0, "nothing connected");
     assert_eq!(plane.sync_of("repo").1, "unavailable");
     assert!(runtime.pass().await.unwrap().is_empty(), "no retry loop");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handle_issued_while_a_runtime_runs_is_used_on_the_next_claim() {
+    let plane = plane().await;
+    let fleet = FleetKey::generate("fleet-1");
+    plane.put_github("repo", "ops/plane-bot");
+    plane.tick_at(60_000);
+    let (connectors, runs) = counted(&[&GITHUB_CONNECTOR]);
+    let runtime = runtime(
+        &plane,
+        "runtime-a",
+        CredentialBindings::default(),
+        connectors,
+    )
+    .await
+    .with_fleet_key(fleet.clone());
+    runtime.register().await.unwrap();
+
+    assert_eq!(
+        runtime.pass().await.unwrap(),
+        [Ran::Finished {
+            source_id: "repo".into(),
+            outcome: Err(SyncFailure::Unavailable)
+        }]
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+
+    plane.issue(&fleet, "ops/plane-bot", "plane-token");
+    plane.tick_at(120_000);
+    assert_eq!(
+        runtime.pass().await.unwrap(),
+        [Ran::Finished {
+            source_id: "repo".into(),
+            outcome: Ok(())
+        }]
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoked_handle_fails_the_next_claim_as_unavailable() {
+    let plane = plane().await;
+    let fleet = FleetKey::generate("fleet-1");
+    plane.issue(&fleet, "ops/plane-bot", "plane-token");
+    plane.put_github("repo", "ops/plane-bot");
+    plane.tick_at(60_000);
+    let (connectors, runs) = counted(&[&GITHUB_CONNECTOR]);
+    let runtime = runtime(
+        &plane,
+        "runtime-a",
+        CredentialBindings::default(),
+        connectors,
+    )
+    .await
+    .with_fleet_key(fleet);
+    runtime.register().await.unwrap();
+    assert_eq!(
+        runtime.pass().await.unwrap(),
+        [Ran::Finished {
+            source_id: "repo".into(),
+            outcome: Ok(())
+        }]
+    );
+
+    plane.revoke("ops/plane-bot");
+    plane.tick_at(120_000);
+    assert_eq!(
+        runtime.pass().await.unwrap(),
+        [Ran::Finished {
+            source_id: "repo".into(),
+            outcome: Err(SyncFailure::Unavailable)
+        }]
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_name_in_static_config_and_on_the_plane_is_unavailable() {
+    let plane = plane().await;
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = FleetKey::generate("fleet-1");
+    plane.issue(&fleet, "ops/github-bot", "plane-token");
+    plane.put_github("repo", "ops/github-bot");
+    plane.tick();
+    let (connectors, runs) = counted(&[&GITHUB_CONNECTOR]);
+    let runtime = runtime(&plane, "runtime-a", bindings(dir.path()), connectors)
+        .await
+        .with_fleet_key(fleet);
+    runtime.register().await.unwrap();
+    assert_eq!(
+        runtime.pass().await.unwrap(),
+        [Ran::Finished {
+            source_id: "repo".into(),
+            outcome: Err(SyncFailure::Unavailable)
+        }]
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replaced_runtime_opens_the_handle_with_the_same_fleet_key() {
+    let plane = plane().await;
+    let fleet = FleetKey::generate("fleet-1");
+    plane.issue(&fleet, "ops/plane-bot", "plane-token");
+    plane.put_github("repo", "ops/plane-bot");
+    plane.tick();
+    let (connectors, runs) = counted(&[&GITHUB_CONNECTOR]);
+    drop(
+        runtime(
+            &plane,
+            "runtime-old",
+            CredentialBindings::default(),
+            connectors.clone(),
+        )
+        .await
+        .with_fleet_key(fleet.clone()),
+    );
+    let replacement = FleetKey::from_bytes(fleet.id(), fleet.secret_bytes().as_ref()).unwrap();
+    let runtime = runtime(
+        &plane,
+        "runtime-new",
+        CredentialBindings::default(),
+        connectors,
+    )
+    .await
+    .with_fleet_key(replacement);
+    runtime.register().await.unwrap();
+    assert_eq!(
+        runtime.pass().await.unwrap(),
+        [Ran::Finished {
+            source_id: "repo".into(),
+            outcome: Ok(())
+        }]
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
 }
 
 /// A connector that reads two pages of one issue each, every page noting

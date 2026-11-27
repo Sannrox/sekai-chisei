@@ -17,13 +17,14 @@ use sekai_client::claim::{
     ClaimAttempt, RuntimeClaimClient, RuntimeClaimError, WorkFence, WorkKind,
 };
 use sekai_client::protocol::sekai::{
-    SourceSyncWork, ack_work_request, ack_work_response, claim_work_response,
+    ConnectorSource, CredentialHandleMaterial, SourceSyncWork, ack_work_request, ack_work_response,
+    claim_work_response,
 };
 use sekai_client::{ClientConfig, CoreLoopClient, GrpcTransport, SdkError};
 use sekai_source_sdk::SyncNotes;
 
-use crate::credentials::CredentialBindings;
-use crate::sync::{Connectors, SyncFailure, prepare};
+use crate::credentials::{CredentialBindings, FleetKey};
+use crate::sync::{Connectors, Prepared, SyncFailure, prepare_claim};
 
 /// How many claimable items one pass looks at per namespace and kind.
 pub(crate) const LIST_LIMIT: i32 = 50;
@@ -93,6 +94,7 @@ pub struct Runtime {
     pub(crate) bindings: CredentialBindings,
     pub(crate) connectors: Connectors,
     pub(crate) gateway: Option<crate::llm_rows::GatewayRoute>,
+    pub(crate) fleet_key: Option<FleetKey>,
 }
 
 impl Runtime {
@@ -115,7 +117,22 @@ impl Runtime {
             bindings,
             connectors,
             gateway: None,
+            fleet_key: None,
         })
+    }
+
+    /// The fleet private key this runtime uses to open plane-held handles.
+    pub fn with_fleet_key(mut self, key: FleetKey) -> Self {
+        self.fleet_key = Some(key);
+        self
+    }
+
+    pub(crate) fn prepare_source(
+        &self,
+        source: &ConnectorSource,
+        plane: Option<&CredentialHandleMaterial>,
+    ) -> Result<Prepared, SyncFailure> {
+        prepare_claim(source, &self.bindings, plane, self.fleet_key.as_ref())
     }
 
     /// Registers this runtime's labels in every namespace. Idempotent; run
@@ -185,7 +202,7 @@ impl Runtime {
             fencing_token: work.fencing_token,
         };
         let mut notes = SyncNotes::default();
-        let outcome = match prepare(&source, &self.bindings) {
+        let outcome = match self.prepare_source(&source, work.credential.as_ref()) {
             Err(failure) => Err(failure),
             Ok(prepared) => {
                 match self

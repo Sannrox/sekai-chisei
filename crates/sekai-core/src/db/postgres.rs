@@ -275,6 +275,8 @@ const INTERACTIVE_AGENT_TURNS_SCHEMA: &str =
 const SOURCE_CAPTURE_SLOTS_SCHEMA: &str = include_str!("postgres/0192_source_capture_slots.sql");
 const ACTION_BINDING_HISTORY_SCHEMA: &str =
     include_str!("postgres/0193_action_binding_history.sql");
+const CONNECTOR_CREDENTIAL_HANDLES_SCHEMA: &str =
+    include_str!("postgres/0194_connector_credential_handles.sql");
 
 #[derive(Clone, Copy)]
 enum MigrationOwner {
@@ -1393,6 +1395,12 @@ const MIGRATIONS: &[Migration] = &[
         193,
         "action_binding_history",
         ACTION_BINDING_HISTORY_SCHEMA,
+        MigrationOwner::Sekai,
+    ),
+    mig(
+        194,
+        "connector_credential_handles",
+        CONNECTOR_CREDENTIAL_HANDLES_SCHEMA,
         MigrationOwner::Sekai,
     ),
 ];

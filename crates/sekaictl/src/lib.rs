@@ -19,6 +19,7 @@ pub mod compatibility_matrix;
 pub mod compliance_cli;
 pub mod compliance_pack;
 pub mod connector_certification_cli;
+pub mod connector_credential_cli;
 pub mod connector_template;
 pub mod credential_cli;
 pub mod decision_trend_cli;

@@ -9,14 +9,16 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use sekai_client::protocol::sekai::{ConnectorSource, source_config_value};
+use sekai_client::protocol::sekai::{
+    ConnectorSource, CredentialHandleMaterial, source_config_value,
+};
 use sekai_source_sdk::{
     ChangeFeedPage, ConfigValue, Connector, ConnectorFailure, ConnectorType, EgressAllowlist,
     ExportArtifact, GenerationSnapshotPage, Operation, PlaneView, RecordChange, SnapshotRead,
     SourceConfig, connector_type,
 };
 
-use crate::credentials::{CredentialBindings, Credentials};
+use crate::credentials::{CredentialBindings, Credentials, FleetKey};
 
 /// Why a sync failed, as the plane records it (`AckWork` reason).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,9 +85,20 @@ pub struct Prepared {
 }
 
 /// Checks the claimed Source before any connection. Fails closed.
+/// Static configuration only.
 pub fn prepare(
     source: &ConnectorSource,
     bindings: &CredentialBindings,
+) -> Result<Prepared, SyncFailure> {
+    prepare_claim(source, bindings, None, None)
+}
+
+/// Checks the claimed Source, opening plane-held slots with `fleet`.
+pub fn prepare_claim(
+    source: &ConnectorSource,
+    bindings: &CredentialBindings,
+    plane: Option<&CredentialHandleMaterial>,
+    fleet: Option<&FleetKey>,
 ) -> Result<Prepared, SyncFailure> {
     let spec = source.spec.as_ref().ok_or(SyncFailure::Invalid)?;
     let connector = connector_type(&spec.connector_type, &spec.connector_version)
@@ -112,11 +125,13 @@ pub fn prepare(
         .map(|(_, destination)| destination)
         .collect::<Vec<_>>();
     let credentials = bindings
-        .resolve(
+        .resolve_claim(
             &spec.credential_ref,
             &source.namespace,
             connector,
             &destinations,
+            plane,
+            fleet,
         )
         .map_err(|_| SyncFailure::Unavailable)?;
     Ok(Prepared {

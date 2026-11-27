@@ -166,6 +166,10 @@ Edit the fixture, then regenerate with
 | `SekaiService.GetSource` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.ListSources` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.DisableSource` | `sekai.object-sync` | yes | none | `experimental` |
+| `SekaiService.RegisterRuntimeFleetKey` | `sekai.object-sync` | yes | cli | `experimental` |
+| `SekaiService.GetRuntimeFleetKey` | `sekai.object-sync` | yes | cli | `experimental` |
+| `SekaiService.IssueCredentialHandle` | `sekai.object-sync` | yes | cli | `experimental` |
+| `SekaiService.RevokeCredentialHandle` | `sekai.object-sync` | yes | cli | `experimental` |
 | `SekaiService.ListSourceRecordVersions` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.RecordSourceCreatedSlot` | `sekai.object-sync` | yes | none | `experimental` |
 | `SekaiService.RequestSourceDiscovery` | `sekai.object-sync` | yes | none | `experimental` |

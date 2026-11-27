@@ -9,6 +9,7 @@
 //! placement matches the labels the runtime registered with
 //! `RegisterTransformRuntime`.
 
+use super::connector_credential_rpc;
 use super::*;
 use crate::sekai::source::{self, PutSource, Source, SourceError, SourceSpec, SourceStatus};
 use crate::sekai::source_sync::{
@@ -255,7 +256,15 @@ fn sync_work(source: Source) -> SourceSyncWork {
         claim_generation: claim.generation,
         fencing_token: claim.fencing_token,
         claim_expires_at_ms: claim.expires_at_ms,
+        credential: None,
     }
+}
+
+fn claimed_sync_work(db: &RuntimeDb, source: Source) -> Result<SourceSyncWork, Status> {
+    let credential = connector_credential_rpc::material_for_source(db, &source)?;
+    let mut work = sync_work(source);
+    work.credential = credential;
+    Ok(work)
 }
 
 /// `PutSource`: creates a Source, or replaces the spec of the revision the
@@ -524,7 +533,9 @@ impl SekaiServiceImpl {
         } else {
             source_sync::claim(db, namespace, source_id, runtime_id, &labels, ttl_ms, now)
         };
-        claimed.map(sync_work).map_err(sync_status)
+        claimed
+            .map_err(sync_status)
+            .and_then(|source| claimed_sync_work(db, source))
     }
 
     pub(super) fn heartbeat_source_sync<T: std::any::Any>(

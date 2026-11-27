@@ -21,7 +21,7 @@ use sekai_source_sdk::{ExportArtifact, Operation};
 use sha2::{Digest, Sha256};
 
 use crate::runtime::{LIST_LIMIT, Ran, Runtime};
-use crate::sync::{SyncFailure, blocking, prepare};
+use crate::sync::{SyncFailure, blocking};
 
 impl Runtime {
     /// The Source `source_id` in the namespace at `index`, when this
@@ -159,7 +159,7 @@ impl Runtime {
             generation: work.claim_generation,
             fencing_token: work.fencing_token,
         };
-        let outcome = match prepare(&source, &self.bindings) {
+        let outcome = match self.prepare_source(&source, work.credential.as_ref()) {
             Err(failure) => Err(failure),
             Ok(prepared) => {
                 match self

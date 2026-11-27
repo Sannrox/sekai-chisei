@@ -668,6 +668,67 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "RegisterRuntimeFleetKey",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/connector_credential.rs",
+        "src/grpc/connector_credential_rpc.rs",
+        "docs/decisions/0175-plane-stores-sealed-connector-credentials.md"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "GetRuntimeFleetKey",
+      "kind": "query",
+      "surfaces": [],
+      "evidence": [
+        "crates/sekai-core/src/sekai/connector_credential.rs",
+        "src/grpc/connector_credential_rpc.rs"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "IssueCredentialHandle",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/connector_credential.rs",
+        "src/grpc/connector_credential_rpc.rs",
+        "docs/decisions/0175-plane-stores-sealed-connector-credentials.md"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
+      ],
+      "product_tier": "experimental"
+    },
+    {
+      "rpc": "RevokeCredentialHandle",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.object-sync"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/connector_credential.rs",
+        "src/grpc/connector_credential_rpc.rs",
+        "docs/decisions/0175-plane-stores-sealed-connector-credentials.md"
+      ],
+      "durable_dependencies": [
+        "sekai.object-sync"
+      ],
+      "product_tier": "experimental"
+    },
+    {
       "rpc": "ListSourceRecordVersions",
       "kind": "persistent",
       "surfaces": [
