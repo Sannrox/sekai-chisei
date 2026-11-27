@@ -3,7 +3,9 @@
 //! resumable snapshot after the slot's position, hands off to the feed, and
 //! what the runtime read passes the ADR 0118 conformance check. The runtime
 //! creates only a slot the plane records (#3083) and reports the log the
-//! slot retains as a sync note.
+//! slot retains as a sync note. A child killed mid change stream restarts
+//! from the committed cursor once; the Source's credential never reaches
+//! plane records, failure reasons, or log lines.
 //!
 //! Linux only, ignored: needs `SEKAI_TEST_POSTGRES_URL` for a TLS server with
 //! `wal_level=logical`, `SEKAI_TEST_POSTGRES_CA_CERT` for its CA, and
@@ -13,11 +15,16 @@
 //! collide.
 #![cfg(target_os = "linux")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use sekai_chisei::domain::ListFilter;
+use sekai_chisei::sekai::audit::DecisionFilter;
+use sekai_chisei::sekai::coordination::WorkUnitFilter;
 
 use postgres_native_tls::MakeTlsConnector;
 use sekai_chisei::sekai::source::SourceSpec;
@@ -425,6 +432,139 @@ fn events(log: &[Read]) -> Vec<CaptureEvent> {
     events
 }
 
+/// The Source's password as the runtime sends it, once, on the child's start.
+fn password(server: &Server) -> String {
+    String::from_utf8(
+        server
+            .config
+            .get_password()
+            .expect("a password in the URL")
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+/// Host PIDs of `changes` capture children this process started.
+fn changes_child_pids() -> Vec<u32> {
+    let mine = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
+            let ppid: u32 = status.lines().find_map(|line| {
+                line.strip_prefix("PPid:")
+                    .and_then(|rest| rest.split_whitespace().next())
+                    .and_then(|value| value.parse().ok())
+            })?;
+            if ppid != mine {
+                return None;
+            }
+            let cmdline = std::fs::read(entry.path().join("cmdline")).ok()?;
+            let args: Vec<&[u8]> = cmdline
+                .split(|byte| *byte == 0)
+                .filter(|arg| !arg.is_empty())
+                .collect();
+            let capture = args.first().is_some_and(|arg| {
+                std::str::from_utf8(arg).is_ok_and(|path| path.ends_with("sekai-change-capture"))
+            });
+            let changes: &[u8] = b"changes";
+            (capture && args.get(1) == Some(&changes)).then_some(pid)
+        })
+        .collect()
+}
+
+/// Whether the Source's slot is held by a replication session.
+fn slot_active(server: &Server, slot: &str) -> bool {
+    server.admin(|client| {
+        client
+            .query_one(
+                "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1 AND active",
+                &[&slot],
+            )
+            .map(|row| row.get::<_, i64>(0) == 1)
+            .unwrap_or(false)
+    })
+}
+
+/// Kills the one `changes` child started after `before`, once this
+/// Source's slot is held. Several new children means another test is in
+/// the same window; wait rather than kill a foreign process.
+fn kill_changes_child_once(
+    server: &Server,
+    slot: &str,
+    before: &BTreeSet<u32>,
+    killed: &AtomicBool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if slot_active(server, slot) {
+            let started: Vec<u32> = changes_child_pids()
+                .into_iter()
+                .filter(|pid| !before.contains(pid))
+                .collect();
+            if let [pid] = started.as_slice() {
+                let status = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+                if status.is_ok_and(|status| status.success()) {
+                    killed.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Plane records, failure reasons and captured log lines for a leak scan.
+fn plane_text(plane: &Plane, extra: &[&str]) -> String {
+    let source = source_of(plane);
+    let objects = plane
+        .db
+        .list_objects(&ListFilter {
+            limit: 10_000,
+            ..ListFilter::default()
+        })
+        .unwrap();
+    let work = plane
+        .db
+        .list_work_units(&WorkUnitFilter {
+            limit: 1_000,
+            ..WorkUnitFilter::default()
+        })
+        .unwrap();
+    let decisions = plane
+        .db
+        .list_decisions(&DecisionFilter {
+            limit: 1_000,
+            ..DecisionFilter::default()
+        })
+        .unwrap();
+    format!(
+        "{source:?}\nlast_failure={}\n{objects:?}\n{work:?}\n{decisions:?}\n{}",
+        source.sync.last_failure,
+        extra.join("\n")
+    )
+}
+
+/// The Source's credential is absent from plane records, failure reasons
+/// and the extra log lines the runtime produced.
+fn assert_credential_absent(plane: &Plane, credential: &str, extra: &[&str]) {
+    assert!(
+        !credential.is_empty(),
+        "the scan needs a non-empty credential"
+    );
+    let text = plane_text(plane, extra);
+    assert!(
+        !text.contains(credential),
+        "credential leaked into plane records, failure reasons or log lines"
+    );
+}
+
 /// A snapshot interrupted after its first page resumes in another runtime
 /// from the plane's cursor. Rows deleted, changed, inserted and moved to a
 /// new key mid-snapshot all end as the source holds them, and the stream
@@ -647,6 +787,116 @@ async fn postgres_capture_resumes_a_recorded_slot_after_a_crash() {
     assert_eq!(plane_rows(&plane, 2), server.rows(&table));
 
     drop(second);
+    server.drop_slot(&slot);
+    server.execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table}"
+    ));
+}
+
+/// A real child killed while it holds the replication slot is restarted
+/// from the plane's cursor. Each change reaches the plane once.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL, SEKAI_TEST_POSTGRES_CA_CERT and SEKAI_TEST_CAPTURE_CHILD; run through scripts/postgres-conformance.sh"]
+async fn postgres_capture_kills_a_child_mid_stream_and_resumes_once() {
+    let server = Server::from_env();
+    let (table, publication, slot) = (
+        unique("cc_rt_kill"),
+        unique("cc_rt_kill_pub"),
+        unique("cc_rt_kill_slot"),
+    );
+    server.execute(&format!(
+        "CREATE TABLE {table} (id int PRIMARY KEY, name text); \
+         INSERT INTO {table} VALUES (1, 'v1'); \
+         CREATE PUBLICATION {publication} FOR TABLE {table}"
+    ));
+    let plane = serving(&server, &slot, &publication).await;
+    let dir = tempfile::tempdir().unwrap();
+    let log = Log::default();
+    let runtime = runtime(&server, &plane, "eu-1", &log, Dies::Never, dir.path()).await;
+
+    assert_eq!(sync(&plane, &runtime, 1).await, Ok(()));
+    assert_eq!(plane_rows(&plane, 1), server.rows(&table));
+
+    // One transaction of many rows: the child stays in the stream until
+    // it commits, then two idle seconds before it ends the page.
+    server.execute(&format!(
+        "INSERT INTO {table} SELECT n, 'v1' FROM generate_series(2, 400) n"
+    ));
+
+    let before: BTreeSet<u32> = changes_child_pids().into_iter().collect();
+    let killed = Arc::new(AtomicBool::new(false));
+    let killer = std::thread::spawn({
+        let killed = Arc::clone(&killed);
+        let slot = slot.clone();
+        let server = Server::from_env();
+        move || kill_changes_child_once(&server, &slot, &before, &killed)
+    });
+
+    assert_eq!(sync(&plane, &runtime, 2).await, Ok(()));
+    killer.join().unwrap();
+    assert!(
+        killed.load(Ordering::SeqCst),
+        "the capture child was never killed while it held the slot"
+    );
+    assert_eq!(plane_rows(&plane, 400), server.rows(&table));
+
+    drop(runtime);
+    server.drop_slot(&slot);
+    server.execute(&format!(
+        "DROP PUBLICATION {publication}; DROP TABLE {table}"
+    ));
+}
+
+/// A refused password, then a successful sync, never writes the Source's
+/// credential into plane records, the recorded failure class, or the
+/// lines the runtime read.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires SEKAI_TEST_POSTGRES_URL, SEKAI_TEST_POSTGRES_CA_CERT and SEKAI_TEST_CAPTURE_CHILD; run through scripts/postgres-conformance.sh"]
+async fn postgres_capture_never_writes_the_credential_to_the_plane() {
+    let server = Server::from_env();
+    let credential = password(&server);
+    let (table, publication, slot) = (
+        unique("cc_rt_cred"),
+        unique("cc_rt_cred_pub"),
+        unique("cc_rt_cred_slot"),
+    );
+    server.execute(&format!(
+        "CREATE TABLE {table} (id int PRIMARY KEY, name text); \
+         INSERT INTO {table} VALUES (1, 'v1'); \
+         CREATE PUBLICATION {publication} FOR TABLE {table}"
+    ));
+    let plane = serving(&server, &slot, &publication).await;
+    let dir = tempfile::tempdir().unwrap();
+    let log = Log::default();
+    let runtime = runtime(&server, &plane, "eu-1", &log, Dies::Never, dir.path()).await;
+    let password_file = dir.path().join("password-eu-1");
+    let refused = format!(
+        "not-the-slot-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    );
+    std::fs::write(&password_file, &refused).unwrap();
+
+    let failed = sync(&plane, &runtime, 1).await;
+    assert_eq!(failed, Err(SyncFailure::AuthFailed));
+    assert_eq!(source_of(&plane).sync.last_failure, "auth_failed");
+    let read = log.lock().unwrap().clone();
+    let lines = format!("{read:?}\n{failed:?}");
+    assert_credential_absent(&plane, &credential, &[&lines]);
+    assert_credential_absent(&plane, &refused, &[&lines]);
+
+    std::fs::write(&password_file, &credential).unwrap();
+    assert_eq!(sync(&plane, &runtime, 2).await, Ok(()));
+    assert_eq!(plane_rows(&plane, 1), server.rows(&table));
+    let read = log.lock().unwrap().clone();
+    let lines = format!("{read:?}");
+    assert_credential_absent(&plane, &credential, &[&lines]);
+    assert_credential_absent(&plane, &refused, &[&lines]);
+
+    drop(runtime);
     server.drop_slot(&slot);
     server.execute(&format!(
         "DROP PUBLICATION {publication}; DROP TABLE {table}"
