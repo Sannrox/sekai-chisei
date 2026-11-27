@@ -184,6 +184,25 @@ covers it through the token interceptor.
 The handler enforces the tenant on the instance's namespace and applies the
 reads of `GetActionInstance`. It stays experimental.
 
+## Added in #3552
+
+| RPC | Namespace from | Space action |
+| --- | --- | --- |
+| `PutSource`, `DisableSource` | request | write (namespace admin in the handler) |
+| `GetSource`, `ListSources` | request | read |
+| `RequestSourceDiscovery` | request | write (namespace admin in the handler) |
+| `GetSourceDiscovery` | request | read at the interceptor; namespace admin in the handler |
+| `GetDecisionTrend` | request | read (instances the caller may not read are withheld) |
+| `GetAgentAutonomy` | request | read (another tenant's namespace is `NOT_FOUND`) |
+| `SetAgentAutonomy` | request | write (namespace admin; the decision names that user) |
+
+Admission does not change the handlers. A viewer reads Sources and autonomy
+and is refused the writes. `GetDecisionTrend` stays experimental, as do
+Source writes, discovery, and autonomy. `tenant_assertion_manages_sources_and_discovery_in_its_namespace`,
+`tenant_assertion_reads_decision_trend_with_withheld_instances`, and
+`tenant_assertion_reads_and_sets_agent_autonomy_as_the_user` cover them
+through the token interceptor's admitted handlers.
+
 ## Not available to tenant credentials
 
 `CloseDefinitionProposal` stays with unscoped credentials

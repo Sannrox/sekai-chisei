@@ -204,6 +204,146 @@ async fn an_admin_puts_lists_and_disables_a_source_and_a_reader_reads_it() {
     assert_eq!(listed.next_page_token, "repo");
 }
 
+/// #3552: an enterprise-scoped credential uses the user's live roles to
+/// manage Sources and discovery in its tenant; another tenant is refused.
+#[tokio::test]
+async fn tenant_assertion_manages_sources_and_discovery_in_its_namespace() {
+    let svc = enterprise_service();
+    crate::chisei_store::apply_chisei_schema(svc.db.runtime());
+    let ns = "allowed";
+    let put_req = || PutSourceRequest {
+        namespace: ns.into(),
+        source_id: "repo".into(),
+        source: "github".into(),
+        source_instance: "acme/repo".into(),
+        spec: Some(github_spec(0)),
+        expected_revision: 0,
+    };
+    let get_req = || GetSourceRequest {
+        namespace: ns.into(),
+        source_id: "repo".into(),
+    };
+    let list_req = || ListSourcesRequest {
+        namespace: ns.into(),
+        ..Default::default()
+    };
+    let disable_req = || DisableSourceRequest {
+        namespace: ns.into(),
+        source_id: "repo".into(),
+    };
+    let request_disc = || RequestSourceDiscoveryRequest {
+        namespace: ns.into(),
+        source_id: "repo".into(),
+    };
+
+    assert_eq!(
+        svc.put_source(with_tenant_write_context(put_req()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+
+    grant_source_namespace(&svc, ns, "subject-a", Role::Viewer);
+    let listed = svc
+        .list_sources(with_tenant_context(list_req()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(listed.sources.is_empty());
+    assert_eq!(
+        svc.get_source(with_tenant_context(get_req()))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    for denied in [
+        svc.put_source(with_tenant_write_context(put_req()))
+            .await
+            .unwrap_err()
+            .code(),
+        svc.disable_source(with_tenant_write_context(disable_req()))
+            .await
+            .unwrap_err()
+            .code(),
+        svc.request_source_discovery(with_tenant_write_context(request_disc()))
+            .await
+            .unwrap_err()
+            .code(),
+    ] {
+        assert_eq!(denied, tonic::Code::PermissionDenied);
+    }
+
+    grant_source_namespace(&svc, ns, "subject-a", Role::Admin);
+    let created = svc
+        .put_source(with_tenant_write_context(put_req()))
+        .await
+        .unwrap()
+        .into_inner()
+        .source
+        .unwrap();
+    assert_eq!(created.source_id, "repo");
+    assert_eq!(
+        svc.get_source(with_tenant_context(get_req()))
+            .await
+            .unwrap()
+            .into_inner()
+            .source
+            .unwrap()
+            .source_id,
+        "repo"
+    );
+    assert_eq!(
+        svc.list_sources(with_tenant_context(list_req()))
+            .await
+            .unwrap()
+            .into_inner()
+            .sources
+            .len(),
+        1
+    );
+    let discovery = svc
+        .request_source_discovery(with_tenant_write_context(request_disc()))
+        .await
+        .unwrap()
+        .into_inner()
+        .discovery
+        .unwrap();
+    assert!(!discovery.discovery_id.is_empty());
+    let got = svc
+        .get_source_discovery(with_tenant_write_context(GetSourceDiscoveryRequest {
+            namespace: ns.into(),
+            discovery_id: discovery.discovery_id,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .discovery
+        .unwrap();
+    assert_eq!(got.source_id, "repo");
+    let disabled = svc
+        .disable_source(with_tenant_write_context(disable_req()))
+        .await
+        .unwrap()
+        .into_inner()
+        .source
+        .unwrap();
+    assert_eq!(disabled.status, "disabled");
+
+    grant_source_namespace(&svc, "denied", "subject-a", Role::Admin);
+    assert_eq!(
+        svc.put_source(with_tenant_write_context(PutSourceRequest {
+            namespace: "denied".into(),
+            ..put_req()
+        }))
+        .await
+        .unwrap_err()
+        .code(),
+        tonic::Code::PermissionDenied
+    );
+}
+
 fn claim_request(work_id: &str) -> ClaimWorkRequest {
     ClaimWorkRequest {
         kind: WorkKind::SourceSync.into(),
