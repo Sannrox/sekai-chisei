@@ -226,6 +226,15 @@ served only with `SEKAI_EXPERIMENTAL_RPCS` set.
 - **Scope.** The relational type discovers its configured table.
   Enterprise-scoped credentials cannot claim the kind.
 
+## Amendment 2026-11-27
+
+Decision 4's later extension is taken by
+[ADR 0175](0175-plane-stores-sealed-connector-credentials.md) (#3553): the
+plane may also store a handle's values sealed to a fleet key that only the
+runtimes hold, issued and revoked by platform admin without a restart.
+Handles in the runtime's configuration keep working, and the plane still
+never holds a readable value.
+
 ## Alternatives considered
 
 - **Keep one process per integration.** Each new integration keeps paying
