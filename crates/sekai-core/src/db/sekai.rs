@@ -509,6 +509,7 @@ impl SekaiDb {
         self.migrate_action_plans()?;
         self.migrate_export_grants()?;
         self.migrate_federated_allowances()?;
+        self.migrate_connector_credentials()?;
         self.migrate_federated_receipts()?;
         self.migrate_agent_turns()?;
         self.migrate_interactive_agent_turns()?;

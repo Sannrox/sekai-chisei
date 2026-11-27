@@ -10,6 +10,7 @@ publish = false
 # chisei-core): the runtime talks to the plane only over gRPC.
 [dependencies]
 bytes = "1"
+crypto_box = { version = "0.9", features = ["seal", "std", "getrandom"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 futures-util = "0.3"
 hmac = "0.12"

@@ -1,6 +1,7 @@
 //! Governed export (#1627, #1695, ADR 0130): export grants, receipts, and
 //! the streaming pipeline every export runs through.
 
+use super::connector_credential_rpc;
 use super::*;
 use crate::sekai::export_delivery::{self, DeliveryError};
 use crate::sekai::work_claim::Fence;
@@ -1604,7 +1605,7 @@ impl SekaiServiceImpl {
         };
         let artifact = claimed.map_err(delivery_status)?;
         let source = self.delivery_source_id(namespace, &artifact.definition_id)?;
-        Ok(to_proto_delivery_work(artifact, source))
+        claimed_delivery_work(self.db.runtime(), namespace, artifact, source)
     }
 
     /// `HeartbeatWorkClaim` for export delivery.
@@ -1813,5 +1814,19 @@ fn to_proto_delivery_work(
         claim_generation: claim.generation,
         fencing_token: claim.fencing_token,
         claim_expires_at_ms: claim.expires_at_ms,
+        credential: None,
     }
+}
+
+fn claimed_delivery_work(
+    db: &RuntimeDb,
+    namespace: &str,
+    artifact: export_delivery::DeliverableExportArtifact,
+    delivery_source_id: String,
+) -> Result<ExportDeliveryWork, Status> {
+    let credential =
+        connector_credential_rpc::material_for_source_id(db, namespace, &delivery_source_id)?;
+    let mut work = to_proto_delivery_work(artifact, delivery_source_id);
+    work.credential = credential;
+    Ok(work)
 }

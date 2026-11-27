@@ -20,7 +20,7 @@ use sekai_client::ClientConfig;
 use std::path::PathBuf;
 
 use sekai_connector_runtime::{
-    Connectors, CredentialBindings, Runtime, RuntimeOptions, event_stream, github,
+    Connectors, CredentialBindings, FleetKey, Runtime, RuntimeOptions, event_stream, github,
     llm_rows::GatewayRoute, object_storage, relational, rest,
 };
 use sekai_source_sdk::{
@@ -53,6 +53,32 @@ struct Config {
     /// transform steps through it with the key in `CHISEI_GATEWAY_KEY`.
     #[serde(default)]
     gateway_url: Option<String>,
+    /// Fleet key id (ADR 0175). Overridden by `SEKAI_RUNTIME_FLEET_KEY_ID`.
+    #[serde(default)]
+    fleet_key_id: String,
+    /// File of the 32-byte fleet secret as hex. Overridden by
+    /// `SEKAI_RUNTIME_FLEET_KEY`.
+    #[serde(default)]
+    fleet_key_file: Option<PathBuf>,
+}
+
+/// Load the fleet private key from env or the config file.
+fn load_fleet_key(config: &Config) -> Result<Option<FleetKey>, String> {
+    let id = std::env::var("SEKAI_RUNTIME_FLEET_KEY_ID")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| config.fleet_key_id.clone());
+    let env_secret = std::env::var("SEKAI_RUNTIME_FLEET_KEY")
+        .ok()
+        .filter(|value| !value.is_empty());
+    match (env_secret, config.fleet_key_file.as_ref(), id.is_empty()) {
+        (None, None, _) => Ok(None),
+        (_, _, true) => {
+            Err("fleet key needs SEKAI_RUNTIME_FLEET_KEY_ID or config fleet_key_id".into())
+        }
+        (Some(hex), _, _) => FleetKey::from_hex(id, &hex).map(Some),
+        (None, Some(path), _) => FleetKey::from_file(id, path).map(Some),
+    }
 }
 
 /// The gateway route for `url`, refusing a URL with no key.
@@ -108,6 +134,7 @@ async fn serve() -> Result<(), String> {
         .ok_or("usage: sekai-connector-runtime <config.json>")?;
     let text = std::fs::read_to_string(&path).map_err(|error| format!("read config: {error}"))?;
     let config = parse_config(&text)?;
+    let fleet_key = load_fleet_key(&config)?;
     let mut plane = ClientConfig::new(config.plane, config.principal);
     if let Ok(token) = std::env::var("SEKAI_CREDENTIAL") {
         plane = plane.with_token(token).map_err(|error| error.to_string())?;
@@ -149,6 +176,10 @@ async fn serve() -> Result<(), String> {
     .map_err(|error| error.to_string())?;
     let runtime = match gateway {
         Some(route) => runtime.with_gateway(route),
+        None => runtime,
+    };
+    let runtime = match fleet_key {
+        Some(key) => runtime.with_fleet_key(key),
         None => runtime,
     };
     runtime

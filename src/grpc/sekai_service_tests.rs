@@ -41251,6 +41251,9 @@ mod source_discovery_rpc_tests;
 #[path = "source_rpc_tests.rs"]
 mod source_rpc_tests;
 
+#[path = "connector_credential_rpc_tests.rs"]
+mod connector_credential_rpc_tests;
+
 #[path = "agent_turn_transcript_rpc_tests.rs"]
 mod agent_turn_transcript_rpc_tests;
 #[path = "interactive_agent_turn_rpc_tests.rs"]

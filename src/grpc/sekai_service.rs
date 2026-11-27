@@ -96,6 +96,8 @@ mod transform_placement_rpc;
 use scored_knowledge_admission::{
     learning_id as scoring_learning_id, source_request_id as knowledge_source_request_id,
 };
+#[path = "connector_credential_rpc.rs"]
+mod connector_credential_rpc;
 #[path = "sekai_service_db_work.rs"]
 mod db_work;
 #[path = "effective_read.rs"]
@@ -308,6 +310,10 @@ impl SekaiService for SekaiServiceImpl {
         ack_agent_turn => ack_agent_turn_rpc(AckAgentTurnRequest) -> AckAgentTurnResponse;
         append_agent_turn_transcript => append_agent_turn_transcript_rpc(AppendAgentTurnTranscriptRequest) -> AppendAgentTurnTranscriptResponse;
         disable_source => disable_source_rpc(DisableSourceRequest) -> DisableSourceResponse;
+        register_runtime_fleet_key => register_runtime_fleet_key_rpc(RegisterRuntimeFleetKeyRequest) -> RegisterRuntimeFleetKeyResponse;
+        get_runtime_fleet_key => get_runtime_fleet_key_rpc(GetRuntimeFleetKeyRequest) -> GetRuntimeFleetKeyResponse;
+        issue_credential_handle => issue_credential_handle_rpc(IssueCredentialHandleRequest) -> IssueCredentialHandleResponse;
+        revoke_credential_handle => revoke_credential_handle_rpc(RevokeCredentialHandleRequest) -> RevokeCredentialHandleResponse;
         export_namespace_package => export_namespace_package_rpc(ExportNamespacePackageRequest) -> ExportNamespacePackageResponse;
         install_namespace_package => install_namespace_package_rpc(InstallNamespacePackageRequest) -> InstallNamespacePackageResponse;
         get_namespace_package_installation => get_namespace_package_installation_rpc(GetNamespacePackageInstallationRequest) -> GetNamespacePackageInstallationResponse;

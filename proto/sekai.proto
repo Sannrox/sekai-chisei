@@ -1920,6 +1920,9 @@ message SourceSyncWork {
   int64 claim_generation = 3;
   string fencing_token = 4;
   int64 claim_expires_at_ms = 5;
+  // Experimental (ADR 0175). Present when the Source names a plane-held
+  // handle, including a tombstone. Sealed slots; never plaintext.
+  CredentialHandleMaterial credential = 6;
 }
 // Experimental (ADR 0167). Reads the live records of a claimed Source, by
 // object key, under the claim's fence. Rows are ordered by object_key and
@@ -1979,6 +1982,9 @@ message SourceDiscoveryWork {
   int64 claim_generation = 4;
   string fencing_token = 5;
   int64 claim_expires_at_ms = 6;
+  // Experimental (ADR 0175). Present when the Source names a plane-held
+  // handle, including a tombstone. Sealed slots; never plaintext.
+  CredentialHandleMaterial credential = 7;
 }
 // A claimed saved-export artifact: a reference, not bytes. Fetch them with
 // FetchExportArtifact under this claim, then acknowledge with AckWork.
@@ -1989,6 +1995,9 @@ message ExportDeliveryWork {
   string fencing_token = 4;
   // Never later than the artifact's expires_at_ms.
   int64 claim_expires_at_ms = 5;
+  // Experimental (ADR 0175). Present when the delivery Source names a
+  // plane-held handle, including a tombstone. Sealed slots; never plaintext.
+  CredentialHandleMaterial credential = 6;
 }
 // A claimable or claimed external effect: the effect with its claim, the
 // Source that applies it, and the admitted Action's parameters.
@@ -1996,7 +2005,69 @@ message ExternalEffectWork {
   ActionEffect effect = 1;
   ConnectorSource source = 2;
   string parameters_json = 3;
+  // Experimental (ADR 0175). Present when the Source names a plane-held
+  // handle, including a tombstone. Sealed slots; never plaintext.
+  CredentialHandleMaterial credential = 4;
 }
+
+// Experimental (ADR 0175): a slot value sealed to a runtime fleet public
+// key. The plane stores and returns only these bytes and the key id.
+message SealedCredentialSlot {
+  string name = 1;
+  string fleet_key_id = 2;
+  bytes ciphertext = 3;
+}
+
+// Experimental (ADR 0175): a plane-held connector credential handle as a
+// claim carries it. A tombstone has revoked true and no slots.
+message CredentialHandleMaterial {
+  string name = 1;
+  repeated string namespaces = 2;
+  repeated string destinations = 3;
+  repeated SealedCredentialSlot slots = 4;
+  bool revoked = 5;
+}
+
+// Experimental (ADR 0175): the public half of a runtime fleet X25519 key.
+message RuntimeFleetKey {
+  string key_id = 1;
+  bytes public_key = 2;
+}
+
+message RegisterRuntimeFleetKeyRequest {
+  string key_id = 1;
+  bytes public_key = 2;
+}
+
+message RegisterRuntimeFleetKeyResponse {
+  RuntimeFleetKey key = 1;
+}
+
+message GetRuntimeFleetKeyRequest {
+  string key_id = 1;
+}
+
+message GetRuntimeFleetKeyResponse {
+  RuntimeFleetKey key = 1;
+}
+
+message IssueCredentialHandleRequest {
+  string name = 1;
+  repeated string namespaces = 2;
+  repeated string destinations = 3;
+  repeated SealedCredentialSlot slots = 4;
+}
+
+message IssueCredentialHandleResponse {
+  string name = 1;
+  string content_digest = 2;
+}
+
+message RevokeCredentialHandleRequest {
+  string name = 1;
+}
+
+message RevokeCredentialHandleResponse {}
 // Options of a list or claim of agent turns.
 message AgentTurnWorkOptions {
   // When false, parked turns that would resume with a continuation are
@@ -7067,6 +7138,20 @@ service SekaiService {
   rpc GetSource(GetSourceRequest) returns (GetSourceResponse);
   rpc ListSources(ListSourcesRequest) returns (ListSourcesResponse);
   rpc DisableSource(DisableSourceRequest) returns (DisableSourceResponse);
+  // Experimental (ADR 0175): platform-admin issue and revoke of a connector
+  // credential handle sealed to a registered runtime fleet public key. The
+  // plane stores sealed bytes and the key id only. A claim of a Source that
+  // names the handle carries the material; the runtime opens it with the
+  // fleet private key. Register and get the public half so sekaictl can
+  // seal before IssueCredentialHandle.
+  rpc RegisterRuntimeFleetKey(RegisterRuntimeFleetKeyRequest)
+      returns (RegisterRuntimeFleetKeyResponse);
+  rpc GetRuntimeFleetKey(GetRuntimeFleetKeyRequest)
+      returns (GetRuntimeFleetKeyResponse);
+  rpc IssueCredentialHandle(IssueCredentialHandleRequest)
+      returns (IssueCredentialHandleResponse);
+  rpc RevokeCredentialHandle(RevokeCredentialHandleRequest)
+      returns (RevokeCredentialHandleResponse);
   // Experimental (ADR 0167): only the runtime holding the Source's live
   // sync claim may read its records' versions; a stale fence is refused.
   rpc ListSourceRecordVersions(ListSourceRecordVersionsRequest)

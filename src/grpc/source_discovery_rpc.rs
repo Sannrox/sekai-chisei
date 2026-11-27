@@ -11,6 +11,7 @@
 //! The plane audits each sample's row count, never its cells, before it
 //! accepts the result.
 
+use super::connector_credential_rpc;
 use super::rpc_actions::cleared_for_marking;
 use super::source_rpc::{source_admin, source_to_proto};
 use super::*;
@@ -201,7 +202,19 @@ fn discovery_work(request: SourceDiscoveryRequest, source: Source) -> SourceDisc
         claim_generation: request.claim.generation,
         fencing_token: request.claim.fencing_token,
         claim_expires_at_ms: request.claim.expires_at_ms,
+        credential: None,
     }
+}
+
+fn claimed_discovery_work(
+    db: &RuntimeDb,
+    request: SourceDiscoveryRequest,
+    source: Source,
+) -> Result<SourceDiscoveryWork, Status> {
+    let credential = connector_credential_rpc::material_for_source(db, &source)?;
+    let mut work = discovery_work(request, source);
+    work.credential = credential;
+    Ok(work)
 }
 
 impl SekaiServiceImpl {
@@ -263,8 +276,8 @@ impl SekaiServiceImpl {
             )
         };
         claimed
-            .map(|(request, source)| discovery_work(request, source))
             .map_err(discovery_status)
+            .and_then(|(request, source)| claimed_discovery_work(db, request, source))
     }
 
     pub(super) fn heartbeat_source_discovery<T: std::any::Any>(

@@ -149,6 +149,9 @@ async fn run() -> Result<(), BoxError> {
             )
             .await
         }
+        "connector-credential" => {
+            sekaictl::connector_credential_cli::run(args.into_iter().skip(1).collect()).await
+        }
         "warehouse" => {
             sekaictl::warehouse_projection_cli::run_warehouse_command(
                 args.into_iter().skip(1).collect(),
@@ -452,6 +455,7 @@ fn expand_admin_args(mut args: Vec<String>) -> Result<Vec<String>, String> {
         (Some("packages"), _) => ("packages", 2),
         (Some("workflow"), _) => ("workflow", 2),
         (Some("connectors"), _) => ("connectors", 2),
+        (Some("connector-credential"), _) => ("connector-credential", 2),
         (Some("warehouse"), _) => ("warehouse", 2),
         (Some("lakehouse"), _) => ("lakehouse", 2),
         (Some("providers"), _) => ("providers", 2),
@@ -672,6 +676,7 @@ fn print_admin_usage() {
          \n\
          Connectors:\n\
            sekaictl admin connectors ...\n\
+           sekaictl admin connector-credential ...\n\
          \n\
          Warehouse:\n\
            sekaictl admin warehouse ...\n\
@@ -761,6 +766,7 @@ fn expert_usage(command: &str) -> Option<String> {
         "network" => Some(sekaictl::federation_network_cli::usage().to_string()),
         "workflow" => Some(sekaictl::workflow_action_cli::usage().to_string()),
         "connectors" => Some(sekaictl::connector_certification_cli::usage().to_string()),
+        "connector-credential" => Some(sekaictl::connector_credential_cli::usage().to_string()),
         "warehouse" => Some(sekaictl::warehouse_projection_cli::usage().to_string()),
         "lakehouse" => Some(sekaictl::lakehouse_snapshot_cli::usage().to_string()),
         "providers" => Some(sekaictl::model_platform_cli::usage().to_string()),
@@ -798,6 +804,7 @@ fn canonical_admin_path(command: &str) -> Option<&'static str> {
         "network" => Some("admin network"),
         "workflow" => Some("admin workflow"),
         "connectors" => Some("admin connectors"),
+        "connector-credential" => Some("admin connector-credential"),
         "warehouse" => Some("admin warehouse"),
         "lakehouse" => Some("admin lakehouse"),
         "providers" => Some("admin providers"),
@@ -920,6 +927,7 @@ mod tests {
             (vec!["network"], "network"),
             (vec!["workflow"], "workflow"),
             (vec!["connectors"], "connectors"),
+            (vec!["connector-credential"], "connector-credential"),
             (vec!["warehouse"], "warehouse"),
             (vec!["lakehouse"], "lakehouse"),
             (vec!["providers"], "providers"),
@@ -983,6 +991,7 @@ mod tests {
             "network",
             "workflow",
             "connectors",
+            "connector-credential",
             "warehouse",
             "lakehouse",
             "providers",

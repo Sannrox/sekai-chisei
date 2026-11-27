@@ -42,7 +42,7 @@ use sekai_source_sdk::{Operation, RecordChange};
 use sha2::{Digest, Sha256};
 
 use crate::runtime::{LIST_LIMIT, Ran, Runtime};
-use crate::sync::{Prepared, SyncFailure, blocking, prepare};
+use crate::sync::{Prepared, SyncFailure, blocking};
 
 /// The host capability every apply offers: the connector checks that the
 /// record still has the version the change was decided against before it
@@ -248,7 +248,8 @@ impl Runtime {
             generation: i64::try_from(effect.claim_generation).unwrap_or(i64::MAX),
             fencing_token: effect.claim_fencing_token.clone(),
         };
-        let outcome = match prepare(&source, &self.bindings)
+        let outcome = match self
+            .prepare_source(&source, work.credential.as_ref())
             .and_then(|prepared| Ok((prepared, Intent::parse(&work, &source)?)))
         {
             Err(failure) => Effected::Failed(failure),
