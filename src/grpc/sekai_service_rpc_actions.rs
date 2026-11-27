@@ -293,6 +293,7 @@ pub(super) async fn submit_action_instance(
         marking_gate: submitter_marking_gate(service, &principals, &namespace_for_gate),
         expected_object_revision: String::new(),
         binding_approval_rule,
+        binding_id: String::new(),
         offline: inner
             .offline
             .map(|offline| from_proto_offline_submission(offline, device_id))
@@ -1259,7 +1260,7 @@ pub(super) fn authorize_action_instance_visibility(
     Ok(())
 }
 
-fn action_instance_target_object_id(parameters_json: &str) -> Option<String> {
+pub(super) fn action_instance_target_object_id(parameters_json: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(parameters_json)
         .ok()
         .and_then(|value| {
@@ -2787,6 +2788,7 @@ pub(super) async fn execute_action_plan(
             marking_gate: submitter_marking_gate(service, &principals, &inner.namespace),
             expected_object_revision: expected_revision.into(),
             binding_approval_rule: String::new(),
+            binding_id: String::new(),
             offline: None,
         };
         let outcome = match &service.cross_store {

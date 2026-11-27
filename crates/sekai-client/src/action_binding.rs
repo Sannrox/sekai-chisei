@@ -5,14 +5,16 @@
 
 use crate::protocol::sekai::{
     ActionBindingRecord, GetActionBindingRequest, GetActionBindingResponse,
-    ListActionBindingsRequest, ListActionBindingsResponse, PutActionBindingRequest,
-    PutActionBindingResponse, RunActionBindingRequest, RunActionBindingResponse,
+    ListActionBindingHistoryRequest, ListActionBindingHistoryResponse, ListActionBindingsRequest,
+    ListActionBindingsResponse, PutActionBindingRequest, PutActionBindingResponse,
+    RunActionBindingRequest, RunActionBindingResponse,
 };
 use crate::{CallOptions, CoreLoopClient, GrpcTransport, SdkError, SdkErrorCode};
 
 const PUT: &str = "/sekai.SekaiService/PutActionBinding";
 const GET: &str = "/sekai.SekaiService/GetActionBinding";
 const LIST: &str = "/sekai.SekaiService/ListActionBindings";
+const HISTORY: &str = "/sekai.SekaiService/ListActionBindingHistory";
 const RUN: &str = "/sekai.SekaiService/RunActionBinding";
 
 /// Install, read, and run Action bindings over the native transport.
@@ -87,6 +89,29 @@ impl ActionBindingClient<'_> {
             LIST,
             ListActionBindingsRequest {
                 namespace: namespace.into(),
+                page_size,
+                page_token: page_token.into(),
+            },
+            true,
+        )
+        .await
+    }
+
+    /// One page of a binding's run history, newest first. Does not advance
+    /// the cursor. Pass the previous `next_page_token`, or empty to start.
+    pub async fn history(
+        &self,
+        namespace: impl Into<String>,
+        binding_id: impl Into<String>,
+        page_size: u32,
+        page_token: impl Into<String>,
+    ) -> Result<ListActionBindingHistoryResponse, SdkError> {
+        let page_size = i32::try_from(page_size).map_err(|_| SdkError::invalid_argument())?;
+        self.call(
+            HISTORY,
+            ListActionBindingHistoryRequest {
+                namespace: namespace.into(),
+                binding_id: binding_id.into(),
                 page_size,
                 page_token: page_token.into(),
             },

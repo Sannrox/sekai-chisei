@@ -598,6 +598,7 @@ fn propose_lifts_for_fixed(
             marking_gate: Default::default(),
             expected_object_revision: String::new(),
             binding_approval_rule: String::new(),
+            binding_id: String::new(),
             offline: None,
         };
         let outcome = ActionInstanceAdmission::new(db, None).admit(request, actor, now_ms);
@@ -901,6 +902,7 @@ mod tests {
             marking_gate: Default::default(),
             expected_object_revision: String::new(),
             binding_approval_rule: String::new(),
+            binding_id: String::new(),
             offline: None,
         }
     }

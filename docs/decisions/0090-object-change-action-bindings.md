@@ -64,6 +64,8 @@ a failed run is recorded rather than retried into duplicate effects.
 - **Wire.** Both RPCs were `experimental` until an SDK consumer shipped.
   They are `stable` since #3036, with `GetActionBinding` and
   `ListActionBindings` beside them, on SQLite and PostgreSQL.
+  `ListActionBindingHistory` (#3551) pages one binding's past submissions
+  without advancing its cursor.
 
 ## Alternatives considered
 

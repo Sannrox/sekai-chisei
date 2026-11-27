@@ -109,6 +109,7 @@ fn dispatch_request() -> ActionInstanceAdmissionRequest {
         marking_gate: Default::default(),
         expected_object_revision: String::new(),
         binding_approval_rule: String::new(),
+        binding_id: String::new(),
         offline: None,
     }
 }

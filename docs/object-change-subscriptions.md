@@ -94,9 +94,15 @@ A rerun admits nothing new, and `require_approval` parks. See
 `sekai.action-binding/v1` JSON with their revision. The `run_as` principal
 and namespace administrators may read a binding; anyone else gets
 `NOT_FOUND` from get and does not see it in a list. A list pages by
-`binding_id`, at most 100 per page. All four RPCs are `stable` (#3036) and
-served over gRPC and the HTTP/JSON projection. The Rust client exposes them
-as `CoreLoopClient::action_bindings()` (`put`, `get`, `list`, `run`).
+`binding_id`, at most 100 per page. `ListActionBindingHistory` pages one
+binding's past submissions newest first without advancing its cursor: each
+entry is a submitted instance (id and outcome submitted, parked, applied, or
+failed) or a skip with reason. An enterprise-scoped credential with
+namespace read may call it; instances it may not read are counted as
+withheld. Instances written before the binding column existed do not appear.
+The five RPCs are `stable` (#3036, #3551) and served over gRPC and the
+HTTP/JSON projection. The Rust client exposes them as
+`CoreLoopClient::action_bindings()` (`put`, `get`, `list`, `history`, `run`).
 
 A binding can fire on a fixed interval instead (#3033): it carries
 `"schedule": {"every_ms": N}` with N from 60000 (one minute) to 604800000

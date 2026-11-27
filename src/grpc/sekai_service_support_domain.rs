@@ -546,6 +546,7 @@ pub(super) fn to_proto_action_instance(
         }),
         erased_properties: domain.erased_properties.clone(),
         erased_request_digest: domain.erased_request_digest.clone(),
+        binding_id: domain.binding_id.clone(),
         agent_turn: domain.agent_turn.as_ref().map(|turn| {
             let interactive = turn.interactive.clone();
             crate::grpc::pb::sekai::ActionAgentTurn {

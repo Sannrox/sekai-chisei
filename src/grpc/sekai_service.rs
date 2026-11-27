@@ -370,6 +370,7 @@ impl SekaiService for SekaiServiceImpl {
         run_action_binding => run_action_binding_once(RunActionBindingRequest) -> RunActionBindingResponse;
         get_action_binding => get_action_binding_record(GetActionBindingRequest) -> GetActionBindingResponse;
         list_action_bindings => list_action_binding_records(ListActionBindingsRequest) -> ListActionBindingsResponse;
+        list_action_binding_history => list_action_binding_history_rpc(ListActionBindingHistoryRequest) -> ListActionBindingHistoryResponse;
         apply_graph_changes => apply_graph_changes_rpc(ApplyGraphChangesRequest) -> ApplyGraphChangesResponse;
     }
 

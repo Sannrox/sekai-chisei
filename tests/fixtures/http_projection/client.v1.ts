@@ -103,6 +103,7 @@ export const HTTP_UNARY_METHODS = [
   { service: "sekai.SekaiService", rpc: "RunActionBinding" },
   { service: "sekai.SekaiService", rpc: "GetActionBinding" },
   { service: "sekai.SekaiService", rpc: "ListActionBindings" },
+  { service: "sekai.SekaiService", rpc: "ListActionBindingHistory" },
   { service: "sekai.SekaiService", rpc: "DescribeObjectAction" },
   { service: "sekai.SekaiService", rpc: "PreviewObjectAction" },
   { service: "sekai.SekaiService", rpc: "GetActionInstance" },

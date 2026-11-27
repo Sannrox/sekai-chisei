@@ -9,11 +9,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use sekai_chisei::db::OlderThan;
 use sekai_chisei::db::runtime_db::RuntimeDb;
 use sekai_chisei::sekai::action_binding::{
     ACTION_BINDING_CONTRACT, ActionBinding, ActionBindingCursor, ActionBindingDatasetCommit,
-    ActionBindingSchedule, ParameterSource, ReadMarker,
+    ActionBindingSchedule, ActionBindingSkip, ParameterSource, ReadMarker,
 };
+use sekai_chisei::sekai::action_instance::ActionInstance;
 use sekai_chisei::sekai::event_subscription::{EventSubscription, EventSubscriptionCursor};
 use sekai_chisei::sekai::object_change_subscription::{OP_UPDATE, ObjectChangeEvent};
 
@@ -282,6 +284,78 @@ fn exercise(db: &RuntimeDb, namespace: &str) {
             .iter()
             .any(|binding| binding.binding_id == "gated" && binding.require_approval)
     );
+
+    let skip = ActionBindingSkip {
+        namespace: namespace.into(),
+        binding_id: "escalate-on-update".into(),
+        event_id: "evt-skip".into(),
+        object_id: "inc-1".into(),
+        op: OP_UPDATE.into(),
+        skipped_reason: "op_not_bound".into(),
+        created_at_ms: 50,
+        dataset_id: String::new(),
+        version_id: String::new(),
+    };
+    db.put_action_binding_skip(&skip).unwrap();
+    let skips = db
+        .list_action_binding_skips(namespace, "escalate-on-update", OlderThan::START, 10)
+        .unwrap();
+    assert_eq!(skips.len(), 1);
+    assert_eq!(skips[0].skipped_reason, "op_not_bound");
+
+    let mut bound = history_instance(namespace, "bound", "escalate-on-update");
+    bound.created_at_ms = 40;
+    db.put_action_instance(&bound).unwrap();
+    let mut unbound = history_instance(namespace, "unbound", "");
+    unbound.created_at_ms = 45;
+    db.put_action_instance(&unbound).unwrap();
+    let listed = db
+        .list_action_instances_for_binding(namespace, "escalate-on-update", OlderThan::START, 10)
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].instance_id, "bound");
+}
+
+fn history_instance(namespace: &str, id: &str, binding_id: &str) -> ActionInstance {
+    ActionInstance {
+        agent_turn: None,
+        instance_id: id.into(),
+        namespace: namespace.into(),
+        type_id: "incident.escalate".into(),
+        version: "1".into(),
+        principal: "svc-escalator".into(),
+        delegating_actor: None,
+        parameters_json: "{}".into(),
+        request_digest: format!("{id}-digest"),
+        idempotency_key: format!("{id}-idem"),
+        operation_id: format!("{id}-op"),
+        status: "admitted".into(),
+        deny_reason: String::new(),
+        evidence_submission_ids: Vec::new(),
+        policy_decision: "allow".into(),
+        budget_decision: "allow".into(),
+        created_at_ms: 10,
+        decided_at_ms: 10,
+        system_one_fill_json: String::new(),
+        parked_object_digest: String::new(),
+        decided_by: String::new(),
+        approval_decision: String::new(),
+        autonomous_envelope_id: String::new(),
+        review: Default::default(),
+        agent_action: false,
+        admission_tenant: String::new(),
+        resource_tenant: String::new(),
+        marking: String::new(),
+        conflict: None,
+        approval: None,
+        offline: None,
+        admission_lease: None,
+        admission_ontology_digest: None,
+        admission_budget_already_reserved: false,
+        erased_properties: Vec::new(),
+        erased_request_digest: String::new(),
+        binding_id: binding_id.into(),
+    }
 }
 
 #[test]

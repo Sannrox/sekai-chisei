@@ -123,6 +123,11 @@ pub struct ActionInstance {
     /// legitimate erase from other edits of the stored parameters.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub erased_request_digest: String,
+    /// The Action binding that raised this instance. Empty when the
+    /// instance was not submitted by a binding, including rows written
+    /// before the binding column existed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub binding_id: String,
 }
 
 /// How long an admission may take before its reservation is considered
@@ -595,6 +600,16 @@ impl SekaiDb {
                 );",
         )
         .map_err(|e| e.to_string())?;
+        crate::db::add_sqlite_column(
+            &conn,
+            "ALTER TABLE sekai_action_instances ADD COLUMN binding_id TEXT",
+        )?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_action_instances_binding
+                ON sekai_action_instances(namespace, binding_id, created_at_ms DESC, instance_id DESC)
+                WHERE binding_id IS NOT NULL AND binding_id != '';",
+        )
+        .map_err(|e| e.to_string())?;
         conn.execute_batch(crate::db::object_log_ingest::SQLITE_SCHEMA)
             .map_err(|e| e.to_string())
     }
@@ -786,6 +801,47 @@ impl SekaiDb {
             .collect()
     }
 
+    /// Instances a binding raised, older than `before`, newest first.
+    /// Rows with no binding_id (written before the column, or not submitted
+    /// by a binding) are not returned.
+    pub fn list_action_instances_for_binding(
+        &self,
+        namespace: &str,
+        binding_id: &str,
+        before: crate::db::OlderThan<'_>,
+        limit: usize,
+    ) -> Result<Vec<ActionInstance>, String> {
+        self.migrate_action_instances()?;
+        if binding_id.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let limit = limit.clamp(1, 500);
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT body_json FROM sekai_action_instances
+                 WHERE namespace = ?1 AND binding_id = ?2
+                   AND (created_at_ms < ?3
+                        OR (created_at_ms = ?3 AND instance_id < ?4))
+                 ORDER BY created_at_ms DESC, instance_id DESC
+                 LIMIT ?5",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![namespace, binding_id, before.at_ms, before.id, limit as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            row.map_err(|e| e.to_string()).and_then(|body| {
+                serde_json::from_str(&body)
+                    .map_err(|e| format!("corrupt action instance body: {e}"))
+            })
+        })
+        .collect()
+    }
+
     /// Whether `principal` has an instance of `type_id` in `namespace` with
     /// `status`, decided at or after `since_ms`; one index probe.
     pub fn action_instance_decided_since(
@@ -909,13 +965,15 @@ impl SekaiDb {
         let body_json = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
         let evidence_json =
             serde_json::to_string(&stored.evidence_submission_ids).map_err(|e| e.to_string())?;
+        let binding_id = stored.binding_id.trim();
+        let binding_id = (!binding_id.is_empty()).then_some(binding_id);
         match tx.execute(
             "INSERT INTO sekai_action_instances
              (instance_id, namespace, type_id, version, principal, parameters_json,
               request_digest, idempotency_key, operation_id, status, deny_reason,
               evidence_submission_ids_json, policy_decision, budget_decision,
-              created_at_ms, decided_at_ms, body_json)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+              created_at_ms, decided_at_ms, body_json, binding_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 stored.instance_id,
                 stored.namespace,
@@ -934,6 +992,7 @@ impl SekaiDb {
                 stored.created_at_ms,
                 stored.decided_at_ms,
                 body_json,
+                binding_id,
             ],
         ) {
             Ok(_) => {
@@ -2095,6 +2154,7 @@ mod tests {
             admission_budget_already_reserved: false,
             erased_properties: Vec::new(),
             erased_request_digest: String::new(),
+            binding_id: String::new(),
         }
     }
 
@@ -2152,6 +2212,35 @@ mod tests {
             .list_action_instances("acme", Some("review.intake"), None, 10)
             .unwrap();
         assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn list_for_binding_omits_rows_without_that_binding() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let mut bound = sample(STATUS_ADMITTED);
+        bound.binding_id = "escalate".into();
+        db.put_action_instance(&bound).unwrap();
+        let mut other = sample(STATUS_ADMITTED);
+        other.instance_id = "ai-2".into();
+        other.idempotency_key = "key-2".into();
+        other.operation_id = "op-2".into();
+        other.binding_id = "other".into();
+        db.put_action_instance(&other).unwrap();
+        let mut unbound = sample(STATUS_ADMITTED);
+        unbound.instance_id = "ai-3".into();
+        unbound.idempotency_key = "key-3".into();
+        unbound.operation_id = "op-3".into();
+        db.put_action_instance(&unbound).unwrap();
+        let listed = db
+            .list_action_instances_for_binding("acme", "escalate", crate::db::OlderThan::START, 10)
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].instance_id, "ai-1");
+        assert!(
+            db.list_action_instances_for_binding("acme", "", crate::db::OlderThan::START, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

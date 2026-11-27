@@ -109,6 +109,7 @@ HTTP_UNARY_METHODS = (
     ("sekai.SekaiService", "RunActionBinding"),
     ("sekai.SekaiService", "GetActionBinding"),
     ("sekai.SekaiService", "ListActionBindings"),
+    ("sekai.SekaiService", "ListActionBindingHistory"),
     ("sekai.SekaiService", "DescribeObjectAction"),
     ("sekai.SekaiService", "PreviewObjectAction"),
     ("sekai.SekaiService", "GetActionInstance"),

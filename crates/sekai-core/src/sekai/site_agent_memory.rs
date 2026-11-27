@@ -665,6 +665,7 @@ mod tests {
                 marking_gate: Default::default(),
                 expected_object_revision: String::new(),
                 binding_approval_rule: String::new(),
+                binding_id: String::new(),
                 offline: None,
             },
             actor,
@@ -1654,6 +1655,7 @@ mod tests {
             admission_budget_already_reserved: false,
             erased_properties: Vec::new(),
             erased_request_digest: String::new(),
+            binding_id: String::new(),
         }
     }
 

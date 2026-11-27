@@ -3,8 +3,10 @@
 
 use super::*;
 use crate::sekai::action_binding::{
-    ActionBinding, DATASET_COMMIT_PINNED, OP_DATASET_COMMIT, ParameterSource, ReadMarker,
+    ActionBinding, ActionBindingSkip, DATASET_COMMIT_PINNED, OP_DATASET_COMMIT, ParameterSource,
+    ReadMarker,
 };
+use crate::sekai::action_instance::{STATUS_ADMITTED, STATUS_DENIED, STATUS_PARKED};
 use crate::sekai::action_instance_admission::{
     ActionInstanceAdmission, ActionInstanceAdmissionError, ActionInstanceAdmissionRequest,
 };
@@ -173,6 +175,136 @@ impl SekaiServiceImpl {
                 .collect::<Result<_, _>>()?,
             next_page_token,
         }))
+    }
+
+    /// Pages one binding's run history, newest first, without advancing its
+    /// cursor. Namespace read is enough; instances the caller may not read
+    /// are counted as withheld.
+    pub(super) async fn list_action_binding_history_rpc(
+        &self,
+        req: Request<ListActionBindingHistoryRequest>,
+    ) -> Result<Response<ListActionBindingHistoryResponse>, Status> {
+        let principals = caller_principals(&req);
+        let tenant_context = request_tenant_context(self.db.runtime(), &req)?;
+        let policy_context = principal_policy_context(&req);
+        let input = req.into_inner();
+        let namespace = input.namespace.trim();
+        let binding_id = input.binding_id.trim();
+        if namespace.is_empty() {
+            return Err(Status::invalid_argument("namespace is required"));
+        }
+        if binding_id.is_empty() {
+            return Err(Status::invalid_argument("binding_id is required"));
+        }
+        let page_size = match input.page_size {
+            0 => MAX_BINDING_PAGE,
+            size @ 1..=MAX_BINDING_PAGE => size,
+            _ => {
+                return Err(Status::invalid_argument(format!(
+                    "page_size must be between 0 and {MAX_BINDING_PAGE}"
+                )));
+            }
+        } as usize;
+        authorize_action_instance_read(self, &principals, namespace, tenant_context.as_ref())?;
+        enforce_namespace_tenant_context(
+            self.db.runtime(),
+            tenant_context.as_ref(),
+            namespace,
+            false,
+        )?;
+        let mut cursor = parse_binding_history_page_token(&input.page_token)?;
+        let mut entries = Vec::new();
+        let mut withheld_count = 0u32;
+        let mut next_page_token = String::new();
+        'pages: loop {
+            let (instances, skips) = self.binding_history_page(namespace, binding_id, &cursor)?;
+            let merged = merge_binding_history(&instances, &skips);
+            if merged.is_empty() {
+                break;
+            }
+            let exhausted = instances.len() < 100 && skips.len() < 100;
+            for (index, item) in merged.iter().enumerate() {
+                cursor = item.cursor();
+                match item {
+                    HistoryItem::Instance(instance) => {
+                        match super::rpc_actions::authorize_action_instance_visibility(
+                            self,
+                            &principals,
+                            tenant_context.as_ref(),
+                            &policy_context,
+                            instance,
+                        ) {
+                            Ok(()) => entries.push(instance_history_entry(instance)),
+                            Err(status)
+                                if matches!(
+                                    status.code(),
+                                    tonic::Code::PermissionDenied | tonic::Code::NotFound
+                                ) =>
+                            {
+                                withheld_count += 1;
+                            }
+                            Err(status) => return Err(status),
+                        }
+                    }
+                    HistoryItem::Skip(skip) => entries.push(skip_history_entry(skip)),
+                }
+                if entries.len() == page_size {
+                    if !exhausted || index + 1 < merged.len() {
+                        next_page_token = encode_binding_history_page_token(cursor);
+                    }
+                    break 'pages;
+                }
+            }
+            if exhausted {
+                break;
+            }
+        }
+        Ok(Response::new(ListActionBindingHistoryResponse {
+            entries,
+            next_page_token,
+            withheld_count,
+        }))
+    }
+
+    fn binding_history_page(
+        &self,
+        namespace: &str,
+        binding_id: &str,
+        cursor: &(i64, HistoryKind, String),
+    ) -> Result<
+        (
+            Vec<crate::sekai::action_instance::ActionInstance>,
+            Vec<ActionBindingSkip>,
+        ),
+        Status,
+    > {
+        // Newest first, skips before instances at the same timestamp.
+        // After a skip cursor, instances at that timestamp still remain.
+        let instance_before = crate::db::OlderThan {
+            at_ms: cursor.0,
+            id: match cursor.1 {
+                HistoryKind::Instance => cursor.2.as_str(),
+                HistoryKind::Skip => "\u{10ffff}",
+            },
+        };
+        let skip_before = crate::db::OlderThan {
+            at_ms: cursor.0,
+            id: match cursor.1 {
+                HistoryKind::Skip => cursor.2.as_str(),
+                HistoryKind::Instance => "",
+            },
+        };
+        let instances = self
+            .db
+            .runtime()
+            .list_action_instances_for_binding(namespace, binding_id, instance_before, 100)
+            .map_err(Status::internal)?;
+        let skips = self
+            .db
+            .runtime()
+            .list_action_binding_skips(namespace, binding_id, skip_before, 100)
+            .map_err(map_binding_store_error)?;
+        Ok((instances, skips))
     }
 
     /// A binding is readable by the principal it runs as and by a namespace
@@ -509,6 +641,7 @@ impl SekaiServiceImpl {
             if is_internal_skip(&submission.skipped_reason) {
                 return Err(Status::internal(submission.skipped_reason.clone()));
             }
+            self.persist_binding_skip(&binding, &submission)?;
             response.submissions.push(submission);
         }
         cursor.pending_events.clear();
@@ -597,6 +730,7 @@ impl SekaiServiceImpl {
                                     .dataset_parameters(&dataset.id, &version.version_id),
                                 idempotency_key,
                                 approval_rule: binding.approval_rule(),
+                                binding_id: &binding.binding_id,
                             },
                             tenant,
                             resource_tenant,
@@ -622,6 +756,7 @@ impl SekaiServiceImpl {
                         submission.skipped_reason = reason;
                     }
                 }
+                self.persist_binding_skip(binding, &submission)?;
                 response.submissions.push(submission);
             }
             if delivered > after {
@@ -700,6 +835,7 @@ impl SekaiServiceImpl {
                             parameters_json: binding.tick_parameters(),
                             idempotency_key: binding.tick_idempotency_key(due_at_ms)?,
                             approval_rule: binding.approval_rule(),
+                            binding_id: &binding.binding_id,
                         },
                         &tenant,
                         &resource_tenant,
@@ -854,6 +990,7 @@ impl SekaiServiceImpl {
                 parameters_json,
                 idempotency_key,
                 approval_rule: binding.approval_rule(),
+                binding_id: &binding.binding_id,
             },
             tenant,
             resource_tenant,
@@ -904,6 +1041,7 @@ impl SekaiServiceImpl {
             ),
             expected_object_revision: String::new(),
             binding_approval_rule: action.approval_rule,
+            binding_id: action.binding_id.to_string(),
             offline: None,
         };
         let result = if let Some(clerk) = &self.cross_store {
@@ -966,6 +1104,8 @@ pub(super) struct BoundAction<'a> {
     pub idempotency_key: String,
     /// The binding's approval rule; empty adds no park (#3035).
     pub approval_rule: String,
+    /// The binding that submits this Action.
+    pub binding_id: &'a str,
 }
 
 /// The objects of `kind` in `namespace` among `object_ids` that `principals`
@@ -1037,6 +1177,164 @@ pub(super) fn load_bound_objects(
 
 fn is_internal_skip(reason: &str) -> bool {
     reason == "internal" || reason.starts_with("internal:")
+}
+
+impl SekaiServiceImpl {
+    fn persist_binding_skip(
+        &self,
+        binding: &ActionBinding,
+        submission: &ActionBindingSubmission,
+    ) -> Result<(), Status> {
+        if submission.skipped_reason.is_empty() || is_internal_skip(&submission.skipped_reason) {
+            return Ok(());
+        }
+        let event_id = if submission.event_id.trim().is_empty() {
+            if submission.dataset_id.is_empty() && submission.version_id.is_empty() {
+                return Ok(());
+            }
+            format!(
+                "dataset_commit:{}:{}",
+                submission.dataset_id, submission.version_id
+            )
+        } else {
+            submission.event_id.clone()
+        };
+        self.db
+            .runtime()
+            .put_action_binding_skip(&ActionBindingSkip {
+                namespace: binding.namespace.clone(),
+                binding_id: binding.binding_id.clone(),
+                event_id,
+                object_id: submission.object_id.clone(),
+                op: submission.op.clone(),
+                skipped_reason: submission.skipped_reason.clone(),
+                created_at_ms: now_millis(),
+                dataset_id: submission.dataset_id.clone(),
+                version_id: submission.version_id.clone(),
+            })
+            .map_err(map_binding_store_error)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HistoryKind {
+    Skip,
+    Instance,
+}
+
+enum HistoryItem<'a> {
+    Instance(&'a crate::sekai::action_instance::ActionInstance),
+    Skip(&'a ActionBindingSkip),
+}
+
+impl HistoryItem<'_> {
+    fn cursor(&self) -> (i64, HistoryKind, String) {
+        match self {
+            Self::Instance(instance) => (
+                instance.created_at_ms,
+                HistoryKind::Instance,
+                instance.instance_id.clone(),
+            ),
+            Self::Skip(skip) => (skip.created_at_ms, HistoryKind::Skip, skip.event_id.clone()),
+        }
+    }
+}
+
+fn merge_binding_history<'a>(
+    instances: &'a [crate::sekai::action_instance::ActionInstance],
+    skips: &'a [ActionBindingSkip],
+) -> Vec<HistoryItem<'a>> {
+    let mut items: Vec<HistoryItem<'a>> = instances
+        .iter()
+        .map(HistoryItem::Instance)
+        .chain(skips.iter().map(HistoryItem::Skip))
+        .collect();
+    items.sort_by(|left, right| {
+        let (left_ms, left_kind, left_id) = left.cursor();
+        let (right_ms, right_kind, right_id) = right.cursor();
+        right_ms
+            .cmp(&left_ms)
+            .then_with(|| match (left_kind, right_kind) {
+                (HistoryKind::Skip, HistoryKind::Instance) => std::cmp::Ordering::Less,
+                (HistoryKind::Instance, HistoryKind::Skip) => std::cmp::Ordering::Greater,
+                _ => right_id.cmp(&left_id),
+            })
+    });
+    items
+}
+
+fn instance_history_outcome(instance: &crate::sekai::action_instance::ActionInstance) -> String {
+    match instance.status.as_str() {
+        STATUS_PARKED => "parked".into(),
+        STATUS_DENIED => "failed".into(),
+        STATUS_ADMITTED
+            if instance.approval_decision == crate::sekai::action_instance::DECISION_GRANT =>
+        {
+            "applied".into()
+        }
+        STATUS_ADMITTED => "submitted".into(),
+        other => other.to_string(),
+    }
+}
+
+fn instance_history_entry(
+    instance: &crate::sekai::action_instance::ActionInstance,
+) -> ActionBindingHistoryEntry {
+    ActionBindingHistoryEntry {
+        event_id: String::new(),
+        object_id: super::rpc_actions::action_instance_target_object_id(&instance.parameters_json)
+            .unwrap_or_default(),
+        op: String::new(),
+        outcome: instance_history_outcome(instance),
+        skipped_reason: String::new(),
+        instance_id: instance.instance_id.clone(),
+        created_at_ms: instance.created_at_ms,
+        dataset_id: String::new(),
+        version_id: String::new(),
+    }
+}
+
+fn skip_history_entry(skip: &ActionBindingSkip) -> ActionBindingHistoryEntry {
+    ActionBindingHistoryEntry {
+        event_id: skip.event_id.clone(),
+        object_id: skip.object_id.clone(),
+        op: skip.op.clone(),
+        outcome: "skipped".into(),
+        skipped_reason: skip.skipped_reason.clone(),
+        instance_id: String::new(),
+        created_at_ms: skip.created_at_ms,
+        dataset_id: skip.dataset_id.clone(),
+        version_id: skip.version_id.clone(),
+    }
+}
+
+fn encode_binding_history_page_token(cursor: (i64, HistoryKind, String)) -> String {
+    let kind = match cursor.1 {
+        HistoryKind::Skip => "s",
+        HistoryKind::Instance => "i",
+    };
+    format!("{}|{kind}|{}", cursor.0, cursor.2)
+}
+
+fn parse_binding_history_page_token(token: &str) -> Result<(i64, HistoryKind, String), Status> {
+    if token.is_empty() {
+        return Ok((i64::MAX, HistoryKind::Skip, "\u{10ffff}".into()));
+    }
+    let mut parts = token.splitn(3, '|');
+    let at_ms = parts
+        .next()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| Status::invalid_argument("invalid page_token"))?;
+    let kind = match parts.next() {
+        Some("s") => HistoryKind::Skip,
+        Some("i") => HistoryKind::Instance,
+        _ => return Err(Status::invalid_argument("invalid page_token")),
+    };
+    let id = parts
+        .next()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Status::invalid_argument("invalid page_token"))?;
+    Ok((at_ms, kind, id.to_string()))
 }
 
 fn map_binding_store_error(error: String) -> Status {
@@ -1947,5 +2245,197 @@ mod tests {
         assert_eq!(response.submissions[0].dataset_id, "orders");
         assert!(!format!("{response:?}").contains("secret"));
         assert_eq!(instances(&db).len(), 1);
+    }
+
+    async fn history(
+        svc: &SekaiServiceImpl,
+        binding_id: &'static str,
+        principal: &'static str,
+    ) -> ListActionBindingHistoryResponse {
+        svc.list_action_binding_history(as_principal(
+            ListActionBindingHistoryRequest {
+                namespace: "demo".into(),
+                binding_id: binding_id.into(),
+                page_size: 0,
+                page_token: String::new(),
+            },
+            principal,
+        ))
+        .await
+        .unwrap()
+        .into_inner()
+    }
+
+    fn as_principal<T>(payload: T, principal: &'static str) -> Request<T> {
+        let mut request = Request::new(payload);
+        request
+            .metadata_mut()
+            .insert("x-principal", MetadataValue::from_static(principal));
+        request
+    }
+
+    #[tokio::test]
+    async fn binding_history_rereads_the_same_page_and_leaves_the_cursor() {
+        let (db, svc) = bound_escalator();
+        let before = db
+            .get_action_binding("demo", "escalate")
+            .unwrap()
+            .unwrap()
+            .1;
+        let run = svc
+            .run_action_binding(local(RunActionBindingRequest {
+                namespace: "demo".into(),
+                binding_id: "escalate".into(),
+                limit: 16,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(run.submissions.len(), 1);
+        assert!(run.submissions[0].skipped_reason.is_empty());
+        let after_run = db
+            .get_action_binding("demo", "escalate")
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_ne!(after_run.pending_events.len(), before.pending_events.len());
+
+        let first = history(&svc, "escalate", "local").await;
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0].instance_id, run.submissions[0].instance_id);
+        assert_eq!(first.entries[0].outcome, "submitted");
+        assert!(first.next_page_token.is_empty());
+        let second = history(&svc, "escalate", "local").await;
+        assert_eq!(second.entries, first.entries);
+        assert_eq!(
+            db.get_action_binding("demo", "escalate")
+                .unwrap()
+                .unwrap()
+                .1,
+            after_run
+        );
+        assert_eq!(instances(&db).len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn binding_history_names_parked_until_a_grant_applies_it() {
+        let (db, svc) = scheduled_escalator(crate::sekai::action_policy::ActionDecision::Allow);
+        require_approval(&db);
+        tick(&svc, 1_000 * 60_000).await;
+        let parked = history(&svc, "escalate-hourly", "local").await;
+        assert_eq!(parked.entries.len(), 1);
+        assert_eq!(parked.entries[0].outcome, "parked");
+        assert!(!parked.entries[0].instance_id.is_empty());
+
+        crate::sekai::action_instance_admission::ActionInstanceAdmission::new(&db, None)
+            .decide(
+                crate::sekai::action_instance_admission::ActionInstanceDecisionRequest {
+                    instance_id: parked.entries[0].instance_id.clone(),
+                    decision: "grant".into(),
+                    reason: "reviewed".into(),
+                    decider_principals: vec!["ops-admin".into()],
+                    decider_is_namespace_admin: true,
+                    delegating_actor: None,
+                    execution_claim: None,
+                },
+                "ops-admin",
+                1_000 * 60_000 + 1,
+            )
+            .unwrap();
+        let applied = history(&svc, "escalate-hourly", "local").await;
+        assert_eq!(applied.entries.len(), 1);
+        assert_eq!(
+            applied.entries[0].instance_id,
+            parked.entries[0].instance_id
+        );
+        assert_eq!(applied.entries[0].outcome, "applied");
+    }
+
+    #[tokio::test]
+    async fn binding_history_counts_unreadable_instances_and_lists_skips() {
+        let (db, svc) = bound_escalator();
+        let (_, grants) = db
+            .ensure_team_namespace("demo", "auditor", security::Role::Viewer, "local")
+            .unwrap();
+        for grant in grants {
+            svc.security.add_grant(&grant);
+        }
+        let submitted = svc
+            .run_action_binding(local(RunActionBindingRequest {
+                namespace: "demo".into(),
+                binding_id: "escalate".into(),
+                limit: 16,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(submitted.submissions[0].skipped_reason, "");
+
+        let mut unbound = instances(&db)[0].clone();
+        unbound.instance_id = "pre-upgrade".into();
+        unbound.idempotency_key = "pre-upgrade".into();
+        unbound.operation_id = "pre-upgrade".into();
+        unbound.binding_id = String::new();
+        db.put_action_instance(&unbound).unwrap();
+
+        let binding = db
+            .get_action_binding("demo", "escalate")
+            .unwrap()
+            .unwrap()
+            .0;
+        db.advance_action_binding_cursor(
+            &binding,
+            &ActionBindingCursor {
+                snapshot_revision: "pin".into(),
+                pending_events: vec![
+                    crate::sekai::object_change_subscription::ObjectChangeEvent {
+                        offset: 2,
+                        event_id: "evt-create".into(),
+                        object_id: "billing-api".into(),
+                        kind: "component".into(),
+                        op: "create".into(),
+                        field: String::new(),
+                        committed_at_ms: 4,
+                        operation_id: "op-create".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            now_millis(),
+        )
+        .unwrap();
+        let skipped = svc
+            .run_action_binding(local(RunActionBindingRequest {
+                namespace: "demo".into(),
+                binding_id: "escalate".into(),
+                limit: 16,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(skipped.submissions[0].skipped_reason, "op_not_bound");
+
+        let visible = history(&svc, "escalate", "local").await;
+        assert_eq!(visible.withheld_count, 0);
+        assert_eq!(visible.entries.len(), 2);
+        assert_eq!(visible.entries[0].outcome, "skipped");
+        assert_eq!(visible.entries[0].skipped_reason, "op_not_bound");
+        assert_eq!(visible.entries[1].outcome, "submitted");
+        assert_eq!(
+            visible.entries[1].instance_id,
+            submitted.submissions[0].instance_id
+        );
+        assert!(
+            visible
+                .entries
+                .iter()
+                .all(|entry| entry.instance_id != "pre-upgrade")
+        );
+
+        let withheld = history(&svc, "escalate", "auditor").await;
+        assert_eq!(withheld.withheld_count, 1);
+        assert_eq!(withheld.entries.len(), 1);
+        assert_eq!(withheld.entries[0].outcome, "skipped");
     }
 }
