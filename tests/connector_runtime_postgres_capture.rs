@@ -455,7 +455,7 @@ fn changes_child_pids() -> Vec<u32> {
         .filter_map(|entry| {
             let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
             let status = std::fs::read_to_string(entry.path().join("status")).ok()?;
-            let ppid = status.lines().find_map(|line| {
+            let ppid: u32 = status.lines().find_map(|line| {
                 line.strip_prefix("PPid:")
                     .and_then(|rest| rest.split_whitespace().next())
                     .and_then(|value| value.parse().ok())
