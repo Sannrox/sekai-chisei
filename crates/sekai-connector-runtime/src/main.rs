@@ -155,6 +155,7 @@ async fn serve() -> Result<(), String> {
         .register()
         .await
         .map_err(|error| error.to_string())?;
+    eprintln!("sekai-connector-runtime: registered");
     runtime
         .serve(Duration::from_millis(config.poll_ms), shutdown_signal()?)
         .await;
