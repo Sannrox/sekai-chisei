@@ -403,6 +403,12 @@ async fn dispatch<I>(
             })
             .await
         }
+        ("sekai.SekaiService", "ListActionBindingHistory") => {
+            invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
+                SekaiService::list_action_binding_history(&*svc, req).await
+            })
+            .await
+        }
         ("sekai.SekaiService", "AcquireLease") => {
             invoke_sekai(state, metadata, extensions, body, |svc, req| async move {
                 SekaiService::acquire_lease(&*svc, req).await

@@ -131,6 +131,7 @@ fn parked_instance(id: &str, namespace: &str) -> ActionInstance {
         admission_budget_already_reserved: false,
         erased_properties: Vec::new(),
         erased_request_digest: String::new(),
+        binding_id: String::new(),
     }
 }
 

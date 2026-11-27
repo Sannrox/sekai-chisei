@@ -635,6 +635,7 @@ fn closing_record(
         admission_budget_already_reserved: false,
         erased_properties: Vec::new(),
         erased_request_digest: String::new(),
+        binding_id: String::new(),
     }
 }
 
@@ -825,6 +826,7 @@ mod tests {
                         marking_gate: Default::default(),
                         expected_object_revision: expected_revision.into(),
                         binding_approval_rule: String::new(),
+                        binding_id: String::new(),
                         offline: None,
                     },
                     PLANNER,

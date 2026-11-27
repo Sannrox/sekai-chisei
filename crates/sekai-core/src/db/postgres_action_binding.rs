@@ -210,4 +210,86 @@ impl PostgresDb {
         }
         Ok(bindings)
     }
+
+    pub fn put_action_binding_skip(
+        &self,
+        skip: &crate::sekai::action_binding::ActionBindingSkip,
+    ) -> Result<(), String> {
+        if skip.namespace.trim().is_empty()
+            || skip.binding_id.trim().is_empty()
+            || skip.event_id.trim().is_empty()
+        {
+            return Err("action binding skip requires namespace, binding_id, and event_id".into());
+        }
+        let mut connection = self.connection()?;
+        connection
+            .execute(
+                "INSERT INTO sekai_action_binding_skips
+                    (namespace, binding_id, event_id, object_id, op, skipped_reason,
+                     created_at_ms, dataset_id, version_id)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT (namespace, binding_id, event_id) DO UPDATE SET
+                    object_id = EXCLUDED.object_id,
+                    op = EXCLUDED.op,
+                    skipped_reason = EXCLUDED.skipped_reason,
+                    created_at_ms = EXCLUDED.created_at_ms,
+                    dataset_id = EXCLUDED.dataset_id,
+                    version_id = EXCLUDED.version_id",
+                &[
+                    &skip.namespace,
+                    &skip.binding_id,
+                    &skip.event_id,
+                    &skip.object_id,
+                    &skip.op,
+                    &skip.skipped_reason,
+                    &skip.created_at_ms,
+                    &skip.dataset_id,
+                    &skip.version_id,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn list_action_binding_skips(
+        &self,
+        namespace: &str,
+        binding_id: &str,
+        before: crate::db::OlderThan<'_>,
+        limit: usize,
+    ) -> Result<Vec<crate::sekai::action_binding::ActionBindingSkip>, String> {
+        let mut connection = self.connection()?;
+        let rows = connection
+            .query(
+                "SELECT event_id, object_id, op, skipped_reason, created_at_ms,
+                        dataset_id, version_id
+                 FROM sekai_action_binding_skips
+                 WHERE namespace = $1 AND binding_id = $2
+                   AND (created_at_ms, event_id) < ($3, $4)
+                 ORDER BY created_at_ms DESC, event_id DESC
+                 LIMIT $5",
+                &[
+                    &namespace,
+                    &binding_id,
+                    &before.at_ms,
+                    &before.id,
+                    &(limit.clamp(1, 500) as i64),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::sekai::action_binding::ActionBindingSkip {
+                namespace: namespace.to_string(),
+                binding_id: binding_id.to_string(),
+                event_id: row.get(0),
+                object_id: row.get(1),
+                op: row.get(2),
+                skipped_reason: row.get(3),
+                created_at_ms: row.get(4),
+                dataset_id: row.get(5),
+                version_id: row.get(6),
+            })
+            .collect())
+    }
 }

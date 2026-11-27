@@ -144,6 +144,7 @@ fn seed_effect(db: &RuntimeDb, suffix: &str) {
         admission_budget_already_reserved: false,
         erased_properties: Vec::new(),
         erased_request_digest: String::new(),
+        binding_id: String::new(),
     })
     .unwrap();
     db.put_action_effects(&[effect]).unwrap();
@@ -968,6 +969,7 @@ async fn a_parked_turn_resumes_with_its_continuation_once_decided() {
         admission_budget_already_reserved: false,
         erased_properties: Vec::new(),
         erased_request_digest: String::new(),
+        binding_id: String::new(),
     })
     .unwrap();
     let parked = plane

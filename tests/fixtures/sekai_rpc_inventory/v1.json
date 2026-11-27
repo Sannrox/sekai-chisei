@@ -3655,6 +3655,20 @@
       "product_tier": "advanced"
     },
     {
+      "rpc": "ListActionBindingHistory",
+      "kind": "persistent",
+      "surfaces": [
+        "sekai.audit"
+      ],
+      "evidence": [
+        "crates/sekai-core/src/sekai/action_binding.rs",
+        "crates/sekai-core/src/sekai/action_instance.rs",
+        "src/grpc/action_binding.rs"
+      ],
+      "durable_dependencies": [],
+      "product_tier": "advanced"
+    },
+    {
       "rpc": "DecideActionInstance",
       "kind": "persistent",
       "surfaces": [

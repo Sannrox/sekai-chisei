@@ -128,6 +128,9 @@ pub struct ActionInstanceAdmissionRequest {
     /// that would admit parks instead, with this as its approval rule.
     /// Empty adds no park.
     pub binding_approval_rule: String,
+    /// The Action binding that submits this instance. Empty for direct
+    /// submits.
+    pub binding_id: String,
 }
 
 /// Clearance check admission runs against the marking it derives (#1706).
@@ -909,6 +912,7 @@ impl<'a> ActionInstanceAdmission<'a> {
             admission_budget_already_reserved: budget_already_reserved,
             erased_properties: Vec::new(),
             erased_request_digest: String::new(),
+            binding_id: request.binding_id,
         };
         let planned_effects = plan_admission_effects(&type_def, &instance, now)?;
 
@@ -3532,6 +3536,7 @@ mod tests {
             marking_gate: Default::default(),
             expected_object_revision: String::new(),
             binding_approval_rule: String::new(),
+            binding_id: String::new(),
             offline: None,
         }
     }
@@ -4454,6 +4459,7 @@ mod tests {
             marking_gate: Default::default(),
                     expected_object_revision: String::new(),
                     binding_approval_rule: String::new(),
+            binding_id: String::new(),
                     offline: None,
                 },
                 "alice",
@@ -4632,6 +4638,7 @@ mod tests {
             marking_gate: Default::default(),
             expected_object_revision: String::new(),
             binding_approval_rule: String::new(),
+            binding_id: String::new(),
             offline: None,
         }
     }
@@ -6649,6 +6656,7 @@ mod tests {
             admission_budget_already_reserved: false,
             erased_properties: Vec::new(),
             erased_request_digest: String::new(),
+            binding_id: String::new(),
         };
         db.put_action_instance(&reserved).unwrap();
         let admission = ActionInstanceAdmission::new(&db, None);

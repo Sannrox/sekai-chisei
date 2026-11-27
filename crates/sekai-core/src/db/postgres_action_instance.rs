@@ -149,6 +149,40 @@ impl PostgresDb {
             .get(0))
     }
 
+    /// See `SekaiDb::list_action_instances_for_binding`.
+    pub fn list_action_instances_for_binding(
+        &self,
+        namespace: &str,
+        binding_id: &str,
+        before: crate::db::OlderThan<'_>,
+        limit: usize,
+    ) -> Result<Vec<ActionInstance>, String> {
+        if binding_id.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        self.connection()?
+            .query(
+                "SELECT body_json FROM sekai_action_instances
+                 WHERE namespace = $1 AND binding_id = $2
+                   AND (created_at_ms, instance_id) < ($3, $4)
+                 ORDER BY created_at_ms DESC, instance_id DESC LIMIT $5",
+                &[
+                    &namespace,
+                    &binding_id,
+                    &before.at_ms,
+                    &before.id,
+                    &(limit.clamp(1, 500) as i64),
+                ],
+            )
+            .map_err(|e| e.to_string())?
+            .iter()
+            .map(|row| {
+                serde_json::from_str(row.get(0))
+                    .map_err(|e| format!("corrupt action instance body: {e}"))
+            })
+            .collect()
+    }
+
     /// See `SekaiDb::list_action_instances_older_than`.
     pub fn list_action_instances_older_than(
         &self,
@@ -241,13 +275,17 @@ impl PostgresDb {
         let body_json = serde_json::to_string(&stored).map_err(|e| e.to_string())?;
         let evidence_json =
             serde_json::to_string(&stored.evidence_submission_ids).map_err(|e| e.to_string())?;
+        let binding_id = {
+            let trimmed = stored.binding_id.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        };
         let result = tx.execute(
             "INSERT INTO sekai_action_instances
              (instance_id, namespace, type_id, version, principal, parameters_json,
               request_digest, idempotency_key, operation_id, status, deny_reason,
               evidence_submission_ids_json, policy_decision, budget_decision,
-              created_at_ms, decided_at_ms, body_json)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+              created_at_ms, decided_at_ms, body_json, binding_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
              ON CONFLICT (namespace, idempotency_key) DO NOTHING",
             &[
                 &stored.instance_id,
@@ -267,6 +305,7 @@ impl PostgresDb {
                 &stored.created_at_ms,
                 &stored.decided_at_ms,
                 &body_json,
+                &binding_id,
             ],
         );
         match result {

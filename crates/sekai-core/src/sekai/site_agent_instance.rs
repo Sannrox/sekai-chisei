@@ -465,6 +465,7 @@ pub(crate) mod tests {
                     offline: None,
                     expected_object_revision: String::new(),
                     binding_approval_rule: String::new(),
+                    binding_id: String::new(),
                 },
                 actor,
                 2_000,

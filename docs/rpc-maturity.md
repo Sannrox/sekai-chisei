@@ -382,6 +382,7 @@ Edit the fixture, then regenerate with
 | `SekaiService.RunActionBinding` | `sekai.audit` | yes | sdk | `stable` |
 | `SekaiService.GetActionBinding` | `sekai.audit` | yes | sdk | `stable` |
 | `SekaiService.ListActionBindings` | `sekai.audit` | yes | sdk | `stable` |
+| `SekaiService.ListActionBindingHistory` | `sekai.audit` | yes | sdk | `stable` |
 | `SekaiService.DescribeObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.PreviewObjectAction` | `sekai.audit` | yes | none | `stable` |
 | `SekaiService.CreatePlanIntent` | `sekai.audit` | yes | none | `experimental` |

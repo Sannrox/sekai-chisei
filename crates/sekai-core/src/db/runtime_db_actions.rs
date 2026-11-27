@@ -216,6 +216,50 @@ impl RuntimeDb {
         }
     }
 
+    pub fn put_action_binding_skip(
+        &self,
+        skip: &crate::sekai::action_binding::ActionBindingSkip,
+    ) -> Result<(), String> {
+        match self {
+            Self::Sqlite(db) => db.put_action_binding_skip(skip),
+            Self::Postgres(db) => {
+                crate::db::postgres::off_runtime(|| db.put_action_binding_skip(skip))
+            }
+        }
+    }
+
+    pub fn list_action_binding_skips(
+        &self,
+        namespace: &str,
+        binding_id: &str,
+        before: crate::db::OlderThan<'_>,
+        limit: usize,
+    ) -> Result<Vec<crate::sekai::action_binding::ActionBindingSkip>, String> {
+        match self {
+            Self::Sqlite(db) => db.list_action_binding_skips(namespace, binding_id, before, limit),
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_action_binding_skips(namespace, binding_id, before, limit)
+            }),
+        }
+    }
+
+    pub fn list_action_instances_for_binding(
+        &self,
+        namespace: &str,
+        binding_id: &str,
+        before: crate::db::OlderThan<'_>,
+        limit: usize,
+    ) -> Result<Vec<crate::sekai::action_instance::ActionInstance>, String> {
+        match self {
+            Self::Sqlite(db) => {
+                db.list_action_instances_for_binding(namespace, binding_id, before, limit)
+            }
+            Self::Postgres(db) => crate::db::postgres::off_runtime(|| {
+                db.list_action_instances_for_binding(namespace, binding_id, before, limit)
+            }),
+        }
+    }
+
     pub fn list_scheduled_action_bindings(
         &self,
     ) -> Result<Vec<crate::sekai::action_binding::ActionBinding>, String> {

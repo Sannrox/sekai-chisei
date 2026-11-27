@@ -232,6 +232,7 @@ fn seed_action_with_act(db: &RuntimeDb, prefix: &str, delegating_actor: Option<&
         admission_budget_already_reserved: false,
         erased_properties: Vec::new(),
         erased_request_digest: String::new(),
+        binding_id: String::new(),
     })
     .unwrap();
     db.put_action_effects(&[effect]).unwrap();

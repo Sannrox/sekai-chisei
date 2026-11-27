@@ -2234,6 +2234,7 @@ fn seed_claimed_action_of(
         admission_budget_already_reserved: false,
         erased_properties: Vec::new(),
         erased_request_digest: String::new(),
+        binding_id: String::new(),
     })
     .unwrap();
     crate::sekai::action_work_lifecycle::ActionWorkLifecycle::new(db)

@@ -54,6 +54,24 @@ pub const DATASET_COMMIT_PINNED: &str = "dataset-versions";
 /// The `op` a dataset-commit submission reports.
 pub const OP_DATASET_COMMIT: &str = "dataset_commit";
 
+/// One event a binding skipped without raising an instance. History reads
+/// these with the binding's instances; they follow instance retention and
+/// have no separate expiry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionBindingSkip {
+    pub namespace: String,
+    pub binding_id: String,
+    pub event_id: String,
+    pub object_id: String,
+    pub op: String,
+    pub skipped_reason: String,
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub dataset_id: String,
+    #[serde(default)]
+    pub version_id: String,
+}
+
 /// Stored in place of `enabled` for an enabled binding that requires
 /// approval (#3035). The stored body then says `enabled: false`, so a plane
 /// that predates `require_approval` refuses the run instead of submitting
@@ -529,8 +547,108 @@ impl SekaiDb {
                     revision INTEGER NOT NULL,
                     seq INTEGER NOT NULL,
                     PRIMARY KEY (namespace, binding_id, dataset_id)
-                );",
+                );
+                CREATE TABLE IF NOT EXISTS sekai_action_binding_skips (
+                    namespace TEXT NOT NULL,
+                    binding_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    object_id TEXT NOT NULL,
+                    op TEXT NOT NULL,
+                    skipped_reason TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    dataset_id TEXT NOT NULL DEFAULT '',
+                    version_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (namespace, binding_id, event_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_action_binding_skips_binding
+                    ON sekai_action_binding_skips (
+                        namespace, binding_id, created_at_ms DESC, event_id DESC
+                    );",
             )
+            .map_err(|error| error.to_string())
+    }
+
+    /// Records a skip so history can name events that never raised an
+    /// instance. Replaying the same event replaces the stored reason.
+    pub fn put_action_binding_skip(&self, skip: &ActionBindingSkip) -> Result<(), String> {
+        if skip.namespace.trim().is_empty()
+            || skip.binding_id.trim().is_empty()
+            || skip.event_id.trim().is_empty()
+        {
+            return Err("action binding skip requires namespace, binding_id, and event_id".into());
+        }
+        self.migrate_action_bindings()?;
+        self.conn()
+            .execute(
+                "INSERT INTO sekai_action_binding_skips
+                    (namespace, binding_id, event_id, object_id, op, skipped_reason,
+                     created_at_ms, dataset_id, version_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(namespace, binding_id, event_id) DO UPDATE SET
+                    object_id = excluded.object_id,
+                    op = excluded.op,
+                    skipped_reason = excluded.skipped_reason,
+                    created_at_ms = excluded.created_at_ms,
+                    dataset_id = excluded.dataset_id,
+                    version_id = excluded.version_id",
+                params![
+                    skip.namespace,
+                    skip.binding_id,
+                    skip.event_id,
+                    skip.object_id,
+                    skip.op,
+                    skip.skipped_reason,
+                    skip.created_at_ms,
+                    skip.dataset_id,
+                    skip.version_id,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Skips for `binding_id` older than `before`, newest first.
+    pub fn list_action_binding_skips(
+        &self,
+        namespace: &str,
+        binding_id: &str,
+        before: crate::db::OlderThan<'_>,
+        limit: usize,
+    ) -> Result<Vec<ActionBindingSkip>, String> {
+        self.migrate_action_bindings()?;
+        let limit = limit.clamp(1, 500);
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_id, object_id, op, skipped_reason, created_at_ms,
+                        dataset_id, version_id
+                 FROM sekai_action_binding_skips
+                 WHERE namespace = ?1 AND binding_id = ?2
+                   AND (created_at_ms < ?3
+                        OR (created_at_ms = ?3 AND event_id < ?4))
+                 ORDER BY created_at_ms DESC, event_id DESC
+                 LIMIT ?5",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(
+                params![namespace, binding_id, before.at_ms, before.id, limit as i64],
+                |row| {
+                    Ok(ActionBindingSkip {
+                        namespace: namespace.to_string(),
+                        binding_id: binding_id.to_string(),
+                        event_id: row.get(0)?,
+                        object_id: row.get(1)?,
+                        op: row.get(2)?,
+                        skipped_reason: row.get(3)?,
+                        created_at_ms: row.get(4)?,
+                        dataset_id: row.get(5)?,
+                        version_id: row.get(6)?,
+                    })
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())
     }
 
@@ -1148,6 +1266,54 @@ mod tests {
                 .unwrap()
                 .1,
             ActionBindingCursor::default()
+        );
+    }
+
+    #[test]
+    fn skip_records_replace_on_the_same_event_and_page_newest_first() {
+        let db = SekaiDb::new(":memory:").unwrap();
+        let older = ActionBindingSkip {
+            namespace: "acme".into(),
+            binding_id: "escalate-on-update".into(),
+            event_id: "evt-1".into(),
+            object_id: "inc-1".into(),
+            op: "update".into(),
+            skipped_reason: "op_not_bound".into(),
+            created_at_ms: 10,
+            dataset_id: String::new(),
+            version_id: String::new(),
+        };
+        let newer = ActionBindingSkip {
+            event_id: "evt-2".into(),
+            created_at_ms: 20,
+            skipped_reason: "parameter_source_unavailable".into(),
+            ..older.clone()
+        };
+        db.put_action_binding_skip(&older).unwrap();
+        db.put_action_binding_skip(&newer).unwrap();
+        db.put_action_binding_skip(&ActionBindingSkip {
+            skipped_reason: "schema_invalid".into(),
+            created_at_ms: 11,
+            ..older.clone()
+        })
+        .unwrap();
+        let listed = db
+            .list_action_binding_skips(
+                "acme",
+                "escalate-on-update",
+                crate::db::OlderThan::START,
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|skip| (skip.event_id.as_str(), skip.skipped_reason.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("evt-2", "parameter_source_unavailable"),
+                ("evt-1", "schema_invalid")
+            ]
         );
     }
 }
