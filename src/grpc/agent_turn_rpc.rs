@@ -287,20 +287,30 @@ fn listed_transcript(
     Ok(Some(listed))
 }
 
-/// What a claim of a turn that parked resumes from: its Action as decided
-/// (ADR 0142). `None` for a turn that never parked.
+/// An Action submission a turn token covers.
+#[derive(Debug)]
+pub(crate) struct TurnSubmission {
+    /// The claim the admission commits under.
+    pub fence: crate::sekai::action_instance::AgentTurnFence,
+    /// The approval rule the Action parks with; empty parks for nothing
+    /// beyond the type's own policy.
+    pub approval_rule: String,
+}
+
+/// What a claim of a turn that parked on `parked_action_id` resumes from:
+/// its Action as decided (ADR 0142). `None` for a turn that never parked.
 fn continuation_for(
     db: &RuntimeDb,
-    turn: &agent_turn::AgentTurn,
+    parked_action_id: &str,
 ) -> Result<Option<AgentTurnContinuation>, Status> {
-    if turn.parked_action_id.is_empty() {
+    if parked_action_id.is_empty() {
         return Ok(None);
     }
     let action = db
-        .get_action_instance(&turn.parked_action_id)
+        .get_action_instance(parked_action_id)
         .map_err(Status::internal)?;
     Ok(Some(AgentTurnContinuation {
-        action_instance_id: turn.parked_action_id.clone(),
+        action_instance_id: parked_action_id.to_string(),
         status: action
             .as_ref()
             .map_or_else(|| "missing".to_string(), |action| action.status.clone()),
@@ -511,14 +521,16 @@ impl SekaiServiceImpl {
     /// An Action submitted with a turn token is the turn's: the turn must
     /// still be claimed by the token, in the namespace the Action names. An
     /// interactive turn submits only the Action types its agent member
-    /// allows (ADR 0173 decision 4). Returns the claim the admission commits
-    /// under, `None` without a turn token.
+    /// allows, and one whose bound Action tool names an approval policy
+    /// parks for approval (ADR 0173 decision 4). Returns the claim the
+    /// admission commits under and the approval rule it parks with, `None`
+    /// without a turn token.
     pub(crate) fn authorize_turn_submission<T: 'static>(
         &self,
         req: &Request<T>,
         namespace: &str,
         type_id: &str,
-    ) -> Result<Option<crate::sekai::action_instance::AgentTurnFence>, Status> {
+    ) -> Result<Option<TurnSubmission>, Status> {
         let Some(claims) = req.extensions().get::<RuntimeTokenClaims>() else {
             return Ok(None);
         };
@@ -538,7 +550,7 @@ impl SekaiServiceImpl {
         };
         let turn = match turn {
             AnyTurn::Interactive(turn) => {
-                interactive_agent_turn::require_allowed_action_type(
+                let approval_rule = interactive_agent_turn::require_allowed_action_type(
                     self.db.runtime(),
                     &turn,
                     type_id,
@@ -549,7 +561,10 @@ impl SekaiServiceImpl {
                     agent_member: turn.agent_member,
                     trace_id: turn.trace_id,
                 });
-                return Ok(Some(fence));
+                return Ok(Some(TurnSubmission {
+                    fence,
+                    approval_rule,
+                }));
             }
             AnyTurn::Site(turn) => turn,
         };
@@ -564,7 +579,10 @@ impl SekaiServiceImpl {
         {
             return Err(Status::failed_precondition("site agent instance is frozen"));
         }
-        Ok(Some(fence))
+        Ok(Some(TurnSubmission {
+            fence,
+            approval_rule: String::new(),
+        }))
     }
 
     /// The turn token for `turn` as claimed by `req`'s caller, or empty
@@ -886,11 +904,12 @@ impl SekaiServiceImpl {
             let room = i64::try_from(cap.saturating_sub(turns.len())).unwrap_or(0);
             if room > 0 {
                 turns.extend(
-                    interactive_agent_turn::list_claimable(
+                    interactive_agent_turn::list_claimable_maybe_resuming(
                         self.db.runtime(),
                         &inner.namespace,
                         now,
                         room,
+                        inner.accepts_continuation,
                     )
                     .map_err(turn_status)?
                     .into_iter()
@@ -923,7 +942,7 @@ impl SekaiServiceImpl {
             {
                 refuse_member_as_worker(&worker, &turn.member_id)?;
             }
-            interactive_agent_turn::claim(
+            interactive_agent_turn::claim_accepting_continuation(
                 self.db.runtime(),
                 &inner.namespace,
                 &inner.runtime_id,
@@ -931,6 +950,7 @@ impl SekaiServiceImpl {
                 &worker,
                 inner.ttl_ms,
                 now,
+                inner.accepts_continuation,
             )
             .map(AnyTurn::Interactive)
         } else if inner.turn_id.trim().is_empty() {
@@ -946,13 +966,14 @@ impl SekaiServiceImpl {
             match site {
                 // Site-agent turns first; an interactive one when none is due.
                 Err(TurnError::NotFound) if inner.accepts_interactive => {
-                    interactive_agent_turn::claim_next(
+                    interactive_agent_turn::claim_next_accepting_continuation(
                         self.db.runtime(),
                         &inner.namespace,
                         &inner.runtime_id,
                         &worker,
                         inner.ttl_ms,
                         now,
+                        inner.accepts_continuation,
                     )
                     .map(AnyTurn::Interactive)
                 }
@@ -978,10 +999,11 @@ impl SekaiServiceImpl {
         }
         .map_err(turn_status)?;
         let (runtime_token, runtime_token_expires_at_ms) = self.turn_token_for(&req, &turn, now)?;
-        let continuation = match &turn {
-            AnyTurn::Site(turn) => continuation_for(self.db.runtime(), turn)?,
-            AnyTurn::Interactive(_) => None,
+        let parked_action_id = match &turn {
+            AnyTurn::Site(turn) => &turn.parked_action_id,
+            AnyTurn::Interactive(turn) => &turn.parked_action_id,
         };
+        let continuation = continuation_for(self.db.runtime(), parked_action_id)?;
         Ok(Response::new(ClaimAgentTurnResponse {
             turn: Some(turn.into_proto()),
             runtime_token,
@@ -1043,15 +1065,25 @@ impl SekaiServiceImpl {
         let inner = req.into_inner();
         let now = now_millis();
         if interactive_agent_turn::is_interactive_turn_id(&inner.turn_id) {
-            // Parking an interactive turn is not yet supported: it fails
-            // closed rather than leaving a turn nothing resumes.
             let outcome = match inner.outcome.as_str() {
                 "completed" => Outcome::Completed,
                 "failed" => Outcome::Failed,
+                // As an instance turn: it resumes once its Action is decided.
                 "parked" => {
-                    return Err(Status::failed_precondition(
-                        "an interactive turn cannot park yet",
-                    ));
+                    let turn = interactive_agent_turn::park(
+                        self.db.runtime(),
+                        &inner.turn_id,
+                        &inner.runtime_id,
+                        inner.claim_generation,
+                        &inner.fencing_token,
+                        &inner.parked_action_instance_id,
+                        &inner.reason,
+                        now,
+                    )
+                    .map_err(turn_status)?;
+                    return Ok(Response::new(AckAgentTurnResponse {
+                        turn: Some(interactive_to_proto(turn)),
+                    }));
                 }
                 _ => {
                     return Err(Status::invalid_argument(

@@ -82,9 +82,24 @@ would also retire such a row as "site agent instance is gone".
    because no claim path reads the table. The next slice adds the opt-in
    claim and listing, the member-subject token, the Action type bound,
    receipt attributes (`ActionInstance.agent_turn`) and the freeze test.
-   Parking, tool-binding approval and turn-token reads (transcript and
-   working memory) follow. Until a slice lands, its calls are refused on
-   interactive turns.
+   The third slice adds parking and tool-binding approval. Turn-token
+   reads (transcript and working memory) follow. Until a slice lands, its
+   calls are refused on interactive turns.
+
+## Clarifications
+
+- 2026-11-27 (#3046): An interactive turn parks as an instance turn does
+  (ADR 0142): on an Action it submitted under its claim, at most
+  `MAX_PARKS` times, and it is claimable again with that Action as its
+  continuation once the decision stands, only by a worker that sets
+  `accepts_continuation`. A parked turn whose member lost access fails on
+  its first call after it resumes. For decision 4, a bound tool of kind `action` whose name is the
+  submitted Action type and that names an `approval_policy` parks the
+  submission for approval under the rule
+  `agent_tool:{agent member}:{policy}`, after autonomy, as an Action
+  binding's approval does. The policy name labels the rule; the Action
+  type's approvers decide it, and the submitting member cannot. Query and
+  gateway tools keep their policies at the gateway.
 
 ## Alternatives considered
 

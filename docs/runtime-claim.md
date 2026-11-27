@@ -236,8 +236,10 @@ as it stands; a member who lost it fails the turn with `member access
 revoked` as its reason. The token submits only the Action types in the agent
 member's `allowed_action_types` at the turn's revision, and the admitted
 instance's `agent_turn` names the turn, revision, agent member and trace id.
-Interactive turns ack `completed` or `failed`; `parked` is refused until
-parking is supported, and transcript and working-memory calls do not cover
+When the agent member binds that Action type as an `action` tool with an
+`approval_policy`, the Action parks for its type's approvers under the rule
+`agent_tool:{agent member}:{policy}`. Interactive turns park and resume as
+instance turns do, below. Transcript and working-memory calls do not cover
 them yet.
 
 A turn whose Action parks for approval acks `parked` with that Action's id
