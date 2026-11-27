@@ -31,7 +31,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use mikura::{ObjectRecord, OverlayPatch};
+use mikura::{EvaluateRequest, EvaluateResponse, Group, ObjectRecord, OverlayPatch, Predicate};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -80,6 +80,8 @@ struct Reply {
     #[serde(default)]
     load: Option<ObjectRecord>,
     #[serde(default)]
+    evaluate: Option<EvaluateWire>,
+    #[serde(default)]
     health: Option<Health>,
     /// Snapshot the reply was answered at; absent on older hosts.
     #[serde(default)]
@@ -93,6 +95,52 @@ struct Reply {
 struct Health {
     #[serde(default)]
     role: String,
+}
+
+#[derive(Deserialize)]
+struct EvaluateWire {
+    two_hop_count: usize,
+    sum_amount: i64,
+    #[serde(default)]
+    groups: Vec<EvaluateGroupWire>,
+}
+
+#[derive(Deserialize)]
+struct EvaluateGroupWire {
+    key: Vec<Option<String>>,
+    count: usize,
+    sum: i64,
+    n: u64,
+    min: Option<i64>,
+    max: Option<i64>,
+    avg: (i64, u64),
+    #[serde(default)]
+    distinct: Option<usize>,
+}
+
+impl EvaluateWire {
+    fn into_response(self) -> EvaluateResponse {
+        EvaluateResponse {
+            two_hop_count: self.two_hop_count,
+            sum_amount: self.sum_amount,
+            objects: Vec::new(),
+            cursor: None,
+            groups: self
+                .groups
+                .into_iter()
+                .map(|group| Group {
+                    key: group.key,
+                    count: group.count,
+                    sum: group.sum,
+                    n: group.n,
+                    min: group.min,
+                    max: group.max,
+                    avg: group.avg,
+                    distinct: group.distinct,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Why a host answered without serving the request.
@@ -472,6 +520,90 @@ impl ObjectLogHost {
         }
         Self::require_ok(self.write(request, Repeat::Idempotent)?).map(|_| ())
     }
+
+    /// Namespace-scoped count/sum/breakdown from the host (#2290).
+    /// `deny` is the host's property-deny shorthand for the log restriction.
+    pub fn evaluate(
+        &self,
+        request: &EvaluateRequest,
+        deny: &[(String, String)],
+    ) -> Result<EvaluateResponse, String> {
+        let reply = Self::require_ok(self.read(evaluate_wire(request, deny))?)?;
+        reply
+            .evaluate
+            .map(EvaluateWire::into_response)
+            .ok_or_else(|| "object-log host evaluate returned no payload".into())
+    }
+}
+
+fn evaluate_wire(request: &EvaluateRequest, deny: &[(String, String)]) -> Value {
+    let mut body = json!({
+        "namespace": request.namespace,
+        "root_kind": request.root_kind,
+        "hops": request.hops.iter().map(|hop| json!({
+            "far_kind": hop.far_kind,
+            "join_property": hop.join_property,
+            "incoming": hop.incoming,
+        })).collect::<Vec<_>>(),
+        "sum_kind": request.sum_kind,
+        "sum_property": request.sum_property,
+        "deny": deny.iter().map(|(kind, property)| json!({
+            "kind": kind,
+            "property": property,
+        })).collect::<Vec<_>>(),
+    });
+    if let Some(predicate) = &request.predicate {
+        body["predicate"] = predicate_wire(predicate);
+    }
+    if let Some(breakdown) = &request.breakdown {
+        body["breakdown"] = json!({
+            "group_by": breakdown.group_by,
+            "max_groups": breakdown.max_groups,
+            "distinct": breakdown.distinct,
+        });
+    }
+    json!({ "op": "evaluate", "request": body })
+}
+
+fn predicate_wire(predicate: &Predicate) -> Value {
+    match predicate {
+        Predicate::Eq { property, value } => {
+            json!({ "op": "eq", "property": property, "value": value })
+        }
+        Predicate::And(args) => json!({
+            "op": "and",
+            "args": args.iter().map(predicate_wire).collect::<Vec<_>>(),
+        }),
+        Predicate::Neq { property, value } => {
+            json!({ "op": "neq", "property": property, "value": value })
+        }
+        Predicate::Or(args) => json!({
+            "op": "or",
+            "args": args.iter().map(predicate_wire).collect::<Vec<_>>(),
+        }),
+        Predicate::Not(arg) => json!({ "op": "not", "arg": predicate_wire(arg) }),
+        Predicate::Missing { property } => json!({ "op": "missing", "property": property }),
+        Predicate::Range { property, min, max } => json!({
+            "op": "range",
+            "property": property,
+            "min": min,
+            "max": max,
+        }),
+        Predicate::Bbox {
+            property,
+            min_lat,
+            min_lon,
+            max_lat,
+            max_lon,
+        } => json!({
+            "op": "bbox",
+            "property": property,
+            "min_lat": min_lat,
+            "min_lon": min_lon,
+            "max_lat": max_lat,
+            "max_lon": max_lon,
+        }),
+    }
 }
 
 type CachedFromEnv = Option<Result<Option<ObjectLogHost>, String>>;
@@ -569,6 +701,32 @@ mod tests {
             updated
         );
         assert_eq!(first.load("sales", "Customer", "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn evaluate_counts_admitted_roots_and_fails_closed_when_unreachable() {
+        let (addr, _dir) = spawn_host(None);
+        let host = ObjectLogHost::new(&addr.to_string(), None).unwrap();
+        host.admit(record("c-1", "eu")).unwrap();
+        host.admit(record("c-2", "us")).unwrap();
+        let request = EvaluateRequest {
+            namespace: "sales".into(),
+            root_kind: "Customer".into(),
+            hops: Vec::new(),
+            sum_kind: "Customer".into(),
+            sum_property: String::new(),
+            ..EvaluateRequest::default()
+        };
+        let page = host.evaluate(&request, &[]).unwrap();
+        assert_eq!(page.two_hop_count, 2);
+        assert!(page.groups.is_empty());
+
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gone = closed.local_addr().unwrap();
+        drop(closed);
+        let unreachable = ObjectLogHost::new(&gone.to_string(), None).unwrap();
+        let error = unreachable.evaluate(&request, &[]).unwrap_err();
+        assert!(error.contains("unreachable"), "{error}");
     }
 
     #[test]

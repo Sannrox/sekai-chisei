@@ -3,13 +3,13 @@
 //! `SEKAI_OBJECT_INDEX_DUAL_READ` compares SQL hop engines. This gate compares
 //! the SQL projection to in-process mikura `ObjectSet::evaluate` (ADR 0081).
 //! ADR 0091 / ADR 0112: the log owns identity generations keyed by
-//! `(namespace, kind, key)`; EvaluateObjectSet keeps the SQL serving
-//! projection.
+//! `(namespace, kind, key)`. EvaluateObjectSet keeps the SQL serving
+//! projection unless `SEKAI_OBJECT_INDEX_ENGINE=object-log` (#2290).
 
 use crate::domain::Object;
 use crate::sekai::object_schema::{PropertyValue, property_values_equivalent};
 use crate::sekai::object_security::ObjectSecurityPolicy;
-use crate::sekai::object_set::{ObjectSetAggregation, ObjectSetDescriptor};
+use crate::sekai::object_set::{ObjectSetAggregateRow, ObjectSetAggregation, ObjectSetDescriptor};
 use crate::sekai::object_type_index::{
     ObjectTypeIndexEdit, ObjectTypeIndexMember, carry_index_edits, merge_index_edits,
     parse_property_edit_times,
@@ -383,6 +383,22 @@ impl ObjectLogCompareError {
                 "object-log dual-read mismatch: sql roots={sql_roots} sum={sql_sum} log roots={} sum={}",
                 log.two_hop_count, log.sum_amount
             ),
+        }
+    }
+
+    /// Fail-closed text when the object-log engine is the selected serving
+    /// store: a shape it cannot answer names the limit, and a missing host
+    /// is unreachable rather than a silent SQL fallback (#2290).
+    pub fn serving_message(&self) -> String {
+        match self {
+            Self::MissingLog => "object-log host is unreachable".into(),
+            Self::Unsupported(reason) => format!("object-log engine cannot answer: {reason}"),
+            Self::GrantNarrowed => {
+                "object-log engine cannot evaluate kinds whose grants the log restriction cannot carry"
+                    .into()
+            }
+            Self::Evaluate(error) => format!("object-log evaluate failed: {error}"),
+            other => other.message(),
         }
     }
 }
@@ -791,6 +807,220 @@ fn compare_sql_to_log_with_cache(
         sql_sum: sql.sum,
         log,
     })
+}
+
+/// Where this process reads object-log evaluates from: a host, or the
+/// in-process log Combined mode already opened.
+pub enum ObjectLogEvaluateSource {
+    Host(crate::sekai::object_log_host::ObjectLogHost),
+    Path(PathBuf),
+}
+
+impl ObjectLogEvaluateSource {
+    /// An explicit path (dual-read override or test) wins. Otherwise the
+    /// host when configured (ADR 0088), else the installed local log.
+    pub fn from_configured(log_path: Option<PathBuf>) -> Result<Self, ObjectLogCompareError> {
+        if let Some(path) = log_path {
+            return Ok(Self::Path(path));
+        }
+        match configured_log_host() {
+            Ok(Some(host)) => Ok(Self::Host(host)),
+            Ok(None) => configured_log_path()
+                .map(Self::Path)
+                .ok_or(ObjectLogCompareError::MissingLog),
+            Err(_) => Err(ObjectLogCompareError::MissingLog),
+        }
+    }
+}
+
+/// Serve one aggregate evaluate from the configured object log.
+pub fn evaluate_from_source(
+    source: &ObjectLogEvaluateSource,
+    descriptor: &ObjectSetDescriptor,
+    hops: &[crate::sekai::object_set::ObjectSetTraversal],
+    aggregation: &ObjectSetAggregation,
+    acl: PropertyAcl,
+    deny: &[(String, String)],
+) -> Result<EvaluateResponse, ObjectLogCompareError> {
+    let request = map_evaluate_request(descriptor, hops, aggregation, acl)?;
+    let unknown_namespace = format!("unknown namespace {}", request.namespace);
+    match source {
+        ObjectLogEvaluateSource::Host(host) => match host.evaluate(&request, deny) {
+            Ok(response) => Ok(response),
+            Err(error) if error.contains(&unknown_namespace) => Ok(EvaluateResponse {
+                two_hop_count: 0,
+                sum_amount: 0,
+                objects: Vec::new(),
+                cursor: None,
+                groups: Vec::new(),
+            }),
+            Err(error) if error.contains("unreachable") => Err(ObjectLogCompareError::MissingLog),
+            Err(error) => Err(ObjectLogCompareError::Evaluate(error)),
+        },
+        ObjectLogEvaluateSource::Path(path) => {
+            evaluate_from_path(path, &request, &unknown_namespace)
+        }
+    }
+}
+
+fn evaluate_from_path(
+    path: &Path,
+    request: &EvaluateRequest,
+    unknown_namespace: &str,
+) -> Result<EvaluateResponse, ObjectLogCompareError> {
+    if !path.exists() {
+        return Err(ObjectLogCompareError::MissingLog);
+    }
+    let cache = OBJECT_LOG_STORE.get_or_init(|| Mutex::new(None));
+    match with_object_log_store_cache(cache, path, |store| {
+        ObjectSet::new(LocalCompute)
+            .evaluate(store, request)
+            .or_else(|error| match error {
+                ComputeError::Load(message) if message == unknown_namespace => {
+                    Ok(EvaluateResponse {
+                        two_hop_count: 0,
+                        sum_amount: 0,
+                        objects: Vec::new(),
+                        cursor: None,
+                        groups: Vec::new(),
+                    })
+                }
+                error => Err(format!("{error:?}")),
+            })
+    }) {
+        Ok(log) => Ok(log),
+        Err(error) => Err(ObjectLogCompareError::Evaluate(error)),
+    }
+}
+
+/// Fold a log evaluate into the SQL aggregate-row shape EvaluateObjectSet
+/// already returns.
+pub fn aggregate_rows_from_log(
+    log: &EvaluateResponse,
+    aggregation: &ObjectSetAggregation,
+) -> Result<Vec<ObjectSetAggregateRow>, ObjectLogCompareError> {
+    let function = aggregation.function.to_ascii_lowercase();
+    if log.groups.is_empty() {
+        let (value, count) = match function.as_str() {
+            "count" => (log.two_hop_count as f64, log.two_hop_count as i64),
+            "sum" => (log.sum_amount as f64, log.two_hop_count as i64),
+            other => {
+                return Err(ObjectLogCompareError::Unsupported(match other {
+                    "min" | "max" | "avg" | "distinct" => {
+                        "min, max, avg, and distinct require a breakdown"
+                    }
+                    _ => "object-log evaluate compares count, sum, min, max, avg, or distinct",
+                }));
+            }
+        };
+        return Ok(vec![ObjectSetAggregateRow {
+            group_key: String::new(),
+            value,
+            count,
+        }]);
+    }
+    log.groups
+        .iter()
+        .map(|group| {
+            let group_key = group.key.first().cloned().flatten().unwrap_or_default();
+            let (value, count) = match function.as_str() {
+                "count" => (group.count as f64, group.count as i64),
+                "sum" => (group.sum as f64, group.n as i64),
+                "min" => (
+                    group.min.ok_or(ObjectLogCompareError::Unsupported(
+                        "min, max, avg, and distinct compare require aggregation.property",
+                    ))? as f64,
+                    group.n as i64,
+                ),
+                "max" => (
+                    group.max.ok_or(ObjectLogCompareError::Unsupported(
+                        "min, max, avg, and distinct compare require aggregation.property",
+                    ))? as f64,
+                    group.n as i64,
+                ),
+                "avg" => {
+                    let (sum, n) = group.avg;
+                    if n == 0 {
+                        (0.0, 0)
+                    } else {
+                        (sum as f64 / n as f64, n as i64)
+                    }
+                }
+                "distinct" => (
+                    group.distinct.ok_or(ObjectLogCompareError::Unsupported(
+                        "min, max, avg, and distinct compare require aggregation.property",
+                    ))? as f64,
+                    group.count as i64,
+                ),
+                _ => {
+                    return Err(ObjectLogCompareError::Unsupported(
+                        "object-log evaluate compares count, sum, min, max, avg, or distinct",
+                    ));
+                }
+            };
+            Ok(ObjectSetAggregateRow {
+                group_key,
+                value,
+                count,
+            })
+        })
+        .collect()
+}
+
+/// Kind policies the log restriction cannot evaluate (ADR 0174): a required
+/// purpose, value-instance grants, or a rule that is not allow-all. Property
+/// grants are projected into deny pairs. Per-object grants, markings, and
+/// hidden rows stay on #3510.
+fn policy_exceeds_log_restriction(policy: &ObjectSecurityPolicy) -> bool {
+    policy
+        .required_purpose
+        .as_ref()
+        .is_some_and(|purpose| !purpose.is_empty())
+        || policy
+            .value_instance_grants
+            .as_ref()
+            .is_some_and(|grants| !grants.is_empty())
+        || policy.rules.iter().any(|rule| {
+            rule.predicates.iter().any(|predicate| {
+                !matches!(
+                    predicate,
+                    crate::sekai::object_security::ObjectSecurityPredicate::AllowAll
+                )
+            })
+        })
+}
+
+/// Deny pairs the host `evaluate` wire carries for `acl`.
+pub fn object_log_deny_pairs<'a>(
+    kinds: impl IntoIterator<Item = ObjectLogAclKind<'a>>,
+) -> Result<(PropertyAcl, Vec<(String, String)>), ObjectLogCompareError> {
+    let kinds: Vec<_> = kinds.into_iter().collect();
+    for kind in &kinds {
+        if kind.policy.is_some_and(policy_exceeds_log_restriction) {
+            return Err(ObjectLogCompareError::GrantNarrowed);
+        }
+    }
+    let mut deny = BTreeSet::new();
+    for kind in &kinds {
+        let Some(grants) = kind
+            .policy
+            .and_then(|policy| policy.property_grants.as_ref())
+            .filter(|grants| !grants.is_empty())
+        else {
+            continue;
+        };
+        let granted: BTreeSet<_> = grants.iter().map(|grant| grant.property.as_str()).collect();
+        let Some(declared) = &kind.schema_properties else {
+            continue;
+        };
+        for property in declared {
+            if !granted.contains(property.as_str()) {
+                deny.insert((kind.kind.to_string(), property.clone()));
+            }
+        }
+    }
+    let acl = project_object_log_acl(kinds)?;
+    Ok((acl, deny.into_iter().collect()))
 }
 
 /// Append an admitted object through tagged mikura ingest when the log lacks
@@ -2022,6 +2252,7 @@ fn visible_record(store: &Store, namespace: &str, kind: &str, key: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mikura::Group;
 
     #[test]
     fn overlay_cells_keep_legacy_literals_and_round_trip_typed_values() {
@@ -2734,6 +2965,58 @@ mod tests {
             );
         }
         assert!(store.committed_pages() <= 80);
+    }
+
+    #[test]
+    fn log_engine_folds_count_and_sum_groups() {
+        let ungrouped = EvaluateResponse {
+            two_hop_count: 2,
+            sum_amount: 10,
+            objects: Vec::new(),
+            cursor: None,
+            groups: Vec::new(),
+        };
+        let count = aggregate_rows_from_log(
+            &ungrouped,
+            &ObjectSetAggregation {
+                function: "count".into(),
+                ..ObjectSetAggregation::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(count[0].value, 2.0);
+        assert_eq!(count[0].count, 2);
+        let grouped = EvaluateResponse {
+            two_hop_count: 1,
+            sum_amount: 10,
+            objects: Vec::new(),
+            cursor: None,
+            groups: vec![Group {
+                key: vec![Some("eu".into())],
+                count: 1,
+                sum: 10,
+                n: 1,
+                min: Some(10),
+                max: Some(10),
+                avg: (10, 1),
+                distinct: None,
+            }],
+        };
+        let sums = aggregate_rows_from_log(
+            &grouped,
+            &ObjectSetAggregation {
+                function: "sum".into(),
+                property: "amount".into(),
+                group_by: "region".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(sums[0].group_key, "eu");
+        assert_eq!(sums[0].value, 10.0);
+        assert_eq!(
+            ObjectLogCompareError::MissingLog.serving_message(),
+            "object-log host is unreachable"
+        );
     }
 
     #[test]
@@ -3768,6 +4051,36 @@ mod tests {
         let mut keys = visible.props.keys().cloned().collect::<Vec<_>>();
         keys.sort();
         assert_eq!(keys, ["region", "tier"]);
+    }
+
+    #[test]
+    fn deny_pairs_dedupe_a_kind_that_appears_twice() {
+        // Host insert_deny fails closed on duplicate kind.property. A hop
+        // chain that revisits a kind must still send each pair once.
+        let policy = granted_customer_policy(&["region"]);
+        let (_, deny) = object_log_deny_pairs([
+            customer_kind(Some(&policy), Some(&["region", "secret"]), &["region"]),
+            customer_kind(Some(&policy), Some(&["region", "secret"]), &["region"]),
+        ])
+        .unwrap();
+        assert_eq!(deny, vec![("Customer".into(), "secret".into())]);
+    }
+
+    #[test]
+    fn serving_fails_closed_when_kind_rules_exceed_the_log_restriction() {
+        let mut policy = granted_customer_policy(&["region"]);
+        policy.required_purpose = Some("review".into());
+        let error =
+            object_log_deny_pairs([customer_kind(Some(&policy), Some(&["region"]), &["region"])])
+                .unwrap_err();
+        assert!(matches!(error, ObjectLogCompareError::GrantNarrowed));
+        assert!(
+            error
+                .serving_message()
+                .contains("log restriction cannot carry"),
+            "{}",
+            error.serving_message()
+        );
     }
 
     #[test]
