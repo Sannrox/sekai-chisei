@@ -534,12 +534,34 @@ impl ObjectLogHost {
         request: &EvaluateRequest,
         deny: &[(String, String)],
     ) -> Result<EvaluateResponse, String> {
-        let reply = Self::require_ok(self.read(evaluate_wire(request, deny))?)?;
-        reply
-            .evaluate
-            .map(EvaluateWire::into_response)
-            .ok_or_else(|| "object-log host evaluate returned no payload".into())
+        Ok(self.evaluate_at(request, deny)?.response)
     }
+
+    /// Evaluate plus the snapshot the host served, so freshness can fail
+    /// closed naming that version (#3511).
+    pub(crate) fn evaluate_at(
+        &self,
+        request: &EvaluateRequest,
+        deny: &[(String, String)],
+    ) -> Result<HostEvaluate, String> {
+        let reply = Self::require_ok(self.read(evaluate_wire(request, deny))?)?;
+        Ok(HostEvaluate {
+            response: reply
+                .evaluate
+                .map(EvaluateWire::into_response)
+                .ok_or_else(|| "object-log host evaluate returned no payload".to_string())?,
+            manifest_version: reply.manifest_version,
+            behind: reply.behind,
+        })
+    }
+}
+
+/// One host evaluate and the snapshot it was answered at (#3511).
+#[derive(Debug)]
+pub(crate) struct HostEvaluate {
+    pub response: EvaluateResponse,
+    pub manifest_version: Option<u64>,
+    pub behind: Option<u64>,
 }
 
 fn evaluate_wire(request: &EvaluateRequest, deny: &[(String, String)]) -> Value {
