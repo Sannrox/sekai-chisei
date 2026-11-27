@@ -127,6 +127,7 @@ impl SekaiServiceImpl {
                 &bound,
                 &hops,
                 &inner.page_token,
+                inner.required_freshness_ms,
                 &attribution,
             );
         }
@@ -1092,7 +1093,12 @@ impl SekaiServiceImpl {
                     "object-log engine cannot evaluate tenant-constrained requests",
                 ));
             }
-            return self.evaluate_object_log_aggregates(bound, hops, attribution);
+            return self.evaluate_object_log_aggregates(
+                bound,
+                hops,
+                required_freshness_ms,
+                attribution,
+            );
         }
         let constrained = authority.tenant_context.is_some();
         let engine = if constrained {
@@ -1379,6 +1385,7 @@ impl SekaiServiceImpl {
         &self,
         bound: &BoundObjectSet,
         hops: &[crate::sekai::object_set::ObjectSetTraversal],
+        required_freshness_ms: i64,
         attribution: &QueryAttribution,
     ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
         let aggregation = bound.descriptor.aggregation.clone().ok_or_else(|| {
@@ -1432,6 +1439,7 @@ impl SekaiServiceImpl {
             &aggregation,
             acl,
             &deny,
+            required_freshness_ms,
         )
         .map_err(|error| Status::failed_precondition(error.serving_message()))?;
         let aggregates = crate::sekai::object_log::aggregate_rows_from_log(&log, &aggregation)
@@ -1460,6 +1468,7 @@ impl SekaiServiceImpl {
         bound: &BoundObjectSet,
         hops: &[crate::sekai::object_set::ObjectSetTraversal],
         page_token: &str,
+        required_freshness_ms: i64,
         attribution: &QueryAttribution,
     ) -> Result<Response<EvaluateObjectSetResponse>, Status> {
         if bound.spatial.is_some() {
@@ -1520,6 +1529,7 @@ impl SekaiServiceImpl {
             page_token,
             acl,
             &deny,
+            required_freshness_ms,
         )
         .map_err(|error| Status::failed_precondition(error.serving_message()))?;
         let members = crate::sekai::object_log::members_from_log(&log);
@@ -5123,6 +5133,136 @@ mod tests {
             "{}",
             unreachable.message()
         );
+    }
+
+    #[tokio::test]
+    async fn object_log_engine_enforces_cost_limits_and_freshness() {
+        let mut svc = service();
+        grant_namespace(&svc, "sales", "alice");
+        grant_namespace(&svc, "sales", "local");
+        let digest = seed_sales_with_shipments(&svc);
+        seed_indexed_customer_order_shipment(&svc, &digest);
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("objects.mikura");
+        seed_mikura_customer_order_shipment(&log, "eu");
+        let mut store = mikura::Store::open(&log).unwrap();
+        mikura_ingest::BatchIngest::run(
+            &mut store,
+            vec![mikura::ObjectRecord {
+                action_id: None,
+                r#gen: 1,
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                key: "c2".into(),
+                hidden: false,
+                props: std::collections::HashMap::from([("region".into(), "us".into())]),
+                schema_version: 1,
+                source_version: 0,
+            }],
+        )
+        .unwrap();
+        drop(store);
+        svc.object_index_engine =
+            crate::sekai::object_index_engine::ObjectIndexEngineKind::ObjectLog;
+        svc.object_log_dual_read.log_path = Some(log);
+        let rows = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest.clone(),
+                        limit: 10,
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 1,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 0,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(rows.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(rows.message(), "cost limit: max_rows_scanned");
+
+        let hops = vec![
+            ObjectSetTraversal {
+                relation: "placed".into(),
+                direction: "outgoing".into(),
+                far_kind: "Order".into(),
+                join_property: "customer_id".into(),
+            },
+            ObjectSetTraversal {
+                relation: "ships".into(),
+                direction: "outgoing".into(),
+                far_kind: "Shipment".into(),
+                join_property: "order_id".into(),
+            },
+        ];
+        let depth = EvaluateObjectSetRequest {
+            descriptor: Some(ObjectSetDescriptor {
+                contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                namespace: "sales".into(),
+                kind: "Customer".into(),
+                definition_digest: digest.clone(),
+                hops: hops.clone(),
+                aggregation: Some(ObjectSetAggregation {
+                    function: "count".into(),
+                    group_by: "region".into(),
+                    ..Default::default()
+                }),
+                cost_limit: Some(ObjectSetCostLimit {
+                    max_rows_scanned: 100,
+                    max_depth: 1,
+                    max_time_ms: 0,
+                }),
+                ..Default::default()
+            }),
+            page_token: String::new(),
+            required_freshness_ms: 0,
+        };
+        let log_depth = svc
+            .evaluate_object_set(with_named_principal(depth, "alice"))
+            .await
+            .unwrap_err();
+        assert_eq!(log_depth.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(log_depth.message(), "cost limit: max_depth");
+
+        let fresh = svc
+            .evaluate_object_set(with_named_principal(
+                EvaluateObjectSetRequest {
+                    descriptor: Some(ObjectSetDescriptor {
+                        contract_version: crate::sekai::object_set::CONTRACT_VERSION_V2.into(),
+                        namespace: "sales".into(),
+                        kind: "Customer".into(),
+                        definition_digest: digest,
+                        limit: 10,
+                        cost_limit: Some(ObjectSetCostLimit {
+                            max_rows_scanned: 100,
+                            max_depth: 3,
+                            max_time_ms: 0,
+                        }),
+                        ..Default::default()
+                    }),
+                    page_token: String::new(),
+                    required_freshness_ms: 60_000,
+                },
+                "alice",
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            fresh.source,
+            crate::sekai::object_set::EVALUATE_SOURCE_OBJECT_LOG
+        );
+        assert_eq!(fresh.total, 2);
     }
 
     #[tokio::test]

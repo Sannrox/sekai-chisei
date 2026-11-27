@@ -7,9 +7,12 @@
 //! projection unless `SEKAI_OBJECT_INDEX_ENGINE=object-log` (#2290, #3510).
 
 use crate::domain::Object;
+use crate::sekai::object_log_host::HostEvaluate;
 use crate::sekai::object_schema::{PropertyValue, property_values_equivalent};
 use crate::sekai::object_security::ObjectSecurityPolicy;
-use crate::sekai::object_set::{ObjectSetAggregateRow, ObjectSetAggregation, ObjectSetDescriptor};
+use crate::sekai::object_set::{
+    CostMeter, ObjectSetAggregateRow, ObjectSetAggregation, ObjectSetDescriptor, ObjectSetError,
+};
 use crate::sekai::object_type_index::{
     ObjectTypeIndexEdit, ObjectTypeIndexMember, carry_index_edits, merge_index_edits,
     parse_property_edit_times, sourced_object_id,
@@ -353,6 +356,12 @@ pub enum ObjectLogCompareError {
     MissingLog,
     Unsupported(&'static str),
     Evaluate(String),
+    /// A cost limit the log enforced, named like the relational engines.
+    CostLimit(&'static str),
+    /// Freshness the host cannot prove, with the snapshot it served.
+    Stale {
+        version: u64,
+    },
     Mismatch {
         sql_roots: usize,
         sql_sum: i64,
@@ -378,6 +387,10 @@ impl ObjectLogCompareError {
                 format!("object-log dual-read cannot map request: {reason}")
             }
             Self::Evaluate(error) => format!("object-log evaluate failed: {error}"),
+            Self::CostLimit(limit) => format!("cost limit: {limit}"),
+            Self::Stale { version } => {
+                format!("object-log host serving version {version} is stale")
+            }
             Self::Mismatch {
                 sql_roots,
                 sql_sum,
@@ -401,6 +414,7 @@ impl ObjectLogCompareError {
                     .into()
             }
             Self::Evaluate(error) => format!("object-log evaluate failed: {error}"),
+            Self::CostLimit(_) | Self::Stale { .. } => self.message(),
             other => other.message(),
         }
     }
@@ -489,11 +503,7 @@ pub fn map_member_evaluate_request(
     }
     let predicate = map_root_filters(&descriptor.property_filters)?;
     let sort = map_member_sort(descriptor)?;
-    let object_bound = if descriptor.cost_limit.max_rows_scanned > 0 {
-        descriptor.cost_limit.max_rows_scanned as usize
-    } else {
-        crate::sekai::object_set::DEFAULT_MAX_ROWS_SCANNED as usize
-    };
+    let object_bound = mapped_object_bound(descriptor);
     let page_size = if descriptor.limit > 0 {
         descriptor.limit as usize
     } else {
@@ -518,6 +528,14 @@ pub fn map_member_evaluate_request(
         cursor: (!page_token.is_empty()).then(|| page_token.to_string()),
         ..EvaluateRequest::default()
     })
+}
+
+fn mapped_object_bound(descriptor: &ObjectSetDescriptor) -> usize {
+    if descriptor.cost_limit.max_rows_scanned > 0 {
+        descriptor.cost_limit.max_rows_scanned as usize
+    } else {
+        crate::sekai::object_set::DEFAULT_MAX_ROWS_SCANNED as usize
+    }
 }
 
 fn map_hops(hops: &[crate::sekai::object_set::ObjectSetTraversal]) -> Vec<Hop> {
@@ -924,9 +942,12 @@ pub fn evaluate_from_source(
     aggregation: &ObjectSetAggregation,
     acl: PropertyAcl,
     deny: &[(String, String)],
+    required_freshness_ms: i64,
 ) -> Result<EvaluateResponse, ObjectLogCompareError> {
     let request = map_evaluate_request(descriptor, hops, aggregation, acl)?;
-    evaluate_mapped(source, request, deny)
+    enforce_cost_and_freshness(descriptor, required_freshness_ms, true, || {
+        evaluate_mapped(source, &request, deny)
+    })
 }
 
 /// Serve one member-page evaluate from the configured object log (#3510).
@@ -937,26 +958,89 @@ pub fn evaluate_members_from_source(
     page_token: &str,
     acl: PropertyAcl,
     deny: &[(String, String)],
+    required_freshness_ms: i64,
 ) -> Result<EvaluateResponse, ObjectLogCompareError> {
     let request = map_member_evaluate_request(descriptor, hops, page_token, acl)?;
-    evaluate_mapped(source, request, deny)
+    enforce_cost_and_freshness(descriptor, required_freshness_ms, false, || {
+        evaluate_mapped(source, &request, deny)
+    })
+}
+
+fn enforce_cost_and_freshness(
+    descriptor: &ObjectSetDescriptor,
+    required_freshness_ms: i64,
+    charge_roots: bool,
+    evaluate: impl FnOnce() -> Result<HostEvaluate, ObjectLogCompareError>,
+) -> Result<EvaluateResponse, ObjectLogCompareError> {
+    let mut meter = CostMeter::new(descriptor.cost_limit.clone());
+    meter.charge(0).map_err(map_cost_error)?;
+    let log = evaluate()?;
+    require_served_freshness(required_freshness_ms, log.manifest_version, log.behind)?;
+    let scanned = if charge_roots {
+        i32::try_from(log.response.two_hop_count).unwrap_or(i32::MAX)
+    } else {
+        0
+    };
+    meter.charge(scanned).map_err(map_cost_error)?;
+    Ok(log.response)
+}
+
+/// A freshness window the host cannot prove from its served snapshot fails
+/// closed naming that version. Version lag is not a time lag, so any replica
+/// behind the writer cannot meet a positive window.
+fn require_served_freshness(
+    required_freshness_ms: i64,
+    served_version: Option<u64>,
+    behind: Option<u64>,
+) -> Result<(), ObjectLogCompareError> {
+    if required_freshness_ms <= 0 {
+        return Ok(());
+    }
+    let Some(version) = served_version else {
+        return Err(ObjectLogCompareError::Evaluate(
+            "object-log host did not report a served version".into(),
+        ));
+    };
+    if behind.unwrap_or(0) > 0 {
+        return Err(ObjectLogCompareError::Stale { version });
+    }
+    Ok(())
+}
+
+fn map_cost_error(error: ObjectSetError) -> ObjectLogCompareError {
+    match error {
+        ObjectSetError::LimitExceeded(message) if message == "cost limit: max_rows_scanned" => {
+            ObjectLogCompareError::CostLimit("max_rows_scanned")
+        }
+        ObjectSetError::LimitExceeded(message) if message == "cost limit: max_time_ms" => {
+            ObjectLogCompareError::CostLimit("max_time_ms")
+        }
+        ObjectSetError::LimitExceeded(message) if message == "cost limit: max_depth" => {
+            ObjectLogCompareError::CostLimit("max_depth")
+        }
+        other => ObjectLogCompareError::Evaluate(other.message()),
+    }
 }
 
 fn evaluate_mapped(
     source: &ObjectLogEvaluateSource,
-    request: EvaluateRequest,
+    request: &EvaluateRequest,
     deny: &[(String, String)],
-) -> Result<EvaluateResponse, ObjectLogCompareError> {
+) -> Result<HostEvaluate, ObjectLogCompareError> {
     let unknown_namespace = format!("unknown namespace {}", request.namespace);
     match source {
-        ObjectLogEvaluateSource::Host(host) => match host.evaluate(&request, deny) {
-            Ok(response) => Ok(response),
-            Err(error) if error.contains(&unknown_namespace) => Ok(empty_evaluate_response()),
+        ObjectLogEvaluateSource::Host(host) => match host.evaluate_at(request, deny) {
+            Ok(reply) => Ok(reply),
+            Err(error) if error.contains(&unknown_namespace) => Ok(HostEvaluate {
+                response: empty_evaluate_response(),
+                manifest_version: None,
+                behind: Some(0),
+            }),
             Err(error) if error.contains("unreachable") => Err(ObjectLogCompareError::MissingLog),
             Err(error) => Err(map_host_evaluate_error(error)),
         },
         ObjectLogEvaluateSource::Path(path) => {
-            evaluate_from_path(path, &request, &unknown_namespace)
+            evaluate_from_path(path, request, &unknown_namespace)
         }
     }
 }
@@ -972,18 +1056,18 @@ fn empty_evaluate_response() -> EvaluateResponse {
 }
 
 fn map_host_evaluate_error(error: String) -> ObjectLogCompareError {
-    if let Some(reason) = named_evaluate_limit(&error) {
+    if error.contains("ObjectBound") || error.to_ascii_lowercase().contains("object bound") {
+        ObjectLogCompareError::CostLimit("max_rows_scanned")
+    } else if let Some(reason) = named_evaluate_limit(&error) {
         ObjectLogCompareError::Unsupported(reason)
     } else {
         ObjectLogCompareError::Evaluate(error)
     }
 }
 
-/// Limits the log names in evaluate errors: object bound, sort, and pages.
+/// Limits the log names in evaluate errors besides the cost bound: sort and pages.
 fn named_evaluate_limit(error: &str) -> Option<&'static str> {
-    if error.contains("ObjectBound") || error.to_ascii_lowercase().contains("object bound") {
-        Some("object_bound")
-    } else if error.contains("Page(") || error.to_ascii_lowercase().contains("sort") {
+    if error.contains("Page(") || error.to_ascii_lowercase().contains("sort") {
         Some("sort")
     } else {
         None
@@ -994,13 +1078,13 @@ fn evaluate_from_path(
     path: &Path,
     request: &EvaluateRequest,
     unknown_namespace: &str,
-) -> Result<EvaluateResponse, ObjectLogCompareError> {
+) -> Result<HostEvaluate, ObjectLogCompareError> {
     if !path.exists() {
         return Err(ObjectLogCompareError::MissingLog);
     }
     let cache = OBJECT_LOG_STORE.get_or_init(|| Mutex::new(None));
     match with_object_log_store_cache(cache, path, |store| {
-        ObjectSet::new(LocalCompute)
+        let response = ObjectSet::new(LocalCompute)
             .evaluate(store, request)
             .or_else(|error| match error {
                 ComputeError::Load(message) if message == unknown_namespace => {
@@ -1011,7 +1095,12 @@ fn evaluate_from_path(
                 }
                 ComputeError::Page(reason) => Err(format!("Page({reason})")),
                 error => Err(format!("{error:?}")),
-            })
+            })?;
+        Ok(HostEvaluate {
+            response,
+            manifest_version: Some(u64::from(store.committed_pages())),
+            behind: Some(0),
+        })
     }) {
         Ok(log) => Ok(log),
         Err(error) => Err(map_host_evaluate_error(error)),
@@ -3221,6 +3310,7 @@ mod tests {
             "",
             PropertyAcl::allow_all(),
             &[],
+            0,
         )
         .unwrap();
         let members = members_from_log(&first);
@@ -3236,6 +3326,7 @@ mod tests {
             &token,
             PropertyAcl::allow_all(),
             &[],
+            0,
         )
         .unwrap();
         let rest = members_from_log(&second);
@@ -3258,6 +3349,7 @@ mod tests {
             "",
             denied,
             &[("Customer".into(), "region".into())],
+            0,
         )
         .unwrap();
         assert!(
@@ -3274,6 +3366,7 @@ mod tests {
             "",
             PropertyAcl::allow_all(),
             &[],
+            0,
         )
         .unwrap_err();
         assert!(
@@ -3281,6 +3374,114 @@ mod tests {
             "{}",
             sort.serving_message()
         );
+    }
+
+    #[test]
+    fn log_engine_names_cost_limits_and_stale_host_version() {
+        require_served_freshness(0, None, Some(1)).unwrap();
+        require_served_freshness(1, Some(9), Some(0)).unwrap();
+        let unversioned = require_served_freshness(1, None, Some(0)).unwrap_err();
+        assert!(
+            unversioned
+                .serving_message()
+                .contains("did not report a served version"),
+            "{}",
+            unversioned.serving_message()
+        );
+        let stale = require_served_freshness(1, Some(3), Some(1)).unwrap_err();
+        assert_eq!(
+            stale.serving_message(),
+            "object-log host serving version 3 is stale"
+        );
+        assert_eq!(
+            ObjectLogCompareError::CostLimit("max_rows_scanned").serving_message(),
+            "cost limit: max_rows_scanned"
+        );
+        assert_eq!(
+            ObjectLogCompareError::CostLimit("max_time_ms").serving_message(),
+            "cost limit: max_time_ms"
+        );
+        assert_eq!(
+            map_cost_error(ObjectSetError::LimitExceeded(
+                "cost limit: max_time_ms".into()
+            ))
+            .serving_message(),
+            "cost limit: max_time_ms"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("cost.mikura");
+        let mut store = Store::create(&log).unwrap();
+        BatchIngest::run(
+            &mut store,
+            vec![
+                ObjectRecord {
+                    action_id: None,
+                    r#gen: 1,
+                    namespace: "sales".into(),
+                    kind: "Customer".into(),
+                    key: "c-a".into(),
+                    hidden: false,
+                    props: HashMap::from([("region".into(), "eu".into())]),
+                    schema_version: 1,
+                    source_version: 0,
+                },
+                ObjectRecord {
+                    action_id: None,
+                    r#gen: 1,
+                    namespace: "sales".into(),
+                    kind: "Customer".into(),
+                    key: "c-b".into(),
+                    hidden: false,
+                    props: HashMap::from([("region".into(), "us".into())]),
+                    schema_version: 1,
+                    source_version: 0,
+                },
+            ],
+        )
+        .unwrap();
+        drop(store);
+        let source = ObjectLogEvaluateSource::Path(log);
+        let descriptor = ObjectSetDescriptor {
+            namespace: "sales".into(),
+            kind: "Customer".into(),
+            limit: 10,
+            cost_limit: crate::sekai::object_set::ObjectSetCostLimit {
+                max_rows_scanned: 1,
+                max_depth: 3,
+                max_time_ms: 0,
+            },
+            ..ObjectSetDescriptor::default()
+        };
+        let over = evaluate_members_from_source(
+            &source,
+            &descriptor,
+            &[],
+            "",
+            PropertyAcl::allow_all(),
+            &[],
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(over.serving_message(), "cost limit: max_rows_scanned");
+        let fresh = evaluate_members_from_source(
+            &source,
+            &ObjectSetDescriptor {
+                cost_limit: crate::sekai::object_set::ObjectSetCostLimit {
+                    max_rows_scanned: 10,
+                    max_depth: 3,
+                    max_time_ms: 0,
+                },
+                ..descriptor.clone()
+            },
+            &[],
+            "",
+            PropertyAcl::allow_all(),
+            &[],
+            60_000,
+        )
+        .unwrap();
+        assert_eq!(fresh.two_hop_count, 2);
     }
 
     #[test]

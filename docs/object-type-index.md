@@ -126,8 +126,11 @@ kind, an `incoming` hop the reverse. Cost limits (`max_rows_scanned`, `max_depth
 `max_time_ms`) fail closed with the limit named. `SEKAI_OBJECT_INDEX_ENGINE`
 selects `hop-projection` (default), `nested-loop`, or `object-log`.
 `object-log` answers count, sum, breakdown, and member-page evaluates from
-the object-log host. Every other descriptor fails closed with the limit
-named, and so does an unreachable host; there is no silent SQL fallback.
+the object-log host and enforces the same cost limits. A
+`required_freshness_ms` the host cannot prove from the snapshot it served
+fails closed naming that version. Every other descriptor fails closed with
+the limit named, and so does an unreachable host; there is no silent SQL
+fallback.
 Hop-projection is a
 rebuildable join-key projection, not object authority. Evaluate walks those
 join edges as the reachability plan and looks up children by the stored
