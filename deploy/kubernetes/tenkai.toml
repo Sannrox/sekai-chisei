@@ -3,7 +3,8 @@
 # Requires TENKAI_SOFTWARE_EXECUTOR=kubernetes-inprocess and an
 # environment-scoped kubeconfig path (`tenkaictl env cluster-config set`).
 # Manifests live under manifests/; Tenkai applies them with field manager
-# `tenkai` and admits health from StatefulSet conditions.
+# `tenkai` and admits health from every workload (StatefulSet and the
+# adapter Deployment).
 #
 # Create Secret `sekai-chisei-tls` in the environment namespace before apply.
 # Walkthrough: docs/kubernetes-minikube.md
@@ -25,6 +26,11 @@ uninstall = "true"
 # would fail every apply.
 inputs = ["manifests"]
 
+# Names only. The adapter reads EZU_URL, EZU_TOKEN, and SEKAI_CREDENTIAL
+# from Secret sekai-chisei-ezu. They never appear in values or a ConfigMap.
+# Without the Secret, and when the dependency document has no Ezu engine,
+# the adapter Deployment idles ready and the core StatefulSet is unchanged.
+
 # Contracts this release provides to dependents (Tenkai profile v2), as its
 # compatibility.json lists them. The pin is a digest of the release version.
 # A version or contract bump refreshes this block: `sekaictl admin
@@ -41,3 +47,7 @@ value = "sha256:5cdf63e90d93ff3bb6a1e410a60a535eeadb9535d44fff147e07761b251c804a
 [compatibility.components.sekai-chisei.provides]
 "chisei.admin-rpc" = "1.1.0"
 "chisei.enterprise-rpc" = "1.0.0"
+
+[compatibility.components.sekai-chisei.requires]
+"ezu.query" = { minimum = "0.1.0", optional = true }
+"ezu.events" = { minimum = "0.1.0", optional = true }

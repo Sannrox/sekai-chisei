@@ -17,6 +17,10 @@ def load(name: str) -> dict:
     return yaml.safe_load((MANIFESTS / name).read_text())
 
 
+def load_all(name: str) -> list:
+    return list(yaml.safe_load_all((MANIFESTS / name).read_text()))
+
+
 class StatefulSet(unittest.TestCase):
     def setUp(self):
         self.pod = load("10-statefulset.yaml")["spec"]["template"]["spec"]
@@ -84,6 +88,78 @@ class StatefulSet(unittest.TestCase):
                 self.assertEqual(context["capabilities"]["drop"], ["ALL"])
                 self.assertNotEqual(context.get("runAsUser"), 0)
                 self.assertIsNot(context.get("runAsNonRoot"), False)
+
+
+class EzuAdapter(unittest.TestCase):
+    def setUp(self):
+        documents = load_all("30-ezu-adapter.yaml")
+        kinds = {document["kind"]: document for document in documents}
+        self.config = kinds["ConfigMap"]
+        self.deployment = kinds["Deployment"]
+        self.pod = self.deployment["spec"]["template"]["spec"]
+        self.container = self.pod["containers"][0]
+
+    def test_two_replicas_and_no_leader(self):
+        self.assertEqual(self.deployment["spec"]["replicas"], 2)
+        self.assertEqual(self.container["command"], ["ezu-adapter"])
+        self.assertNotIn("volumeClaimTemplates", self.deployment["spec"])
+
+    def test_ops_listens_on_every_address_for_kubelet_probes(self):
+        env = {entry["name"]: entry.get("value") for entry in self.container.get("env", [])}
+        self.assertEqual(env.get("OPS_BIND"), "0.0.0.0")
+        ports = {port["name"]: port["containerPort"] for port in self.container["ports"]}
+        self.assertEqual(ports.get("ops"), 9464)
+        for probe, path in (("livenessProbe", "/healthz"), ("readinessProbe", "/readyz")):
+            self.assertEqual(self.container[probe]["httpGet"], {"path": path, "port": "ops"})
+
+    def test_ezu_credentials_come_only_from_the_optional_secret(self):
+        env = {entry["name"]: entry for entry in self.container.get("env", [])}
+        for name in ("EZU_URL", "EZU_TOKEN", "SEKAI_CREDENTIAL"):
+            with self.subTest(variable=name):
+                self.assertNotIn("value", env[name])
+                self.assertEqual(
+                    env[name]["valueFrom"],
+                    {
+                        "secretKeyRef": {
+                            "name": "sekai-chisei-ezu",
+                            "key": name,
+                            "optional": True,
+                        }
+                    },
+                )
+        self.assertNotIn("EZU_URL", self.config.get("data", {}))
+        self.assertNotIn("EZU_TOKEN", self.config.get("data", {}))
+
+    def test_dependency_document_and_config_are_mounted(self):
+        env = {entry["name"]: entry.get("value") for entry in self.container.get("env", [])}
+        self.assertEqual(
+            env.get("TENKAI_DEPENDENCIES_FILE"),
+            "/etc/tenkai/tenkai-dependencies.json",
+        )
+        self.assertEqual(env.get("EZU_ADAPTER_CONFIG_FILE"), "/etc/ezu/adapter.json")
+        volumes = {volume["name"]: volume for volume in self.pod["volumes"]}
+        self.assertEqual(
+            volumes["tenkai-dependencies"]["configMap"]["name"],
+            "tenkai-dependencies-${TENKAI_INSTANCE}",
+        )
+        self.assertTrue(volumes["tenkai-dependencies"]["configMap"]["optional"])
+        self.assertNotIn("items", volumes["tenkai-dependencies"]["configMap"])
+        self.assertEqual(
+            volumes["tls"]["secret"],
+            {
+                "secretName": "sekai-chisei-tls",
+                "items": [{"key": "tls.crt", "path": "tls.crt"}],
+            },
+        )
+
+    def test_pod_meets_restricted_pod_security(self):
+        context = self.pod["securityContext"]
+        self.assertTrue(context["runAsNonRoot"])
+        self.assertEqual(context["runAsUser"], 999)
+        self.assertEqual(context["seccompProfile"], {"type": "RuntimeDefault"})
+        container = self.container["securityContext"]
+        self.assertIs(container["allowPrivilegeEscalation"], False)
+        self.assertEqual(container["capabilities"]["drop"], ["ALL"])
 
 
 class Service(unittest.TestCase):

@@ -840,6 +840,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ezu-adapter"
+version = "3.1.0"
+dependencies = [
+ "axum",
+ "reqwest 0.12.28",
+ "rustls",
+ "sekai-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

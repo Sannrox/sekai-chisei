@@ -1,6 +1,7 @@
 # Running with Docker
 
-The server image is Debian bookworm with `sekai-chisei` and `sekaictl`. The
+The server image is Debian bookworm with `sekai-chisei`, `sekaictl`, and
+`ezu-adapter`. The
 gateway image is the same base with `chisei-gateway` only. The builder is
 pinned `rust:1.98.1-bookworm`.
 

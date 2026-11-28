@@ -4,6 +4,7 @@
 
 const TENKAI: &str = include_str!("../deploy/kubernetes/tenkai.toml");
 const STATEFULSET: &str = include_str!("../deploy/kubernetes/manifests/10-statefulset.yaml");
+const EZU_ADAPTER: &str = include_str!("../deploy/kubernetes/manifests/30-ezu-adapter.yaml");
 const CARGO: &str = include_str!("../Cargo.toml");
 
 fn quoted_assignment<'a>(src: &'a str, key: &str) -> Option<&'a str> {
@@ -122,4 +123,71 @@ fn statefulset_is_single_replica_sqlite_tls() {
         !STATEFULSET.contains("SEKAI_SHARED_STORE"),
         "retired single-store variables must stay unset"
     );
+}
+
+#[test]
+fn ezu_adapter_is_two_replicas_of_the_published_image() {
+    let version = crate_version();
+    let image = format!("ghcr.io/sannrox/sekai-chisei:v{version}");
+    assert!(
+        EZU_ADAPTER.contains(&format!("image: {image}")),
+        "adapter image must use the published v-prefixed tag for crate version {version}"
+    );
+    assert!(
+        EZU_ADAPTER.contains("kind: Deployment"),
+        "adapter is a Deployment; nothing on disk is authoritative"
+    );
+    assert!(
+        EZU_ADAPTER.contains("replicas: 2"),
+        "two replicas, no leader"
+    );
+    assert!(
+        EZU_ADAPTER.contains("command: [\"ezu-adapter\"]"),
+        "the image runs the adapter process"
+    );
+    assert!(
+        !EZU_ADAPTER.contains("volumeClaimTemplates:"),
+        "adapter replicas share no PVC"
+    );
+}
+
+#[test]
+fn ezu_url_and_bearer_come_only_from_the_sealed_secret() {
+    assert!(
+        EZU_ADAPTER.contains("secretKeyRef:\n                  name: sekai-chisei-ezu"),
+        "EZU_URL and EZU_TOKEN come from Secret sekai-chisei-ezu"
+    );
+    for needle in ["EZU_URL: ", "EZU_TOKEN: "] {
+        assert!(
+            !EZU_ADAPTER.contains(needle),
+            "{needle:?} must not be a literal in the adapter manifest"
+        );
+    }
+    assert!(
+        EZU_ADAPTER.contains("value: https://sekai-chisei:50051"),
+        "the adapter reaches the plane at the in-cluster Service"
+    );
+    assert!(
+        !EZU_ADAPTER.contains("tls.key"),
+        "the adapter mounts only the plane CA, not the server private key"
+    );
+    let config_map = EZU_ADAPTER
+        .split("kind: Deployment")
+        .next()
+        .expect("ConfigMap document");
+    assert!(
+        !config_map.contains("EZU_URL") && !config_map.contains("EZU_TOKEN"),
+        "the adapter ConfigMap must not hold the Ezu URL or bearer"
+    );
+}
+
+#[test]
+fn kubernetes_product_optionally_requires_ezu() {
+    assert!(
+        TENKAI.contains("[compatibility.components.sekai-chisei.requires]"),
+        "kubernetes product declares optional Ezu requires so Tenkai writes a dependency document"
+    );
+    assert!(TENKAI.contains("\"ezu.query\""));
+    assert!(TENKAI.contains("\"ezu.events\""));
+    assert!(TENKAI.contains("optional = true"));
 }

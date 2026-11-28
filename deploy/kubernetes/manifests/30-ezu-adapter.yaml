@@ -1,0 +1,109 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sekai-ezu-adapter
+  labels:
+    app: sekai-ezu-adapter
+data:
+  adapter.json: |
+    {"feeds":[],"bindings":[]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sekai-ezu-adapter
+  labels:
+    app: sekai-ezu-adapter
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sekai-ezu-adapter
+  template:
+    metadata:
+      labels:
+        app: sekai-ezu-adapter
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ezu-adapter
+          image: ghcr.io/sannrox/sekai-chisei:v3.1.0
+          command: ["ezu-adapter"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: ops
+              containerPort: 9464
+          env:
+            - name: OPS_BIND
+              value: "0.0.0.0"
+            - name: TENKAI_DEPENDENCIES_FILE
+              value: /etc/tenkai/tenkai-dependencies.json
+            - name: SEKAI_ENDPOINT
+              value: https://sekai-chisei:50051
+            - name: SEKAI_TLS_CA
+              value: /tls/tls.crt
+            - name: EZU_ADAPTER_CONFIG_FILE
+              value: /etc/ezu/adapter.json
+            - name: EZU_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sekai-chisei-ezu
+                  key: EZU_URL
+                  optional: true
+            - name: EZU_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: sekai-chisei-ezu
+                  key: EZU_TOKEN
+                  optional: true
+            - name: SEKAI_CREDENTIAL
+              valueFrom:
+                secretKeyRef:
+                  name: sekai-chisei-ezu
+                  key: SEKAI_CREDENTIAL
+                  optional: true
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            - name: config
+              mountPath: /etc/ezu
+              readOnly: true
+            - name: tenkai-dependencies
+              mountPath: /etc/tenkai
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ops
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: ops
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: tls
+          secret:
+            secretName: sekai-chisei-tls
+            items:
+              - key: tls.crt
+                path: tls.crt
+        - name: config
+          configMap:
+            name: sekai-ezu-adapter
+        - name: tenkai-dependencies
+          configMap:
+            name: tenkai-dependencies-${TENKAI_INSTANCE}
+            optional: true

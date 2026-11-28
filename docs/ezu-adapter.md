@@ -129,6 +129,17 @@ are still experimental and need `SEKAI_EXPERIMENTAL_RPCS=1` on the plane.
 
 No Ezu setting goes into the plane.
 
+### Kubernetes product
+
+The Kubernetes product runs `ezu-adapter` as a two-replica Deployment when
+Tenkai's dependency document reports both `ezu.query` and `ezu.events`.
+Without those contracts the Deployment is idle-ready and the core
+StatefulSet applies as before. The process re-reads the document, so an
+Ezu engine that appears later starts work. The Ezu URL, bearer, and
+adapter principal arrive only from Secret `sekai-chisei-ezu`. Feeds and
+bindings are a ConfigMap. See
+[Kubernetes on minikube](kubernetes-minikube.md#ezu-adapter).
+
 ### Adapter
 
 `AdapterConfig` is a JSON document with `feeds` and `bindings`. Unknown
@@ -146,7 +157,10 @@ new snapshot.
 ## Tests
 
 `tests/ezu_adapter.rs` runs the adapter against an in-memory plane served
-over gRPC and a fake Ezu:
+over gRPC and a fake Ezu. `cargo test -p ezu-adapter` covers the Kubernetes
+host: the dependency-document gate, idle versus ready probes, and the HTTP
+Ezu client. Live cluster evidence is operator-run; CI does not start a
+cluster.
 
 - a crash mid-page and a takeover converge, and the runner that lost its
   lease writes nothing;

@@ -627,25 +627,47 @@ pub fn tenkai_profile(matrix: &CompatibilityMatrix) -> Result<String, String> {
     Ok(profile)
 }
 
+/// Kubernetes product suffix: the release profile, then optional Ezu
+/// contracts so Tenkai writes a dependency document. Installs without Ezu
+/// still plan; the adapter idles until both contracts are present.
+pub fn tenkai_kubernetes_profile(matrix: &CompatibilityMatrix) -> Result<String, String> {
+    Ok(format!(
+        "{}\n\
+         [compatibility.components.sekai-chisei.requires]\n\
+         \"ezu.query\" = {{ minimum = \"0.1.0\", optional = true }}\n\
+         \"ezu.events\" = {{ minimum = \"0.1.0\", optional = true }}\n",
+        tenkai_profile(matrix)?
+    ))
+}
+
+fn expected_tenkai_profile(product: &str, matrix: &CompatibilityMatrix) -> Result<String, String> {
+    if product == "deploy/kubernetes/tenkai.toml" {
+        tenkai_kubernetes_profile(matrix)
+    } else {
+        tenkai_profile(matrix)
+    }
+}
+
 /// Fails unless every product in [`TENKAI_PRODUCTS`] under `root` ends with
-/// [`tenkai_profile`]. The error carries the block to paste.
+/// its release profile. The error carries the block to paste.
 pub fn check_tenkai_products(
     root: impl AsRef<Path>,
     matrix: &CompatibilityMatrix,
 ) -> Result<(), String> {
-    let profile = tenkai_profile(matrix)?;
-    let stale: Vec<&str> = TENKAI_PRODUCTS
-        .iter()
-        .copied()
-        .filter(|product| {
-            !read_text(&root.as_ref().join(product)).is_ok_and(|body| body.ends_with(&profile))
-        })
-        .collect();
+    let mut stale = Vec::new();
+    let mut paste = String::new();
+    for product in TENKAI_PRODUCTS {
+        let profile = expected_tenkai_profile(product, matrix)?;
+        if !read_text(&root.as_ref().join(product)).is_ok_and(|body| body.ends_with(&profile)) {
+            stale.push(*product);
+            paste = profile;
+        }
+    }
     if stale.is_empty() {
         return Ok(());
     }
     Err(format!(
-        "{} must end with this compatibility profile:\n\n{profile}",
+        "{} must end with this compatibility profile:\n\n{paste}",
         stale.join(" and ")
     ))
 }
@@ -1240,8 +1262,16 @@ mod tests {
         let root = TempDir::new().unwrap();
         fs::create_dir_all(root.path().join("deploy/kubernetes")).unwrap();
         let product = format!("[product]\nname = \"sekai-chisei\"\n\n{profile}");
+        let kubernetes = format!(
+            "[product]\nname = \"sekai-chisei\"\n\n{}",
+            tenkai_kubernetes_profile(&matrix).unwrap()
+        );
         fs::write(root.path().join("deploy/tenkai.toml"), &product).unwrap();
-        fs::write(root.path().join("deploy/kubernetes/tenkai.toml"), &product).unwrap();
+        fs::write(
+            root.path().join("deploy/kubernetes/tenkai.toml"),
+            &kubernetes,
+        )
+        .unwrap();
         check_tenkai_products(root.path(), &matrix).unwrap();
 
         let (name, version) = PROVIDED_CONTRACTS[0];
@@ -1251,11 +1281,12 @@ mod tests {
         );
         fs::write(root.path().join("deploy/kubernetes/tenkai.toml"), stale).unwrap();
         let error = check_tenkai_products(root.path(), &matrix).unwrap_err();
+        let kubernetes_profile = tenkai_kubernetes_profile(&matrix).unwrap();
         assert!(
             error.starts_with("deploy/kubernetes/tenkai.toml must end with"),
             "{error}"
         );
-        assert!(error.ends_with(&profile), "{error}");
+        assert!(error.ends_with(&kubernetes_profile), "{error}");
     }
 
     #[test]
