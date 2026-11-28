@@ -16,6 +16,7 @@ autotests = false
 members = [
     "crates/chisei-core",
     "crates/chisei-gateway",
+    "crates/ezu-adapter",
     "crates/sekai-adapters",
     "crates/sekai-admin-client",
     "crates/sekai-connector-runtime",

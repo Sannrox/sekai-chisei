@@ -112,7 +112,7 @@ fn the_server_image_boots_from_the_data_dir() {
 #[test]
 fn the_server_image_does_not_ship_the_gateway_binary() {
     let image = include_str!("../build/server-image/Dockerfile");
-    assert!(image.contains("COPY sekai-chisei sekaictl"));
+    assert!(image.contains("COPY sekai-chisei sekaictl ezu-adapter"));
     assert!(!image.contains("chisei-gateway"));
 }
 

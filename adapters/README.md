@@ -457,4 +457,9 @@ in-memory plane and a fake Ezu:
 
 ```sh
 cargo test --test ezu_adapter
+cargo test -p ezu-adapter
 ```
+
+The Kubernetes product runs the `ezu-adapter` binary from the server image
+when Tenkai's dependency document reports an Ezu engine
+([ezu-adapter.md](../docs/ezu-adapter.md#kubernetes-product)).

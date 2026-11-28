@@ -114,6 +114,11 @@ impl Sekai {
         Ok(request)
     }
 
+    /// One authenticated call so a host can tell whether the plane answers.
+    pub async fn probe(&self) -> Result<(), Error> {
+        self.get_object("ezu-adapter.probe").await.map(|_| ())
+    }
+
     /// `None` when the object is absent or hidden from this principal.
     async fn get_object(&self, id: &str) -> Result<Option<Object>, Error> {
         let request = self.request(GetObjectRequest { id: id.into() })?;

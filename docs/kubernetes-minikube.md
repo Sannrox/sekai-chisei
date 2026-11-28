@@ -4,8 +4,8 @@ Plain manifests under `deploy/kubernetes/manifests/` deploy a single-replica
 StatefulSet with SQLite on a PVC, a Service, TLS from Secret `sekai-chisei-tls`,
 and HTTP probes on the ops port. The product file
 `deploy/kubernetes/tenkai.toml` uses the `kubernetes-inprocess` executor
-(server-side apply, field manager `tenkai`, health from StatefulSet
-conditions). Helm, multiple replicas, and PostgreSQL are out of scope.
+(server-side apply, field manager `tenkai`, health from every workload).
+Helm, PostgreSQL, and extra replicas of the plane are out of scope.
 
 The Apple `container` product at `deploy/tenkai.toml` is a separate packaging
 path. Use one or the other for a given environment.
@@ -41,6 +41,35 @@ kubectl -n local create secret tls sekai-chisei-tls \
 # require one. Missing or unreadable files fail closed at startup.
 rm tls.key
 ```
+
+## Ezu adapter
+
+The product optionally requires `ezu.query` and `ezu.events`. Tenkai writes
+ConfigMap `tenkai-dependencies-<instance>` (key `tenkai-dependencies.json`).
+The adapter mounts it at `/etc/tenkai/tenkai-dependencies.json` and re-reads
+it so a later Ezu engine starts work. Both contracts present: two replicas
+run feeds and bindings, fenced by plane leases, and `/readyz` is ready only
+when the process can reach the plane and Ezu. Otherwise `/readyz` is idle
+and the core StatefulSet is unchanged.
+
+Create Secret `sekai-chisei-ezu` in the environment namespace before the
+adapter does work. It holds `EZU_URL`, `EZU_TOKEN`, and `SEKAI_CREDENTIAL`
+(the adapter service principal). Those keys never go in values or a
+ConfigMap. Feeds and bindings are ConfigMap `sekai-ezu-adapter`.
+
+```bash
+kubectl -n local create secret generic sekai-chisei-ezu \
+  --from-literal=EZU_URL=http://ezu.local.svc:7600 \
+  --from-file=EZU_TOKEN=ezu.token \
+  --from-file=SEKAI_CREDENTIAL=adapter.token
+# The adapter reads the Secret at start: restart it after changing it.
+kubectl -n local rollout restart deployment/sekai-ezu-adapter
+```
+
+The adapter principal needs Write on the namespace for cursor objects, read
+on the bound kinds, and, for fence events, `action_types` for the bound
+Action type. Issue its token with `sekaictl admin access credential create`
+as the service principal.
 
 ## Gateway secret (optional)
 
@@ -140,4 +169,5 @@ tenkaictl env unsubscribe local sekai-chisei
 # or remove the environment workload through the usual Tenkai uninstall path
 kubectl -n local delete secret sekai-chisei-tls --ignore-not-found
 kubectl -n local delete secret sekai-chisei-gateway --ignore-not-found
+kubectl -n local delete secret sekai-chisei-ezu --ignore-not-found
 ```
